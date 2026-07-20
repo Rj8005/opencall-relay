@@ -1,0 +1,3 @@
+﻿-keep class org.webrtc.** { *; }
+-keep class com.opencall.relay.** { *; }
+-dontwarn org.webrtc.**

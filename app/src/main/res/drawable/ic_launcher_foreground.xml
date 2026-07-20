@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    OCP signal icon — foreground layer
+    Viewport 216×216, center (108,108).
+    Safe zone for adaptive icon masking: (18,18)–(198,198).
+    Circles, crosshairs, and center dot all fit within safe zone (max radius 80).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="216"
+    android:viewportHeight="216">
+
+    <!-- ── Background ──────────────────────────────────────────────────────── -->
+    <path
+        android:pathData="M0,0 H216 V216 H0 Z"
+        android:fillColor="#060a10"/>
+
+    <!-- ── Concentric rings ────────────────────────────────────────────────── -->
+
+    <!-- r=80  opacity 15 % -->
+    <path
+        android:pathData="M28,108 A80,80 0 1,0 188,108 A80,80 0 1,0 28,108 Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#2663B4FF"
+        android:strokeWidth="1"/>
+
+    <!-- r=58  opacity 20 % -->
+    <path
+        android:pathData="M50,108 A58,58 0 1,0 166,108 A58,58 0 1,0 50,108 Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#3363B4FF"
+        android:strokeWidth="1"/>
+
+    <!-- r=38  opacity 28 % -->
+    <path
+        android:pathData="M70,108 A38,38 0 1,0 146,108 A38,38 0 1,0 70,108 Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#4763B4FF"
+        android:strokeWidth="1"/>
+
+    <!-- r=20  opacity 45 % -->
+    <path
+        android:pathData="M88,108 A20,20 0 1,0 128,108 A20,20 0 1,0 88,108 Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#7363B4FF"
+        android:strokeWidth="1"/>
+
+    <!-- r=8   opacity 100 %  stroke 2dp -->
+    <path
+        android:pathData="M100,108 A8,8 0 1,0 116,108 A8,8 0 1,0 100,108 Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#FF63B4FF"
+        android:strokeWidth="2"/>
+
+    <!-- ── Cardinal crosshairs (center-dot edge → outer ring) ─────────────── -->
+    <!-- opacity 25 %  stroke 0.5dp -->
+
+    <!-- North: (108,104) → (108,28) -->
+    <path
+        android:pathData="M108,104 L108,28"
+        android:fillColor="#00000000"
+        android:strokeColor="#4063B4FF"
+        android:strokeWidth="0.5"/>
+
+    <!-- South: (108,112) → (108,188) -->
+    <path
+        android:pathData="M108,112 L108,188"
+        android:fillColor="#00000000"
+        android:strokeColor="#4063B4FF"
+        android:strokeWidth="0.5"/>
+
+    <!-- East: (112,108) → (188,108) -->
+    <path
+        android:pathData="M112,108 L188,108"
+        android:fillColor="#00000000"
+        android:strokeColor="#4063B4FF"
+        android:strokeWidth="0.5"/>
+
+    <!-- West: (104,108) → (28,108) -->
+    <path
+        android:pathData="M104,108 L28,108"
+        android:fillColor="#00000000"
+        android:strokeColor="#4063B4FF"
+        android:strokeWidth="0.5"/>
+
+    <!-- ── Cardinal dots on outer ring (r=3, opacity 50 %) ────────────────── -->
+
+    <!-- North  (108, 28) -->
+    <path
+        android:pathData="M105,28 A3,3 0 1,0 111,28 A3,3 0 1,0 105,28 Z"
+        android:fillColor="#8063B4FF"/>
+
+    <!-- South  (108, 188) -->
+    <path
+        android:pathData="M105,188 A3,3 0 1,0 111,188 A3,3 0 1,0 105,188 Z"
+        android:fillColor="#8063B4FF"/>
+
+    <!-- East   (188, 108) -->
+    <path
+        android:pathData="M185,108 A3,3 0 1,0 191,108 A3,3 0 1,0 185,108 Z"
+        android:fillColor="#8063B4FF"/>
+
+    <!-- West   (28, 108) -->
+    <path
+        android:pathData="M25,108 A3,3 0 1,0 31,108 A3,3 0 1,0 25,108 Z"
+        android:fillColor="#8063B4FF"/>
+
+    <!-- ── Center filled dot (r=4, 100 %) ─────────────────────────────────── -->
+    <path
+        android:pathData="M104,108 A4,4 0 1,0 112,108 A4,4 0 1,0 104,108 Z"
+        android:fillColor="#63B4FF"/>
+
+</vector>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.OpenCallRelay" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#63b4ff</item>
+        <item name="colorPrimaryVariant">#0d1f35</item>
+        <item name="colorOnPrimary">#060a10</item>
+        <item name="colorSecondary">#1d9e75</item>
+        <item name="colorOnSecondary">#060a10</item>
+        <item name="android:windowBackground">#060a10</item>
+        <item name="android:statusBarColor">#060a10</item>
+        <item name="android:navigationBarColor">#060a10</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

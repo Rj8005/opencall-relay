@@ -1,0 +1,401 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="#111111">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <!-- Drag handle -->
+        <View
+            android:layout_width="40dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="20dp"
+            android:background="#333333"/>
+
+        <!-- Title -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Relay Settings"
+            android:textColor="#f0ede8"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Run this device as an OpenCall relay node"
+            android:textColor="#555555"
+            android:textSize="13sp"
+            android:layout_marginBottom="24dp"/>
+
+        <!-- Credits -->
+        <TextView
+            android:id="@+id/tv_credits"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Credits: 0"
+            android:textColor="#c8f55a"
+            android:textSize="15sp"
+            android:layout_marginBottom="24dp"/>
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#1f1f1f"
+            android:layout_marginBottom="24dp"/>
+
+        <!-- Server URL -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="SIGNAL SERVER URL"
+            android:textColor="#666666"
+            android:textSize="11sp"
+            android:letterSpacing="0.12"
+            android:layout_marginBottom="8dp"/>
+
+        <EditText
+            android:id="@+id/et_server_url"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="wss://signal.opencall.space"
+            android:textColor="#f0ede8"
+            android:textColorHint="#333333"
+            android:background="#1a1a1a"
+            android:padding="14dp"
+            android:textSize="14sp"
+            android:inputType="textUri"
+            android:singleLine="true"
+            android:layout_marginBottom="20dp"/>
+
+        <!-- Area code + Country on one row -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="20dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical"
+                android:layout_marginEnd="12dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="AREA CODE"
+                    android:textColor="#666666"
+                    android:textSize="11sp"
+                    android:letterSpacing="0.12"
+                    android:layout_marginBottom="8dp"/>
+
+                <EditText
+                    android:id="@+id/et_area_code"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="+91"
+                    android:textColor="#f0ede8"
+                    android:textColorHint="#333333"
+                    android:background="#1a1a1a"
+                    android:padding="14dp"
+                    android:textSize="14sp"
+                    android:inputType="phone"/>
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="COUNTRY"
+                    android:textColor="#666666"
+                    android:textSize="11sp"
+                    android:letterSpacing="0.12"
+                    android:layout_marginBottom="8dp"/>
+
+                <EditText
+                    android:id="@+id/et_country"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="IN"
+                    android:textColor="#f0ede8"
+                    android:textColorHint="#333333"
+                    android:background="#1a1a1a"
+                    android:padding="14dp"
+                    android:textSize="14sp"
+                    android:inputType="textCapCharacters"
+                    android:maxLength="2"/>
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#1f1f1f"
+            android:layout_marginBottom="20dp"/>
+
+        <!-- I can help with -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="I CAN HELP WITH"
+            android:textColor="#666666"
+            android:textSize="11sp"
+            android:letterSpacing="0.12"
+            android:layout_marginBottom="8dp"/>
+
+        <RadioGroup
+            android:id="@+id/rg_relay_mode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginBottom="20dp">
+
+            <RadioButton
+                android:id="@+id/rb_calls_only"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:text="Calls only"
+                android:textColor="#f0ede8"
+                android:textSize="14sp"
+                android:buttonTint="#c8f55a"
+                android:paddingStart="12dp"/>
+
+            <RadioButton
+                android:id="@+id/rb_sms_only"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:text="SMS only"
+                android:textColor="#f0ede8"
+                android:textSize="14sp"
+                android:buttonTint="#c8f55a"
+                android:paddingStart="12dp"/>
+
+            <RadioButton
+                android:id="@+id/rb_calls_and_sms"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:text="Calls and SMS"
+                android:textColor="#f0ede8"
+                android:textSize="14sp"
+                android:buttonTint="#c8f55a"
+                android:paddingStart="12dp"
+                android:checked="true"/>
+
+        </RadioGroup>
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#1f1f1f"
+            android:layout_marginBottom="20dp"/>
+
+        <!-- Relay state label -->
+        <TextView
+            android:id="@+id/tv_relay_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="○ Relay is STOPPED"
+            android:textColor="#666666"
+            android:textSize="14sp"
+            android:layout_marginBottom="16dp"/>
+
+        <!-- Toggle button -->
+        <Button
+            android:id="@+id/btn_toggle"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:text="START RELAY"
+            android:textColor="#0a0a0a"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:stateListAnimator="@null"
+            android:layout_marginBottom="32dp"/>
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#1f1f1f"
+            android:layout_marginBottom="24dp"/>
+
+        <!-- ── Invite section ────────────────────────────────────────────── -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="INVITE"
+            android:textColor="#666666"
+            android:textSize="11sp"
+            android:letterSpacing="0.12"
+            android:layout_marginBottom="4dp"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Get your OCP link and send it worldwide"
+            android:textColor="#333333"
+            android:textSize="13sp"
+            android:layout_marginBottom="16dp"/>
+
+        <!-- Phone number + auto-detected country chip -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="16dp">
+
+            <EditText
+                android:id="@+id/et_invite_number"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="+14045551234"
+                android:textColor="#f0ede8"
+                android:textColorHint="#333333"
+                android:background="#1a1a1a"
+                android:padding="14dp"
+                android:textSize="14sp"
+                android:inputType="phone"
+                android:singleLine="true"/>
+
+            <TextView
+                android:id="@+id/tv_country_chip"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:text="🌍"
+                android:textColor="#f0ede8"
+                android:textSize="15sp"
+                android:gravity="center"
+                android:background="#1a1a1a"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp"
+                android:layout_marginStart="8dp"/>
+
+        </LinearLayout>
+
+        <!-- Invite link (readonly) + copy -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="YOUR INVITE LINK"
+            android:textColor="#555555"
+            android:textSize="11sp"
+            android:letterSpacing="0.12"
+            android:layout_marginBottom="8dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="20dp">
+
+            <TextView
+                android:id="@+id/tv_invite_link"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Generating…"
+                android:textColor="#BFFF00"
+                android:textSize="13sp"
+                android:singleLine="true"
+                android:ellipsize="end"
+                android:textIsSelectable="true"
+                android:background="#1a1a1a"
+                android:padding="14dp"/>
+
+            <Button
+                android:id="@+id/btn_copy_link"
+                android:layout_width="72dp"
+                android:layout_height="match_parent"
+                android:text="COPY"
+                android:textColor="#0a0a0a"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                android:backgroundTint="#BFFF00"
+                android:stateListAnimator="@null"
+                android:layout_marginStart="8dp"/>
+
+        </LinearLayout>
+
+        <!-- Channel grid — populated dynamically from server response -->
+        <com.google.android.flexbox.FlexboxLayout
+            android:id="@+id/fl_channels"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"/>
+
+        <!-- WeChat QR panel — shown only when QR is generated -->
+        <LinearLayout
+            android:id="@+id/ll_qr_container"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:background="#1a1a1a"
+            android:padding="16dp"
+            android:layout_marginBottom="16dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="WeChat QR Code"
+                android:textColor="#f0ede8"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="12dp"/>
+
+            <ImageView
+                android:id="@+id/iv_qr_code"
+                android:layout_width="200dp"
+                android:layout_height="200dp"
+                android:scaleType="fitCenter"
+                android:layout_marginBottom="12dp"/>
+
+            <Button
+                android:id="@+id/btn_close_qr"
+                android:layout_width="120dp"
+                android:layout_height="40dp"
+                android:text="Close"
+                android:textColor="#0a0a0a"
+                android:textSize="13sp"
+                android:textAllCaps="false"
+                android:backgroundTint="#BFFF00"
+                android:stateListAnimator="@null"/>
+
+        </LinearLayout>
+
+        <!-- Server-side SMS send -->
+        <Button
+            android:id="@+id/btn_auto_sms"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:text="Send SMS automatically"
+            android:textColor="#0a0a0a"
+            android:textSize="14sp"
+            android:textAllCaps="false"
+            android:backgroundTint="#BFFF00"
+            android:stateListAnimator="@null"
+            android:layout_marginBottom="32dp"/>
+
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>

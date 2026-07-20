@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0a0a0a"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:padding="32dp">
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="RELAYING CALL" android:textColor="#666666" android:textSize="12sp" android:letterSpacing="0.2" android:layout_marginBottom="16dp"/>
+    <TextView android:id="@+id/tv_dial_number" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Relaying call to\n+1..." android:textColor="#f0ede8" android:textSize="22sp" android:textStyle="bold" android:gravity="center" android:layout_marginBottom="48dp"/>
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Auto-dismissing in 3 seconds..." android:textColor="#444444" android:textSize="13sp" android:layout_marginBottom="48dp"/>
+    <Button android:id="@+id/btn_cancel_relay" android:layout_width="200dp" android:layout_height="52dp" android:text="Cancel Relay" android:textColor="#ff4d4d" android:stateListAnimator="@null"/>
+</LinearLayout>

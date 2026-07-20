@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Single channel tile inflated into invite_panel's FlexboxLayout.
+  layout_flexBasisPercent="30%" + flexGrow="1" gives ~3 tiles per row.
+-->
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="0dp"
+    android:layout_height="wrap_content"
+    app:layout_flexBasisPercent="30%"
+    app:layout_flexGrow="1"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:padding="10dp"
+    android:clickable="true"
+    android:focusable="true"
+    android:background="?attr/selectableItemBackgroundBorderless">
+
+    <TextView
+        android:id="@+id/ch_label"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Channel"
+        android:textColor="#BFFF00"
+        android:textSize="13sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:layout_marginBottom="2dp"/>
+
+    <TextView
+        android:id="@+id/ch_score"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="0%"
+        android:textColor="#666666"
+        android:textSize="11sp"
+        android:gravity="center"/>
+
+</LinearLayout>
