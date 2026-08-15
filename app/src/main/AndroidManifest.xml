@@ -11,6 +11,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
@@ -21,6 +22,18 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- PHASE 5BC: SOS siren vibration pattern (SosAlarm.kt) -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- PHASE 6 TRACK C: BLE presence + beacon broadcast (MeshBleBeacon.kt).
+         Pre-API31 devices instead rely on plain BLUETOOTH/BLUETOOTH_ADMIN plus
+         the already-declared ACCESS_FINE_LOCATION for BLE scan. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
 
@@ -84,7 +97,7 @@
         <service
             android:name=".offline.OfflineCallService"
             android:exported="false"
-            android:foregroundServiceType="camera|microphone|connectedDevice" />
+            android:foregroundServiceType="camera|microphone|connectedDevice|dataSync" />
 
         <receiver
             android:name=".CallStateReceiver"

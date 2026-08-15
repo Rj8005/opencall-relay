@@ -56,4 +56,14 @@ dependencies {
     implementation 'io.michaelrocks:libphonenumber-android:8.13.14'
     implementation 'com.google.android.flexbox:flexbox:3.0.0'
     implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+    // PHASE 7A: real cryptographic identity — plain JCA "Ed25519" (Conscrypt) is
+    // only available on API 31+; this project's minSdk is 26, so a portable
+    // software Ed25519 implementation is required for API 26-30. BouncyCastle is
+    // the de facto standard choice (widely audited, actively maintained) — see
+    // OfflineIdentity.kt's class doc for how it's used (lightweight API, no JCA
+    // Provider registration needed for Ed25519 specifically).
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.78.1'
+    // PHASE 5A: first JVM-only unit tests in this project (MeshLocationTest) — pure
+    // Kotlin codec, no Android/Robolectric dependency needed.
+    testImplementation 'junit:junit:4.13.2'
 }

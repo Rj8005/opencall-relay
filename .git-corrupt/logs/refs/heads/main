@@ -1,3 +1,0 @@
-0000000000000000000000000000000000000000 32b135e1aca1da937b9afa6aa1d4c7631fa386cd Rahul <rahuljha8005@gmail.com> 1780007407 +0530	commit (initial): feat: ambient UI redesign + new app icon
-32b135e1aca1da937b9afa6aa1d4c7631fa386cd 47befa7ea69d38ad1fe9f4687741ea0cd685e014 Rahul <rahuljha8005@gmail.com> 1782553760 +0530	commit: baseline: full relay + offline wifi-direct pipeline (audio+video, BUSY-backoff, GO=15, SIGABRT fix)
-47befa7ea69d38ad1fe9f4687741ea0cd685e014 47befa7ea69d38ad1fe9f4687741ea0cd685e014 Rahul <rahuljha8005@gmail.com> 1784528455 +0530	Branch: renamed refs/heads/master to refs/heads/main

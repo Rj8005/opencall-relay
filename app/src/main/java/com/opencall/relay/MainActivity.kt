@@ -84,6 +84,9 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        // CAP PROBE: temporary read-only diagnostic — see CapabilityProbe.kt.
+        CapabilityProbe.logStartupCapabilities(this)
+
         if (REQUIRED_PERMISSIONS.any {
                 checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
             }) {
@@ -414,7 +417,7 @@ class MainActivity : AppCompatActivity() {
         val running = RelayForegroundService.instance != null
         if (running) {
             binding.tvStatusPill?.text = "ACTIVE"
-            binding.btnToggleRelay?.text = "Stop Relay"
+            binding.btnToggleRelay vv            b?.text = "Stop Relay"
         } else {
             binding.tvStatusPill?.text = "IDLE"
             binding.btnToggleRelay?.text = "Start Relay"

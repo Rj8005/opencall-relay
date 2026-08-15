@@ -21,10 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * FIX: the offline call path (OfflineCallActivity) no longer carries sdp/ice —
  * OfflineMediaTransport is its entire media path now. This class gained its
- * own small control protocol on top of the existing generic JSON send/receive
- * (kept as public API because OfflineCallManager — unused by the offline path
- * now, but not deleted per the "online path may share code" note — still
- * calls send()/onMessage directly):
+ * own small control protocol on top of the existing generic JSON send/receive:
  *   {"t":"hangup"} — sent once when the local user ends the call, so the far
  *                    side can tear down cleanly instead of relying solely on
  *                    link-death detection.
@@ -46,7 +43,14 @@ class LocalSignaling(
         private const val CONNECT_RETRIES = 10
         private const val CONNECT_RETRY_DELAY_MS = 500L
         private const val PING_INTERVAL_MS = 5000L
-        private const val KEEPALIVE_TIMEOUT_MS = 15000L
+        // IDLE-SESSION FIX: raised from 15000 — 15s was short enough that an ordinary
+        // WiFi power-save renegotiation right after screen-off (missing even 2-3
+        // ping/pong cycles) could read as "peer gone" and tear the whole group down.
+        private const val KEEPALIVE_TIMEOUT_MS = 45000L
+        // Missing about two ping cycles is treated as DEGRADED (logged, surfaced to the
+        // UI) without giving up — only silence all the way to KEEPALIVE_TIMEOUT_MS is
+        // fatal (see startKeepalive).
+        private const val DEGRADED_THRESHOLD_MS = PING_INTERVAL_MS * 2
         private const val KEEPALIVE_CHECK_INTERVAL_MS = 1000L
     }
 
@@ -66,6 +70,11 @@ class LocalSignaling(
     // Latches once so a hangup message racing the keepalive watchdog (or vice versa)
     // can't fire onPeerGone twice for the same call.
     private val peerGoneReported = AtomicBoolean(false)
+    // IDLE-SESSION FIX: latches true while silence has crossed DEGRADED_THRESHOLD_MS
+    // but not yet the full KEEPALIVE_TIMEOUT_MS — flips back (firing onRecovered) the
+    // moment fresh data arrives, so onDegraded fires once per degraded episode rather
+    // than once per second while it persists.
+    private val degradedReported = AtomicBoolean(false)
 
     var onConnected: (() -> Unit)? = null
     var onError: ((String) -> Unit)? = null
@@ -74,8 +83,15 @@ class LocalSignaling(
      *  either way the caller should end the call the same way a link failure would.
      *  The string is a short human-readable reason, for logging. */
     var onPeerGone: ((String) -> Unit)? = null
-    /** Kept for OfflineCallManager (not used by the offline call path anymore) —
-     *  any message that isn't this class's own "hangup"/"ping" control protocol is
+    /** IDLE-SESSION FIX: fired (main thread) once when silence crosses
+     *  DEGRADED_THRESHOLD_MS — NOT fatal, just a heads-up so the caller can surface
+     *  "Reconnecting…" instead of tearing anything down. silentMs is how long it's
+     *  been since the last received message at the time this fires. */
+    var onDegraded: ((silentMs: Long) -> Unit)? = null
+    /** IDLE-SESSION FIX: fired (main thread) once fresh data arrives after a degraded
+     *  episode — the caller can clear whatever "Reconnecting…" state it showed. */
+    var onRecovered: (() -> Unit)? = null
+    /** Any message that isn't this class's own "hangup"/"ping" control protocol is
      *  forwarded here untouched. */
     var onMessage: ((JSONObject) -> Unit)? = null
 
@@ -177,17 +193,31 @@ class LocalSignaling(
 
     /** FIX: pings the peer every PING_INTERVAL_MS and independently watches
      *  lastReceivedAtMs (updated by any incoming line, ping or otherwise) — if
-     *  nothing at all arrives for KEEPALIVE_TIMEOUT_MS, the peer is presumed gone. */
+     *  nothing at all arrives for KEEPALIVE_TIMEOUT_MS, the peer is presumed gone.
+     *  IDLE-SESSION FIX: silence past DEGRADED_THRESHOLD_MS but short of the full
+     *  timeout is reported via onDegraded — NOT fatal, just a heads-up — so a brief
+     *  WiFi power-save hiccup while idle on the roster (no chat/call traffic to
+     *  refresh lastReceivedAtMs, only these pings) doesn't read the same as a genuinely
+     *  dead peer. */
     private fun startKeepalive() {
         var lastPingSentMs = System.currentTimeMillis()
         keepaliveThread = Thread {
             while (running.get()) {
                 try { Thread.sleep(KEEPALIVE_CHECK_INTERVAL_MS) } catch (_: InterruptedException) { return@Thread }
                 val now = System.currentTimeMillis()
-                if (now - lastReceivedAtMs >= KEEPALIVE_TIMEOUT_MS) {
+                val silentMs = now - lastReceivedAtMs
+                if (silentMs >= KEEPALIVE_TIMEOUT_MS) {
                     Log.e("OFFTRACE", "signaling: keepalive timeout — no message in ${KEEPALIVE_TIMEOUT_MS}ms")
                     reportPeerGone("keepalive timeout")
                     return@Thread
+                }
+                if (silentMs >= DEGRADED_THRESHOLD_MS) {
+                    if (degradedReported.compareAndSet(false, true)) {
+                        Log.w("OFFTRACE", "SIG: link degraded, ${silentMs / 1000}s silent")
+                        mainHandler.post { onDegraded?.invoke(silentMs) }
+                    }
+                } else if (degradedReported.compareAndSet(true, false)) {
+                    mainHandler.post { onRecovered?.invoke() }
                 }
                 if (now - lastPingSentMs >= PING_INTERVAL_MS) {
                     send(JSONObject().put("t", "ping"))
@@ -208,8 +238,7 @@ class LocalSignaling(
         send(JSONObject().put("t", "hangup"))
     }
 
-    /** Generic send, kept public for OfflineCallManager (see class doc). Safe to call
-     *  from any thread. */
+    /** Generic send — safe to call from any thread. */
     fun send(json: JSONObject) {
         Log.d("OFFTRACE", "sig-> ${json.optString("t").ifEmpty { json.optString("type") }}")
         val out = writer ?: return
