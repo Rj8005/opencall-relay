@@ -123,6 +123,22 @@ object OfflineIdentity {
 
     fun hex(id: ByteArray): String = id.joinToString("") { "%02x".format(it) }
 
+    /** PART D4: static-static X25519 Diffie-Hellman shared secret with a
+     *  peer, derived from THIS device's own Ed25519 identity (see
+     *  [X25519Bridge]) — the raw 32-byte seed never leaves this function,
+     *  only the derived shared secret does, matching [sign]'s existing
+     *  "operations on the key, never the key itself" posture. */
+    fun x25519SharedSecret(context: Context, otherEd25519PublicKey: ByteArray): ByteArray {
+        val id = identity(context)
+        val myScalar = X25519Bridge.privateScalarFrom(id.private.encoded)
+        val otherX25519Pub = X25519Bridge.publicKeyFrom(otherEd25519PublicKey)
+        val shared = ByteArray(32)
+        org.bouncycastle.crypto.agreement.X25519Agreement().apply {
+            init(org.bouncycastle.crypto.params.X25519PrivateKeyParameters(myScalar, 0))
+        }.calculateAgreement(org.bouncycastle.crypto.params.X25519PublicKeyParameters(otherX25519Pub, 0), shared, 0)
+        return shared
+    }
+
     // ── PHASE 7A STEP 5: signed display name ────────────────────────────────
     // A user-chosen name, not the raw Wi-Fi Direct/Build.MODEL device name —
     // it travels inside the SIGNED material of HELLO/ROSTER (see MeshSigner),
@@ -189,6 +205,22 @@ object OfflineIdentity {
             val id = loadOrCreate(context.applicationContext)
             cached = id
             return id
+        }
+    }
+
+    /** PART 5.4: account deletion — irreversibly discards this device's
+     *  mesh nodeId/keypair (the root identity Part 5.1 of the three-tab
+     *  restructure made every tab share) and its display name, so the NEXT
+     *  call to [nodeId] generates a brand-new one. Purely additive: does
+     *  not touch the Ed25519 signing/verification protocol itself, only
+     *  this object's own persisted-state lifecycle. Never throws — a
+     *  missing file is already the desired end state. */
+    fun resetIdentity(context: Context) {
+        val ctx = context.applicationContext
+        synchronized(lock) {
+            cached = null
+            File(ctx.filesDir, KEY_FILE).delete()
+            ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().remove(PREF_DISPLAY_NAME).apply()
         }
     }
 

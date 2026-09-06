@@ -3,6 +3,7 @@ package com.opencall.relay.offline
 import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -11,7 +12,9 @@ import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.atan2
+import kotlin.math.ceil
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -58,7 +61,22 @@ class MeshLedger private constructor(context: Context) {
         val headingDeg: Int?,
         val speedCms: Int?,
         val tier: Int,
-        val receivedAtMs: Long
+        /** Wall-clock time this was recorded — kept for display (e.g. absolute
+         *  "last seen at") and for the store-and-forward replay window's own
+         *  aging, which lives outside this class. NEVER used to compute an
+         *  age shown to the user — see [recvElapsedMs]. */
+        val receivedAtMs: Long,
+        /** PEER DIRECTION READOUT STEP 5: SystemClock.elapsedRealtime() at the
+         *  moment THIS device received the frame — monotonic, immune to wall-
+         *  clock jumps (NTP correction, manual clock change, timezone edit),
+         *  which is what made "age=-1s" possible when age was computed from
+         *  [receivedAtMs] against System.currentTimeMillis(). [vectorTo]'s ageS
+         *  is computed EXCLUSIVELY from this field. Not persisted verbatim
+         *  (elapsedRealtime is time-since-boot — a value from a previous boot
+         *  session is meaningless after a reboot); see [loadAllFromDisk] for
+         *  how a reasonable elapsedRealtime-space value is reconstructed for a
+         *  loaded entry instead. */
+        val recvElapsedMs: Long
     ) {
         val latitude: Double get() = latE7 / 1e7
         val longitude: Double get() = lonE7 / 1e7
@@ -118,12 +136,140 @@ class MeshLedger private constructor(context: Context) {
         private const val DEFAULT_ACCURACY_M = 30 // fallback when a fix's own accuracy is unknown
         private const val LEDGER_DIR_NAME = "ledger"
 
+        /** FIX 3: MeshSigner's pubkeys.json (MeshSigner.kt:143) lives in this
+         *  SAME [ledgerDir] — [loadAllFromDisk]'s old glob was any "*.json"
+         *  file, so it also picked up "pubkeys.json", stripped the
+         *  extension to get "pubkeys", and fed that straight to
+         *  Long.parseUnsignedLong(_, 16) as if it were a hex nodeId —
+         *  throwing NumberFormatException("For input string: \"pubkeys\"
+         *  under radix 16"), caught and logged as "LEDGER: discarding
+         *  malformed file pubkeys.json: ...". Purely cosmetic for THIS
+         *  class (the catch already skips just that one file and continues
+         *  loading every real track normally) — but see MeshSignerTest's
+         *  round-trip test for why pubkeys.json's own separate load path
+         *  was never actually broken by this; the fix here is simply to
+         *  stop trying to parse a file that was never one of ours.
+         *
+         *  Pure predicate (no Context, no File I/O) so this exact filter is
+         *  directly testable — true iff [fileName] is a plausible ledger
+         *  track file: ends with ".json" and its base name parses as an
+         *  unsigned hex Long (a valid nodeId). Anything else sharing this
+         *  directory (pubkeys.json, a stray temp file, ...) is excluded
+         *  BEFORE the parse is ever attempted, rather than relying on a
+         *  catch block to paper over it. */
+        fun isLedgerTrackFileName(fileName: String): Boolean {
+            if (!fileName.endsWith(".json")) return false
+            val base = fileName.removeSuffix(".json")
+            if (base.isEmpty()) return false
+            return try {
+                java.lang.Long.parseUnsignedLong(base, 16)
+                true
+            } catch (e: NumberFormatException) {
+                false
+            }
+        }
+
+        // PEER DIRECTION READOUT STEP 7: PeerState boundaries — half-open,
+        // see vectorTo's doc for the exact 59/60/299/300s behavior.
+        const val LIVE_MAX_AGE_S = 60L
+        const val STALE_MAX_AGE_S = 300L
+        // Plausible-hiker fallback speed for the LOST search cone when this
+        // peer's own last speed is unknown (NaN) — deliberately different
+        // from MIN_SPEED_MPS/MAX_SPEED_MPS above, which back the OLDER,
+        // still-in-use searchCone()/SearchCone (SOS alert screen).
+        private const val DEFAULT_SEARCH_SPEED_MPS = 1.1f
+
         @Volatile private var instance: MeshLedger? = null
 
         fun get(context: Context): MeshLedger =
             instance ?: synchronized(this) {
                 instance ?: MeshLedger(context.applicationContext).also { instance = it }
             }
+
+        /** PEER DIRECTION READOUT: the pure decision/computation core of
+         *  [vectorTo] — everything here is deterministic given its inputs, no
+         *  ledger lookups, no Android APIs except the WGS84 geodesic (see
+         *  [GeoUtils.geodesicDistanceAndBearing]'s doc) — extracted
+         *  specifically so MeshLedgerTest can exercise it directly without
+         *  needing a Context to construct a MeshLedger (this project has no
+         *  Robolectric/Mockito dependency; same reasoning as
+         *  MeshElection.pickWinner's extraction). [vertM] is pre-computed by
+         *  the caller (needs a real MeshBarometer instance) and passed
+         *  through unchanged — this function's only job regarding it is
+         *  deciding whether the peer even qualifies structurally, not the
+         *  pressure math itself. */
+        fun computeVector(
+            myEntry: Entry?,
+            peerEntry: Entry?,
+            lostContact: LostContact?,
+            hasBlePresence: Boolean,
+            linkUp: Boolean,
+            nowElapsedMs: Long,
+            vertM: Float?
+        ): PeerVector {
+            if (peerEntry == null) {
+                val state = if (hasBlePresence) PeerState.BLE_ONLY else PeerState.UNKNOWN
+                return PeerVector(Float.NaN, Float.NaN, Float.NaN, Float.NaN, 0L, null, state)
+            }
+
+            val ageS = ((nowElapsedMs - peerEntry.recvElapsedMs) / 1000L).coerceAtLeast(0L)
+            val state = when {
+                !linkUp -> PeerState.LOST
+                ageS < LIVE_MAX_AGE_S -> PeerState.LIVE
+                ageS < STALE_MAX_AGE_S -> PeerState.STALE
+                else -> PeerState.LOST
+            }
+
+            // LOST prefers the frozen markLostContact() snapshot (dead-reckoned
+            // pre-loss heading/speed) when one exists; otherwise (e.g.
+            // linkUp=false arrives before the roster-diff has actually called
+            // markLostContact yet) falls back to the plain last entry.
+            val lc = if (state == PeerState.LOST) lostContact else null
+            val refEntry = lc?.lastEntry ?: peerEntry
+
+            var distM = Float.NaN
+            var bearingTrue = Float.NaN
+            var accFloorM = 0f
+            if (myEntry != null) {
+                // PEER DIRECTION READOUT STEP 3: WGS84 ellipsoidal geodesic
+                // (the same algorithm android.location.Location.distanceBetween
+                // uses internally) — see GeoUtils.geodesicDistanceAndBearing's
+                // doc for why that platform API isn't called directly. NOT the
+                // haversine spherical approximation (GeoUtils.haversineMeters/
+                // bearingDeg stay exactly as they are, for their existing callers).
+                val result = GeoUtils.geodesicDistanceAndBearing(myEntry.latitude, myEntry.longitude, refEntry.latitude, refEntry.longitude)
+                distM = result[0].toFloat()
+                bearingTrue = ((result[1] + 360.0) % 360.0).toFloat()
+                accFloorM = (myEntry.accuracyMeters ?: 0) + (refEntry.accuracyMeters ?: 0).toFloat()
+                if (distM < accFloorM) {
+                    // Below the floor: the bearing carries no real information
+                    // (a fix-to-fix vector shorter than combined GPS error is
+                    // noise, not direction) — suppressed, per class doc. distM
+                    // itself is left as the raw computed value; "here (within
+                    // N m)" text formatting is the caller's job, not this
+                    // function's — see OfflineCallActivity's row builder.
+                    bearingTrue = Float.NaN
+                }
+            }
+
+            val peerHeadingDeg = (lc?.computedHeadingDeg ?: refEntry.headingDeg)?.toFloat() ?: Float.NaN
+            val speedMps = (lc?.computedSpeedCms ?: refEntry.speedCms)?.let { it / 100f } ?: Float.NaN
+
+            var coneMin = Float.NaN
+            var coneMax = Float.NaN
+            if (state == PeerState.LOST) {
+                // SEARCH CONE: the peer's own last-known speed if we have one,
+                // else a plausible-hiker default — never the fixed 0.3-1.5 m/s
+                // range the older searchCone()/SearchCone (still used by the
+                // SOS alert screen) uses; this is a deliberately different,
+                // narrower formula scoped to this new row text.
+                val v = if (speedMps.isNaN()) DEFAULT_SEARCH_SPEED_MPS else speedMps
+                coneMin = v * ageS * 0.5f
+                coneMax = v * ageS * 1.5f
+            }
+
+            return PeerVector(distM, bearingTrue, peerHeadingDeg, speedMps, ageS, vertM, state, accFloorM, coneMin, coneMax)
+        }
     }
 
     private val appContext = context.applicationContext
@@ -255,6 +401,112 @@ class MeshLedger private constructor(context: Context) {
 
     fun clearBlePresence(nodeId: Long) {
         tracks[nodeId]?.blePresence = null
+    }
+
+    // ── PEER DIRECTION READOUT: distance/bearing/heading/age/vertical ──────────
+
+    enum class PeerState { LIVE, STALE, LOST, BLE_ONLY, UNKNOWN }
+
+    /** [distM]/[bearingTrue]/[peerHeading]/[speed] are NaN (never null — see
+     *  Step 4's NaN-means-unknown convention) whenever there's nothing to
+     *  report; [vertM] is a real nullable Float since "no barometer reading"
+     *  is a normal, common, permanent state (see class doc) worth a proper
+     *  null rather than a sentinel. [accFloorM]/[coneMinM]/[coneMaxM] aren't
+     *  named in the original field list but are load-bearing for the exact
+     *  row-text examples given (the distance floor's "within N m" and the
+     *  LOST row's "search 340-1010 m" both need a value the caller can't
+     *  otherwise reconstruct without re-deriving accuracy/speed math this
+     *  function already did) — accFloorM is always a real number (0f when
+     *  either side's accuracy is unknown), coneMinM/coneMaxM are NaN outside
+     *  PeerState.LOST. */
+    data class PeerVector(
+        val distM: Float,
+        val bearingTrue: Float,
+        val peerHeading: Float,
+        val speed: Float,
+        val ageS: Long,
+        val vertM: Float?,
+        val state: PeerState,
+        val accFloorM: Float = 0f,
+        val coneMinM: Float = Float.NaN,
+        val coneMaxM: Float = Float.NaN
+    )
+
+    /** The full picture for one peer's row — distance/bearing/heading/age/
+     *  vertical/state, computed from THIS device's own last recorded fix and
+     *  [nodeId]'s. Never null: a peer with no position history at all still
+     *  gets a PeerVector (BLE_ONLY or UNKNOWN state, every numeric field
+     *  NaN). [linkUp] must come from the caller — mesh/roster connectivity is
+     *  OfflineMediaTransport's concern, this class only ever sees position
+     *  samples and BLE sightings. [myBarometer], if given, is used ONLY to
+     *  compute [PeerVector.vertM] via the SAME pressure-difference math
+     *  buildMemberCard already trusts (MeshBarometer.relativeAltitudeTo) —
+     *  never GPS altitude, see that function's own doc for why a difference
+     *  through a shared local reference is what makes this trustworthy at
+     *  all.
+     *
+     *  STATE MACHINE (boundaries are half-open — see MeshLedgerTest):
+     *    !linkUp                  -> LOST, at any age
+     *    linkUp && ageS < 60      -> LIVE
+     *    linkUp && ageS < 300     -> STALE
+     *    linkUp && ageS >= 300    -> LOST (an update this old is effectively
+     *                                lost track even if still mesh-connected)
+     *    no position ever, BLE seen -> BLE_ONLY
+     *    no position ever, no BLE   -> UNKNOWN
+     *
+     *  [nowElapsedMs] defaults to the real clock — overridable ONLY so
+     *  MeshLedgerTest can exercise the age/state-machine boundaries
+     *  deterministically without needing Robolectric (this project has no
+     *  Robolectric dependency; see [GeoUtils.geodesicDistanceAndBearing]'s
+     *  doc for why the same reasoning applies to the distance/bearing call
+     *  below). Production code never passes this explicitly.
+     */
+    fun vectorTo(
+        nodeId: Long,
+        myNodeId: Long,
+        linkUp: Boolean,
+        myBarometer: MeshBarometer? = null,
+        nowElapsedMs: Long = SystemClock.elapsedRealtime()
+    ): PeerVector {
+        val entry = latestEntry(nodeId)
+        val myEntry = latestEntry(myNodeId)
+        val hasBle = blePresenceFor(nodeId) != null
+        val lc = lostContactFor(nodeId)
+        // VERTICAL: only when BOTH sides reported a real pressure reading —
+        // MeshBarometer.relativeAltitudeTo is itself a second layer of the
+        // same guard (returns null with no local reading), but checking
+        // refEntry.pressureHpaX10 too (inside computeVector) means a peer who
+        // never had a barometer never even attempts the call.
+        val refEntryForVert = lc?.lastEntry ?: entry
+        val vertM = if (myBarometer != null && myEntry?.pressureHpaX10 != null && refEntryForVert?.pressureHpaX10 != null) {
+            myBarometer.relativeAltitudeTo(refEntryForVert.pressureHpaX10 / 10.0)?.toFloat()
+        } else {
+            null
+        }
+        val v = computeVector(myEntry, entry, lc, hasBle, linkUp, nowElapsedMs, vertM)
+        logVecThrottled(nodeId, v.distM, v.bearingTrue, v.peerHeading, v.ageS, v.state, v.vertM)
+        return v
+    }
+
+    private val lastVecLogAtMs = ConcurrentHashMap<Long, Long>()
+
+    /** PEER DIRECTION READOUT STEP 9: throttled to 1 line per srcId per
+     *  second — vectorTo is called at up to 4Hz per visible row (see
+     *  OfflineCallActivity.refreshPartyRowTexts), so without this it would
+     *  become exactly the kind of per-tick log flood the old unthrottled
+     *  relay-forward log line once caused (see OfflineMediaTransport's
+     *  logIfRelayed, "MESH: relayed $n frames from ..." — that line was
+     *  itself throttled for the same reason, historically 76% of all
+     *  OFFTRACE output before that fix). */
+    private fun logVecThrottled(nodeId: Long, d: Float, brg: Float, hdg: Float, ageS: Long, state: PeerState, vert: Float?) {
+        val now = System.currentTimeMillis()
+        val last = lastVecLogAtMs[nodeId] ?: 0L
+        if (now - last < 1_000L) return
+        lastVecLogAtMs[nodeId] = now
+        Log.d(
+            "OFFTRACE",
+            "VEC: ${MeshFrame.hex(nodeId)} d=${d}m brg=$brg hdg=$hdg age=${ageS}s state=$state vert=$vert"
+        )
     }
 
     /** Public wrapper around the same heading/speed derivation used internally
@@ -442,7 +694,10 @@ class MeshLedger private constructor(context: Context) {
     }
 
     private fun loadAllFromDisk() {
-        val files = ledgerDir.listFiles { f -> f.name.endsWith(".json") } ?: return
+        // FIX 3: was `f.name.endsWith(".json")` alone — matched MeshSigner's
+        // pubkeys.json too (same directory), which this class was never
+        // able to parse as a track file. See isLedgerTrackFileName's doc.
+        val files = ledgerDir.listFiles { f -> isLedgerTrackFileName(f.name) } ?: return
         val now = System.currentTimeMillis()
         var loaded = 0
         files.forEach { file ->
@@ -465,7 +720,21 @@ class MeshLedger private constructor(context: Context) {
                             headingDeg = o.optIntOrNull("hdg"),
                             speedCms = o.optIntOrNull("spd"),
                             tier = o.optInt("tier"),
-                            receivedAtMs = t
+                            receivedAtMs = t,
+                            // PEER DIRECTION READOUT STEP 5: elapsedRealtime
+                            // is time-since-boot — a value from a PREVIOUS
+                            // boot session is meaningless (could even exceed
+                            // the current boot's elapsedRealtime, producing a
+                            // negative age). Deliberately NOT persisted (see
+                            // Entry's doc) — reconstructed here as "now, minus
+                            // the wall-clock age this entry had when it was
+                            // saved," floored at 0 so a backward wall-clock
+                            // jump between save and load can't produce a
+                            // negative offset here either. This is a one-time
+                            // approximation only at the process-restart
+                            // boundary; every age computed from this value
+                            // AFTER load is fully monotonic.
+                            recvElapsedMs = (SystemClock.elapsedRealtime() - (now - t).coerceAtLeast(0)).coerceAtLeast(0L)
                         )
                     )
                 }
@@ -490,4 +759,78 @@ class MeshLedger private constructor(context: Context) {
 
     private fun JSONObject.optIntOrNull(key: String): Int? =
         if (isNull(key) || !has(key)) null else optInt(key)
+}
+
+/** PEER DIRECTION READOUT: the exact per-state row text — a pure, top-level
+ *  function (not a MeshLedger member, not an OfflineCallActivity member) so
+ *  it's directly off-device-testable (see MeshLedgerTest) despite living
+ *  next to the class whose PeerVector it formats. Only ever reads
+ *  [MeshLedger.PeerVector]/[MeshLedger.BlePresence] — never MeshCompass, so
+ *  there is no call path by which rotating the phone could reach this
+ *  function (see STEP 2's hard rule, proven in OUTPUT #3). 16-point
+ *  cardinals only (GeoUtils.compassPoint) — degrees are never shown. */
+fun formatPeerVectorRow(name: String, v: MeshLedger.PeerVector, ble: MeshLedger.BlePresence?): String {
+    fun distText(): String? = when {
+        v.distM.isNaN() -> null
+        v.distM < v.accFloorM -> "here (within ${ceil(v.accFloorM).toInt()} m)"
+        v.distM < 1000f -> "${v.distM.roundToInt()} m"
+        else -> "%.1f km".format(v.distM / 1000f)
+    }
+    fun cardinal(): String? = if (v.bearingTrue.isNaN()) null else GeoUtils.compassPoint(v.bearingTrue.toDouble())
+    fun distAndCardinal(): String? {
+        val d = distText() ?: return null
+        val c = cardinal()
+        // Below the distance floor the bearing is suppressed too — see
+        // MeshLedger.vectorTo's doc — so "here (within N m)" never gets a
+        // trailing cardinal even though d itself is non-null there.
+        return if (c != null) "$d $c" else d
+    }
+    fun headingWord(): String? = if (v.peerHeading.isNaN()) null else "heading ${GeoUtils.compassPoint(v.peerHeading.toDouble())}"
+    fun speedWord(): String? = if (v.speed.isNaN()) null else "%.1f m/s".format(v.speed)
+
+    // PHASE 3 GLOBAL UI RULE: every distance/bearing renders with its age —
+    // "a bare metre value is a bug." LIVE's distAndCardinal() (below) is the
+    // one branch that used to omit this (STALE/LOST already included it in
+    // minutes); ageS is always < LIVE_MAX_AGE_S (60s) here, so seconds are
+    // the natural unit rather than always-zero minutes.
+    fun freshAgeWord(): String = if (v.ageS <= 0L) "just now" else "${v.ageS}s ago"
+
+    return when (v.state) {
+        MeshLedger.PeerState.LIVE -> {
+            val distPart = distAndCardinal() ?: "direction unknown"
+            val hdg = headingWord()
+            // PEER DIRECTION READOUT STEP 4: "NaN heading renders as
+            // 'stationary', not a direction" — a peer moving too slowly for
+            // GNSS course to be meaningful (or genuinely not moving) always
+            // gets an explicit movement word, never a silently omitted clause.
+            val movePart = if (hdg != null) (speedWord()?.let { "$hdg $it" } ?: hdg) else "stationary"
+            "$name — $distPart · $movePart · ${freshAgeWord()}"
+        }
+        MeshLedger.PeerState.STALE -> {
+            val distPart = distAndCardinal() ?: "direction unknown"
+            val minutes = (v.ageS / 60L).coerceAtLeast(0L)
+            "$name — $distPart · $minutes min ago"
+        }
+        MeshLedger.PeerState.LOST -> {
+            val minutes = (v.ageS / 60L).coerceAtLeast(0L)
+            val parts = mutableListOf("LAST SEEN $minutes min ago")
+            distAndCardinal()?.let { parts.add(it) }
+            headingWord()?.let { parts.add(it) }
+            if (!v.coneMinM.isNaN() && !v.coneMaxM.isNaN()) {
+                parts.add("search ${v.coneMinM.roundToInt()}–${v.coneMaxM.roundToInt()} m")
+            }
+            "$name — " + parts.joinToString(" · ")
+        }
+        MeshLedger.PeerState.BLE_ONLY -> {
+            // No metres, ever — an RSSI trend is not a fix, see class doc.
+            val trendWord = when (ble?.trend) {
+                MeshLedger.Trend.CLOSER -> "getting closer"
+                MeshLedger.Trend.FARTHER -> "moving away"
+                MeshLedger.Trend.STEADY -> "steady distance"
+                else -> "nearby"
+            }
+            "$name — nearby, $trendWord"
+        }
+        MeshLedger.PeerState.UNKNOWN -> "$name — direction unknown"
+    }
 }

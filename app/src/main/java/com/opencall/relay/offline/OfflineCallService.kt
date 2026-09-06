@@ -38,6 +38,12 @@ class OfflineCallService : Service() {
         private const val TAG = "OfflineCallService"
         private const val CHANNEL_ID = "offline_call_channel"
         private const val NOTIF_ID = 2001
+        // BUG (MAKE THE INVITE ACTUALLY TRANSMIT) FIX PART 2.1/2.3: a
+        // SEPARATE, HIGH-importance channel from the ongoing-call one above
+        // (IMPORTANCE_LOW, silent, ongoing) — an incoming invite needs to
+        // actually alert (heads-up + sound), and isn't ongoing.
+        private const val INVITE_CHANNEL_ID = "incoming_invite_channel"
+        private const val INVITE_NOTIF_ID = 2002
         const val ACTION_START = "com.opencall.relay.offline.START"
         const val ACTION_STOP = "com.opencall.relay.offline.STOP"
 
@@ -54,6 +60,48 @@ class OfflineCallService : Service() {
 
         /** No-op if the service isn't running. */
         fun reacquireWifiLockForBeacon() = activeInstance?.acquireWifiLock()
+
+        /** BUG (MAKE THE INVITE ACTUALLY TRANSMIT) FIX PART 2.1/2.3: posted
+         *  unconditionally — a plain NotificationManager.notify() call needs
+         *  no running Service and works whether or not this device's own
+         *  foreground service happens to be up yet, which is exactly why
+         *  item 2.3 asks to confirm the service IS running for the
+         *  invite-listening window: this notification alone gets the alert
+         *  onto the screen even backgrounded, but only the foreground
+         *  service (started from Activity.startDiscovery, not just after a
+         *  group forms — see OfflineCallActivity's own doc on why that
+         *  changed) keeps the PROCESS itself alive long enough to still be
+         *  listening for WIFI_P2P_PEERS_CHANGED_ACTION when the invite
+         *  actually arrives. Tapping the notification opens the app, where
+         *  the existing Accept/Decline dialog (same pattern as A5's
+         *  incoming-roster-invite dialog) takes over. */
+        fun notifyIncomingInvite(context: Context, fromName: String, fromMac: String) {
+            val appContext = context.applicationContext
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    INVITE_CHANNEL_ID,
+                    "Incoming invites",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply { description = "Someone nearby wants to connect over Wi-Fi Direct" }
+                (appContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                    .createNotificationChannel(channel)
+            }
+            val openPending = PendingIntent.getActivity(
+                appContext, 0, Intent(appContext, OfflineCallActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notification = NotificationCompat.Builder(appContext, INVITE_CHANNEL_ID)
+                .setContentTitle("$fromName wants to connect")
+                .setContentText("Tap to accept or decline")
+                .setSmallIcon(android.R.drawable.ic_menu_call)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_CALL)
+                .setAutoCancel(true)
+                .setContentIntent(openPending)
+                .build()
+            androidx.core.app.NotificationManagerCompat.from(appContext).notify(INVITE_NOTIF_ID, notification)
+            Log.d("OFFTRACE", "P2P: incoming invite from=$fromMac name=$fromName")
+        }
     }
 
     private var wakeLock: PowerManager.WakeLock? = null

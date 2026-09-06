@@ -12,6 +12,12 @@ class IncomingCallActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED)
         setContentView(R.layout.activity_incoming_call)
+        // PART 2.2: targetSdk 36 — edge-to-edge is mandatory, no opt-out.
+        // activity_incoming_call.xml's root has no android:id of its own,
+        // so this insets the platform content container one level up
+        // instead — its only child is that root, so padding here reaches
+        // the same place.
+        com.opencall.relay.shell.AppShell.applySystemBarInsets(findViewById(android.R.id.content))
         val callId = intent.getStringExtra("callId") ?: ""
         val dialNumber = intent.getStringExtra("dialNumber") ?: ""
         findViewById<TextView>(R.id.tv_dial_number).text = "Relaying call to\n$dialNumber"

@@ -1,5 +1,7 @@
 package com.opencall.relay.offline
 
+import kotlin.math.abs
+import kotlin.math.atan
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.pow
@@ -50,6 +52,84 @@ object GeoUtils {
         val y = sin(dLon) * cos(phi2)
         val x = cos(phi1) * sin(phi2) - sin(phi1) * cos(phi2) * cos(dLon)
         return (Math.toDegrees(atan2(y, x)) + 360.0) % 360.0
+    }
+
+    /** PEER DIRECTION READOUT STEP 3: WGS84 ellipsoidal geodesic distance
+     *  (metres) + initial true bearing (degrees, 0..360) — Vincenty's inverse
+     *  formula, the SAME algorithm android.location.Location.distanceBetween
+     *  uses internally (confirmed against AOSP's Location.java, which is a
+     *  direct port of this exact method). Used here INSTEAD of calling that
+     *  platform API directly, specifically because Location.distanceBetween
+     *  is unmockable in this project's plain-JVM unit tests — confirmed
+     *  empirically ("Method distanceBetween in android.location.Location not
+     *  mocked"; no Robolectric dependency exists here) — and the established
+     *  convention in this codebase is pure-Kotlin, off-device-testable math
+     *  (see MeshElection.pickWinner, MeshLocation's codec, this file's own
+     *  class doc). This is NOT the haversine spherical approximation above —
+     *  it's the full ellipsoidal solution, same accuracy class as the
+     *  platform API it replaces.
+     *
+     *  Returns [distanceMeters, initialBearingDegrees]. Falls back to the
+     *  spherical (haversine/bearingDeg) result only if Vincenty fails to
+     *  converge (near-antipodal points, an extreme edge case for a
+     *  mountaineering use case) — never returns garbage. */
+    fun geodesicDistanceAndBearing(lat1: Double, lon1: Double, lat2: Double, lon2: Double): DoubleArray {
+        if (lat1 == lat2 && lon1 == lon2) return doubleArrayOf(0.0, 0.0)
+        val a = UTM_A
+        val f = UTM_F
+        val b = a * (1 - f)
+        val bigL = Math.toRadians(lon2 - lon1)
+        val u1 = atan((1 - f) * tan(Math.toRadians(lat1)))
+        val u2 = atan((1 - f) * tan(Math.toRadians(lat2)))
+        val sinU1 = sin(u1); val cosU1 = cos(u1)
+        val sinU2 = sin(u2); val cosU2 = cos(u2)
+
+        var lambda = bigL
+        var lambdaPrev: Double
+        var iterLimit = 100
+        var sinSigma = 0.0
+        var cosSigma = 0.0
+        var sigma = 0.0
+        var cosSqAlpha = 0.0
+        var cos2SigmaM = 0.0
+
+        do {
+            val sinLambda = sin(lambda); val cosLambda = cos(lambda)
+            sinSigma = sqrt(
+                (cosU2 * sinLambda).pow(2) + (cosU1 * sinU2 - sinU1 * cosU2 * cosLambda).pow(2)
+            )
+            if (sinSigma == 0.0) return doubleArrayOf(0.0, 0.0) // coincident points
+            cosSigma = sinU1 * sinU2 + cosU1 * cosU2 * cosLambda
+            sigma = atan2(sinSigma, cosSigma)
+            val sinAlpha = cosU1 * cosU2 * sinLambda / sinSigma
+            cosSqAlpha = 1 - sinAlpha * sinAlpha
+            cos2SigmaM = if (cosSqAlpha != 0.0) cosSigma - 2 * sinU1 * sinU2 / cosSqAlpha else 0.0
+            val c = f / 16 * cosSqAlpha * (4 + f * (4 - 3 * cosSqAlpha))
+            lambdaPrev = lambda
+            lambda = bigL + (1 - c) * f * sinAlpha *
+                (sigma + c * sinSigma * (cos2SigmaM + c * cosSigma * (-1 + 2 * cos2SigmaM * cos2SigmaM)))
+        } while (abs(lambda - lambdaPrev) > 1e-12 && --iterLimit > 0)
+
+        if (iterLimit == 0) {
+            return doubleArrayOf(haversineMeters(lat1, lon1, lat2, lon2), bearingDeg(lat1, lon1, lat2, lon2))
+        }
+
+        val uSq = cosSqAlpha * (a * a - b * b) / (b * b)
+        val bigA = 1 + uSq / 16384 * (4096 + uSq * (-768 + uSq * (320 - 175 * uSq)))
+        val bigB = uSq / 1024 * (256 + uSq * (-128 + uSq * (74 - 47 * uSq)))
+        val deltaSigma = bigB * sinSigma * (
+            cos2SigmaM + bigB / 4 * (
+                cosSigma * (-1 + 2 * cos2SigmaM * cos2SigmaM) -
+                    bigB / 6 * cos2SigmaM * (-3 + 4 * sinSigma * sinSigma) * (-3 + 4 * cos2SigmaM * cos2SigmaM)
+                )
+            )
+        val distance = b * bigA * (sigma - deltaSigma)
+
+        val sinLambdaFinal = sin(lambda); val cosLambdaFinal = cos(lambda)
+        val alpha1 = atan2(cosU2 * sinLambdaFinal, cosU1 * sinU2 - sinU1 * cosU2 * cosLambdaFinal)
+        val bearing = (Math.toDegrees(alpha1) + 360.0) % 360.0
+
+        return doubleArrayOf(distance, bearing)
     }
 
     private val COMPASS_POINTS = arrayOf(

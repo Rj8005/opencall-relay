@@ -22,19 +22,82 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.android.flexbox.FlexboxLayout
 import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.opencall.relay.account.AccountStore
 import com.opencall.relay.databinding.ActivityMainBinding
+import com.opencall.relay.dialer.ui.PhoneTabController
+import com.opencall.relay.international.InternationalCallScreen
 import com.opencall.relay.offline.OfflineCallActivity
+import com.opencall.relay.settings.SettingsActivity
+import com.opencall.relay.shell.AppShell
+import com.opencall.relay.shell.AppTab
 import java.net.HttpURLConnection
 import java.net.URL
 
+/**
+ * PART 1: the app's shell — hosts Tab 1 (International) and Tab 2 (Phone)
+ * as sibling containers inside `screen_dashboard` (same visibility-toggle
+ * pattern this Activity already used for `screen_setup`/`screen_dashboard`
+ * itself); Tab 3 (Offline) is a hop to [OfflineCallActivity], which wears
+ * the same shared chrome ([AppShell]) — see this task's report for why
+ * that's a separate Activity rather than a third container here (a 6955-
+ * line, already-stable screen the brief explicitly asked not to refactor).
+ * `android:launchMode="singleTask"` (manifest) + [Intent.
+ * FLAG_ACTIVITY_REORDER_TO_FRONT] on every cross-Activity tab switch, never
+ * `finish()`, is what keeps both this Activity's and OfflineCallActivity's
+ * state alive across pillar switching — see [onTabBarSelected].
+ */
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        /** Set by [OfflineCallActivity]'s global tab bar / [com.opencall.relay.
+         *  dialer.ui.DialerHostActivity]'s redirect — which [AppTab] to show. */
+        const val EXTRA_SELECT_TAB = "select_tab"
+        /** Set by DialerHostActivity's redirect (ACTION_DIAL/tel:) — pre-fills
+         *  the Phone tab's keypad. */
+        const val EXTRA_PREFILL_NUMBER = "prefill_number"
+        /** Set by SettingsActivity's "Change account" row — see the header
+         *  comment near the old `tvChangeUser` click listener below. */
+        const val EXTRA_RESET_SETUP = "reset_setup"
+        private const val PREF_LAST_TAB = "last_tab"
+    }
+
     private lateinit var binding: ActivityMainBinding
+    private var currentTab: AppTab = AppTab.INTERNATIONAL
+    private lateinit var internationalScreen: InternationalCallScreen
+    private lateinit var phoneTabController: PhoneTabController
+
+    // PART 0: every permission-result path in this app — this class's own
+    // legacy onRequestPermissionsResult below included — checks the
+    // Activity is alive AND phoneTabController is actually constructed
+    // before touching anything. A permission dialog can be answered well
+    // after the user has backgrounded/left the screen; the result callback
+    // still fires, on whatever Activity instance issued the request.
+    private val phoneCallPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> ifAliveAndReady { phoneTabController.handleCallPermissionResult(granted) } }
+    private val phoneCallLogPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> ifAliveAndReady { phoneTabController.handleCallLogPermissionResult(granted) } }
+    private val phoneContactsPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> ifAliveAndReady { phoneTabController.handleContactsPermissionResult(granted) } }
+
+    /** PART 0: the shared guard — Activity not finishing/destroyed, and the
+     *  tab-shell Views/controllers this callback would touch actually exist
+     *  (they're built in [setupTabShell], called from [onCreate]; a stray
+     *  callback that somehow fired before that would otherwise crash on an
+     *  uninitialized `lateinit`). */
+    private fun ifAliveAndReady(action: () -> Unit) {
+        if (isFinishing || isDestroyed) return
+        if (!::phoneTabController.isInitialized) return
+        action()
+    }
 
     private val REQUIRED_PERMISSIONS = arrayOf(
         android.Manifest.permission.READ_PHONE_STATE,
@@ -44,14 +107,9 @@ class MainActivity : AppCompatActivity() {
         android.Manifest.permission.RECORD_AUDIO,
     )
 
-    private val relayStoppedReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == RelayService.ACTION_STOPPED) {
-                updateRelayStatus()
-            }
-        }
-    }
-    private var receiverRegistered = false
+    // PART 1.3: relayStoppedReceiver (+ the status-pill UI it drove) moved
+    // to SettingsActivity along with the rest of Cards 1/2/3 — this
+    // Activity no longer shows relay status directly.
 
     private val relaySmsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -83,19 +141,36 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        // PART 2.2: targetSdk 36 — edge-to-edge is mandatory, no opt-out.
+        AppShell.applySystemBarInsets(binding.root)
 
-        // CAP PROBE: temporary read-only diagnostic — see CapabilityProbe.kt.
+        // PART 1.1: native back handling for Tab 1's WebView — its own
+        // history first, system back (leave the app / whatever's next in
+        // the task) only once it has none left, and only while Tab 1 is
+        // actually the visible tab.
+        onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                val consumed = currentTab == AppTab.INTERNATIONAL &&
+                    ::internationalScreen.isInitialized && internationalScreen.handleBackPressed()
+                if (!consumed) {
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                    isEnabled = true
+                }
+            }
+        })
+
+        // CAP PROBE: temporary read-only diagnostic \u2014 see CapabilityProbe.kt.
         CapabilityProbe.logStartupCapabilities(this)
 
-        if (REQUIRED_PERMISSIONS.any {
-                checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
-            }) {
-            requestPermissions(REQUIRED_PERMISSIONS, 1001)
-        }
-        setupStatusBar()
-        setupRelayButton()
-        setupModeButtons()
-        addOfflineCallButton()
+        // PART 4.3: removed the old blanket 5-permission request that used
+        // to fire right here, unconditionally, on every cold launch, with
+        // no rationale — exactly what that Part's instruction singles out.
+        // Every permission this Activity needs is now requested at its own
+        // point of use instead: see startRelayService's rationale dialog
+        // below (CALL_PHONE/RECORD_AUDIO, right before the user's own "Set
+        // up relay node" tap actually needs them).
+        setupTabShell()
 
         binding.btnSetupComplete.setOnClickListener {
             val name   = binding.etSetupName.text.toString().trim()
@@ -118,9 +193,14 @@ class MainActivity : AppCompatActivity() {
                 .putString("server_url",  server)
                 .putBoolean("setup_complete", true)
                 .apply()
+            // PART 5.1/5.2: this onboarding step doubles as "who is this
+            // device" for the whole app now — written alongside (not instead
+            // of) the "opencall" keys above, which the untouched relay/SMS
+            // code in this file still reads directly.
+            AccountStore.setDisplayName(this, name)
+            AccountStore.setSimNumber(this, normalized, verified = true)
 
             showScreen("dashboard")
-            updateHeaderInfo(name, normalized)
             startRelayService(server, normalized)
         }
 
@@ -138,25 +218,122 @@ class MainActivity : AppCompatActivity() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
         })
 
-        binding.tvChangeUser.setOnClickListener {
+        // PART 1.2: the "change" link that used to sit in this header moved
+        // into Settings' Account section ("Change account") — see
+        // EXTRA_RESET_SETUP below, which is how it gets back here.
+
+        initFlow()
+        applyIncomingExtras(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyIncomingExtras(intent)
+    }
+
+    private fun applyIncomingExtras(intent: Intent) {
+        if (intent.getBooleanExtra(EXTRA_RESET_SETUP, false)) {
             getSharedPreferences("opencall", MODE_PRIVATE).edit()
                 .putBoolean("setup_complete", false)
                 .apply()
             stopRelayService()
             showScreen("setup")
+            return
         }
-
-        initFlow()
+        val tabName = intent.getStringExtra(EXTRA_SELECT_TAB)
+        val tab = tabName?.let { runCatching { AppTab.valueOf(it) }.getOrNull() }
+        if (tab != null && tab != AppTab.OFFLINE) showTab(tab)
+        intent.getStringExtra(EXTRA_PREFILL_NUMBER)?.let { number ->
+            showTab(AppTab.PHONE)
+            if (::phoneTabController.isInitialized) phoneTabController.prefillNumber(number)
+        }
     }
 
-    // ── Two-screen flow ───────────────────────────────────────────────────────
+    // â”€â”€ Two-screen flow â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private fun showScreen(screen: String) {
         binding.screenSetup.visibility =
             if (screen == "setup") View.VISIBLE else View.GONE
         binding.screenDashboard.visibility =
             if (screen == "dashboard") View.VISIBLE else View.GONE
-        if (screen == "dashboard") restoreRelayMode()
+    }
+
+    // ── PART 1: three-tab shell ──────────────────────────────────────────
+
+    private fun setupTabShell() {
+        internationalScreen = InternationalCallScreen(this, binding.tabInternational)
+        phoneTabController = PhoneTabController(
+            this, binding.tabPhone,
+            phoneCallPermissionLauncher, phoneCallLogPermissionLauncher, phoneContactsPermissionLauncher
+        )
+        // PART 2.1: same AppShell.buildTopBar() call OfflineCallActivity.kt:2911
+        // makes — one header-rendering code path for all three tabs now.
+        binding.dashboardTopBarSlot.addView(
+            AppShell.buildTopBar(this) {
+                startActivity(Intent(this, SettingsActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                })
+            }
+        )
+
+        // PART 1.4: process-death/first-launch restore — see AppShell.restoreTab's
+        // own doc for why AppTab.OFFLINE is never what this returns.
+        val stored = getSharedPreferences("opencall", MODE_PRIVATE).getString(PREF_LAST_TAB, null)
+        showTab(AppShell.restoreTab(stored))
+    }
+
+    /** Bottom-bar tap: Offline hops to [OfflineCallActivity] (never
+     *  `finish()`-ing this Activity, see class doc); the other two tabs are
+     *  shown in place. */
+    private fun onTabBarSelected(tab: AppTab) {
+        if (tab == AppTab.OFFLINE) {
+            getSharedPreferences("opencall", MODE_PRIVATE).edit().putString(PREF_LAST_TAB, tab.name).apply()
+            startActivity(Intent(this, OfflineCallActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+            })
+            return
+        }
+        showTab(tab)
+    }
+
+    private fun showTab(tab: AppTab) {
+        currentTab = tab
+        getSharedPreferences("opencall", MODE_PRIVATE).edit().putString(PREF_LAST_TAB, tab.name).apply()
+        binding.tabInternational.visibility = if (tab == AppTab.INTERNATIONAL) View.VISIBLE else View.GONE
+        binding.tabPhone.visibility = if (tab == AppTab.PHONE) View.VISIBLE else View.GONE
+        if (tab == AppTab.INTERNATIONAL) internationalScreen.start()
+        if (tab == AppTab.PHONE) phoneTabController.start()
+        renderBottomTabBar()
+    }
+
+    /** PART 2.1: AppShell.buildBottomTabBar() bakes the selected tab's colour
+     *  into the views it returns at build time (see AppShell.kt) — it has no
+     *  separate "update selection" entry point, so unlike the old inline nav
+     *  bar (which just recoloured its existing icon/label views in place),
+     *  this rebuilds the bar fresh on every tab switch. */
+    private fun renderBottomTabBar() {
+        binding.dashboardBottomBarSlot.removeAllViews()
+        binding.dashboardBottomBarSlot.addView(
+            AppShell.buildDivider(this),
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (1 * resources.displayMetrics.density).toInt()
+            )
+        )
+        binding.dashboardBottomBarSlot.addView(
+            AppShell.buildBottomTabBar(this, currentTab) { tab -> onTabBarSelected(tab) }
+        )
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(PREF_LAST_TAB, currentTab.name)
+    }
+
+    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
+        super.onRestoreInstanceState(savedInstanceState)
+        showTab(AppShell.restoreTab(savedInstanceState.getString(PREF_LAST_TAB)))
     }
 
     private fun initFlow() {
@@ -166,20 +343,15 @@ class MainActivity : AppCompatActivity() {
         val number  = prefs.getString("user_number", null)
         if (claimed && !name.isNullOrBlank() && !number.isNullOrBlank()) {
             showScreen("dashboard")
-            updateHeaderInfo(name, number)
-            // Restore saved server URL to the dashboard field
-            val savedServer = prefs.getString("server_url", RelayService.DEFAULT_SERVER) ?: RelayService.DEFAULT_SERVER
-            binding.etServerUrl.setText(savedServer)
+            // PART 1.3: the server-URL field itself now lives in
+            // SettingsActivity (Card 2), which reads/restores it on its own
+            // onCreate — nothing to do with it here anymore.
         } else {
             showScreen("setup")
         }
     }
 
-    private fun updateHeaderInfo(name: String, number: String) {
-        binding.tvHeaderUserInfo.text = "$name · $number"
-    }
-
-    // ── Relay service helpers ─────────────────────────────────────────────────
+    // â”€â”€ Relay service helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fun normalizeNumber(num: String): String {
         var n = num.trim().replace(Regex("[\\s\\-\\(\\)]"), "")
@@ -187,6 +359,11 @@ class MainActivity : AppCompatActivity() {
         return n
     }
 
+    private var pendingRelayStart: Pair<String, String>? = null
+
+    // PART 4.3: this app's own permission-result callback for the CALL_PHONE/
+    // RECORD_AUDIO pair below (requestCode 1001 is also still used by
+    // onRequestPermissionsResult's generic toast, unchanged).
     private fun startRelayService(serverUrl: String, e164: String) {
         val hasCall  = checkSelfPermission(Manifest.permission.CALL_PHONE) ==
             PackageManager.PERMISSION_GRANTED
@@ -194,12 +371,23 @@ class MainActivity : AppCompatActivity() {
             PackageManager.PERMISSION_GRANTED
 
         if (!hasCall || !hasAudio) {
-            Toast.makeText(
-                this,
-                "Grant Call and Microphone permissions first",
-                Toast.LENGTH_LONG
-            ).show()
-            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, 1001)
+            pendingRelayStart = serverUrl to e164
+            // PART 4.3: a rationale FIRST, in this app's own dialog — the
+            // system permission dialog(s) only appear after the user taps
+            // "Continue" here, never as a surprise on launch or mid-flow.
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("Call and microphone access")
+                .setMessage(
+                    "OpenCall needs to place calls and use the microphone " +
+                    "to relay a call for you. You'll be asked to grant both next."
+                )
+                .setPositiveButton("Continue") { _, _ ->
+                    ActivityCompat.requestPermissions(
+                        this, arrayOf(Manifest.permission.CALL_PHONE, Manifest.permission.RECORD_AUDIO), 1001
+                    )
+                }
+                .setNegativeButton("Not now", null)
+                .show()
             return
         }
 
@@ -223,52 +411,10 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    private fun startRelay() {
-        val prefs = getSharedPreferences("opencall", MODE_PRIVATE)
-        val number = prefs.getString("user_number", "") ?: ""
+    // PART 1.3: startRelay()/stopRelay() (RelayForegroundService toggle) moved
+    // to SettingsActivity along with the Start/Stop Relay button itself.
 
-        if (number.isEmpty()) {
-            Toast.makeText(this, "Complete setup first", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val hasSend = checkSelfPermission(Manifest.permission.SEND_SMS) ==
-            PackageManager.PERMISSION_GRANTED
-        val hasReceive = checkSelfPermission(Manifest.permission.RECEIVE_SMS) ==
-            PackageManager.PERMISSION_GRANTED
-
-        if (!hasSend || !hasReceive) {
-            Toast.makeText(this,
-                "Grant Send SMS and Receive SMS permissions first",
-                Toast.LENGTH_LONG).show()
-            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, 1001)
-            return
-        }
-
-        val intent = Intent(this, RelayForegroundService::class.java).apply {
-            action = RelayForegroundService.ACTION_START
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
-
-        binding.tvStatusPill?.text = "ACTIVE"
-        binding.btnToggleRelay?.text = "Stop Relay"
-        Toast.makeText(this, "Relay service started", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun stopRelay() {
-        val intent = Intent(this, RelayForegroundService::class.java).apply {
-            action = RelayForegroundService.ACTION_STOP
-        }
-        startService(intent)
-        binding.tvStatusPill?.text = "IDLE"
-        binding.btnToggleRelay?.text = "Start Relay"
-    }
-
-    // ── Permissions ───────────────────────────────────────────────────────────
+    // â”€â”€ Permissions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     override fun onRequestPermissionsResult(
         requestCode: Int,
@@ -276,6 +422,8 @@ class MainActivity : AppCompatActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // PART 0: see ifAliveAndReady's own doc.
+        if (isFinishing || isDestroyed) return
 
         val denied = permissions.filterIndexed { i, _ ->
             grantResults[i] != android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -284,159 +432,64 @@ class MainActivity : AppCompatActivity() {
         if (denied.isEmpty()) {
             Toast.makeText(
                 this,
-                "✅ All permissions granted — relay ready",
+                "\u2705 All permissions granted \u2014 relay ready",
                 Toast.LENGTH_SHORT
             ).show()
+            // PART 4.3: resumes exactly where the user left off \u2014 they
+            // shouldn't have to re-tap "Set up relay node" after granting.
+            pendingRelayStart?.let { (serverUrl, e164) -> startRelayService(serverUrl, e164) }
+            pendingRelayStart = null
         } else {
+            pendingRelayStart = null
             Toast.makeText(
                 this,
-                "⚠️ Denied: ${denied.joinToString { it.substringAfterLast('.') }}" +
+                "\u26a0\ufe0f Denied: ${denied.joinToString { it.substringAfterLast('.') }}" +
                 "\nRelay may not work fully",
                 Toast.LENGTH_LONG
             ).show()
         }
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 2001) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-                android.provider.Settings.canDrawOverlays(this)) {
-                startRelay() // retry after permission granted
-            } else {
-                Toast.makeText(this,
-                    "Overlay permission needed for relay",
-                    Toast.LENGTH_LONG).show()
-            }
-        }
-    }
+    // PART 1.3: this used to retry startRelay() (now relocated to
+    // SettingsActivity) after an overlay-permission grant — but requestCode
+    // 2001 was never actually requested from anywhere in this Activity
+    // (dead even before this restructure), so onActivityResult is dropped
+    // entirely rather than left calling a function that no longer exists here.
 
-    // ── Status bar card → opens RelaySettingsFragment ─────────────────────────
+    // â”€â”€ Status bar card â†’ opens RelaySettingsFragment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    private fun setupStatusBar() {
-        binding.relayStatusBar.setOnClickListener {
-            RelaySettingsFragment().show(supportFragmentManager, "relay_settings")
-        }
-    }
+    // PART 1.3: setupStatusBar() (opened RelaySettingsFragment from the
+    // dashboard's status card) moved to SettingsActivity, verbatim.
 
-    // ── Start/Stop relay button ───────────────────────────────────────────────
+    // â”€â”€ Start/Stop relay button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    private fun setupRelayButton() {
-        binding.btnToggleRelay.setOnClickListener {
-            if (RelayService.isRunning) {
-                stopRelayService()
-                Handler(Looper.getMainLooper()).postDelayed({ updateRelayStatus() }, 600)
-            } else {
-                startRelay()
-            }
-        }
-    }
+    // PART 1.3: setupRelayButton() moved to SettingsActivity, verbatim.
 
-    // ── Offline Wi-Fi-Direct call launcher ───────────────────────────────────────
-    // Added programmatically (no layout XML edit) — floats over whichever
-    // screen (setup/dashboard) is currently visible in the root FrameLayout.
+    // PART 1: addOfflineCallButton() is gone — Tab 3 (Offline) in the new
+    // bottom tab bar is what opens OfflineCallActivity now, so the old
+    // floating "Offline Call" button would just be a second, redundant way in.
 
-    private fun addOfflineCallButton() {
-        val root = binding.root as? FrameLayout ?: return
-        val density = resources.displayMetrics.density
-        val margin = (16 * density).toInt()
+    // â”€â”€ Relay mode toggles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        val button = Button(this).apply {
-            text = "Offline Call"
-            setOnClickListener {
-                startActivity(Intent(this@MainActivity, OfflineCallActivity::class.java))
-            }
-        }
-        val params = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            gravity = Gravity.BOTTOM or Gravity.END
-            setMargins(margin, margin, margin, margin)
-        }
-        root.addView(button, params)
-    }
+    // PART 1.3: setupModeButtons()/saveRelayMode()/restoreRelayMode()/
+    // updateModeUI() all moved to SettingsActivity, verbatim.
 
-    // ── Relay mode toggles ────────────────────────────────────────────────────
+    // PART 1.3: updateRelayStatus() moved to SettingsActivity, verbatim.
 
-    private fun setupModeButtons() {
-        binding.btnModeBoth.setOnClickListener { saveRelayMode("both"); updateModeUI("both") }
-        binding.btnModeCall.setOnClickListener { saveRelayMode("call"); updateModeUI("call") }
-        binding.btnModeSms.setOnClickListener  { saveRelayMode("sms");  updateModeUI("sms")  }
-    }
+    // â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    private fun saveRelayMode(mode: String) {
-        getSharedPreferences("opencall", MODE_PRIVATE).edit()
-            .putString("relay_mode", mode).apply()
-    }
-
-    private fun restoreRelayMode() {
-        val mode = getSharedPreferences("opencall", MODE_PRIVATE)
-            .getString("relay_mode", "both") ?: "both"
-        updateModeUI(mode)
-    }
-
-    private fun updateModeUI(mode: String) {
-        val btnBoth = binding.btnModeBoth
-        val btnCall = binding.btnModeCall
-        val btnSms  = binding.btnModeSms
-
-        listOf(btnBoth, btnCall, btnSms).forEach { btn ->
-            btn.setBackgroundResource(R.drawable.mode_btn_normal)
-            btn.setTextColor(getColor(R.color.text_muted))
-        }
-
-        val selected = when (mode) {
-            "call" -> btnCall
-            "sms"  -> btnSms
-            else   -> btnBoth
-        }
-        selected.setBackgroundResource(R.drawable.mode_btn_selected)
-        selected.setTextColor(getColor(R.color.accent_blue))
-    }
-
-    // ── Relay status indicator ────────────────────────────────────────────────
-
-    private fun updateRelayStatus() {
-        val running = RelayService.isRunning
-        val accent  = Color.parseColor("#c8f55a")
-        val grey    = Color.parseColor("#666666")
-        binding.tvRelayDot.text = if (running) "●" else "○"
-        binding.tvRelayDot.setTextColor(if (running) accent else grey)
-        binding.tvRelayStatus.text = if (running) " Relay ON" else " Relay OFF"
-        binding.tvRelayStatus.setTextColor(if (running) accent else grey)
-        binding.tvStatusPill.text = if (running) "ACTIVE" else "STOPPED"
-        binding.tvStatusPill.setTextColor(if (running) accent else grey)
-        binding.btnToggleRelay.text = if (running) "Stop Relay" else "Start Relay"
-    }
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
-
-    override fun onResume() {
-        super.onResume()
-        val running = RelayForegroundService.instance != null
-        if (running) {
-            binding.tvStatusPill?.text = "ACTIVE"
-            binding.btnToggleRelay vv            b?.text = "Stop Relay"
-        } else {
-            binding.tvStatusPill?.text = "IDLE"
-            binding.btnToggleRelay?.text = "Start Relay"
-        }
-    }
+    // PART 1.3: the ACTIVE/Stop-Relay pill-sync used to live in onResume()
+    // here — that UI is now SettingsActivity's own (see its onResume()).
 
     override fun onPause() {
         super.onPause()
-        if (receiverRegistered) {
-            unregisterReceiver(relayStoppedReceiver)
-            receiverRegistered = false
-        }
         if (smsReceiverRegistered) {
             unregisterReceiver(relaySmsReceiver)
             smsReceiverRegistered = false
         }
     }
 
-    // ── Default dialer prompt ─────────────────────────────────────────────────
+    // â”€â”€ Default dialer prompt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private fun checkDefaultDialer() {
         val prefs = getSharedPreferences("opencall", Context.MODE_PRIVATE)
@@ -451,7 +504,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle("Enable full privacy protection")
             .setMessage(
                 "Set OpenCall as your default dialer so relay calls show " +
-                "the OCP number — not your real number."
+                "the OCP number \u2014 not your real number."
             )
             .setPositiveButton("Set as default") { _, _ ->
                 try {
@@ -471,7 +524,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ── SMS relay ─────────────────────────────────────────────────────────────
+    // â”€â”€ SMS relay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private fun handleRelaySms(callId: String, targetNumber: String, joinURL: String) {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS)
@@ -513,7 +566,7 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // ── Number validation ─────────────────────────────────────────────────────
+    // â”€â”€ Number validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fun validateNumber(number: String): Boolean {
         return when {
@@ -537,7 +590,7 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
     }
 
-    // ── Channel engine ────────────────────────────────────────────────────────
+    // â”€â”€ Channel engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fun detectCountry(e164: String): String {
         val n = e164.removePrefix("+")
@@ -565,7 +618,7 @@ class MainActivity : AppCompatActivity() {
 
     fun buildDeepLinkIntent(channel: String, e164: String, inviteURL: String): Intent? {
         val num = e164.removePrefix("+")
-        val msg = Uri.encode("Hey! Call me free on OpenCall — tap: $inviteURL")
+        val msg = Uri.encode("Hey! Call me free on OpenCall \u2014 tap: $inviteURL")
         return when (channel) {
             "whatsapp" -> Intent(Intent.ACTION_VIEW,
                 Uri.parse("https://wa.me/$num?text=$msg"))
@@ -687,10 +740,10 @@ class MainActivity : AppCompatActivity() {
                 val response = conn.inputStream.bufferedReader().readText()
                 runOnUiThread {
                     statusView.text = if (response.contains("\"success\":true"))
-                        "✓ SMS sent" else "✗ Failed — use buttons above"
+                        "\u2713 SMS sent" else "\u2717 Failed \u2014 use buttons above"
                 }
             } catch (e: Exception) {
-                runOnUiThread { statusView.text = "✗ Network error" }
+                runOnUiThread { statusView.text = "\u2717 Network error" }
             }
         }.start()
     }

@@ -46,9 +46,24 @@ import java.util.concurrent.ConcurrentHashMap
  * WIRE FORMAT (OCP-native, manufacturer-specific data, company id 0xFFFF —
  * reserved for internal/testing use per the Bluetooth spec; this is a closed
  * app-to-app protocol, not a real SIG-registered company):
- *   nodeId    8B
- *   flags     1B  bit0 SOS active, bit1 hasFix, bit2 batteryLow
- *   battery   1B  0-100, 0xFF = unknown
+ *   nodeId       8B
+ *   flags        1B  bit0 SOS active, bit1 hasFix, bit2 batteryLow, bit3 inviteActive
+ *   battery      1B  0-100, 0xFF = unknown
+ *   inviteTarget 3B  present only if bit3 set — low 24 bits of the invited
+ *                    peer's nodeId (the same truncation this app's DNS-SD
+ *                    "id"/"gp" TXT fields already use). BUG (MAKE THE
+ *                    INVITE ACTUALLY TRANSMIT) FIX PART 4: unlike DNS-SD's
+ *                    gp, this rides the SAME advertisement as [nodeId]
+ *                    above (the sender's own FULL 64-bit id), so a match
+ *                    gives the receiver everything needed to derive shared
+ *                    credentials directly (see WifiDirectManager.
+ *                    deriveFallbackNetworkName/deriveFallbackPassphrase) —
+ *                    no separate exchange needed. 13 bytes total fits
+ *                    comfortably inside the legacy 31-byte advertisement
+ *                    (this AD structure is 1+1+2+13=17 bytes) — no scan
+ *                    response required. An older build's 10-byte payload
+ *                    (no invite fields at all) still decodes fine — see
+ *                    [OcpBeaconPayload.decode].
  * See [OcpBeaconPayload] for the pure, unit-testable codec.
  *
  * While any SOS is active, advertising ROTATES every [ROTATE_INTERVAL_MS]
@@ -67,41 +82,101 @@ class MeshBleBeacon private constructor(context: Context) {
         private const val FLAG_SOS_ACTIVE = 0x01
         private const val FLAG_HAS_FIX = 0x02
         private const val FLAG_BATTERY_LOW = 0x04
+        // BUG (MAKE THE INVITE ACTUALLY TRANSMIT) FIX PART 4: set iff the
+        // trailing 3-byte inviteTarget field is present and meaningful.
+        private const val FLAG_INVITE_ACTIVE = 0x08
+        // PART "HASSLE-FREE JOIN" 2.1: set iff this host currently has an
+        // OPEN GROUP (hosting, under capacity) — the no-camera BLE join
+        // path. Costs ZERO extra wire bytes: [nodeId] (8B, already present
+        // in every OCP_NATIVE advertisement — see [encode]'s own
+        // `buf.putLong(nodeId)`) is already the host's FULL nodeId, and
+        // BOTH the group's networkName and passphrase are derived from
+        // that nodeId ALONE (see WifiDirectManager.deriveHostNetworkName/
+        // deriveHostPassphrase) — nothing else needs to travel over BLE at
+        // all, so this is a single previously-unused bit in the existing
+        // flags byte, not a new field. (This is also why "the short id
+        // alone is enough" from that task item is really "the FULL nodeId
+        // already being broadcast is enough" — the separate, truncated
+        // [shortNodeId] below is a different, unrelated field used only
+        // for [inviteTarget] correlation.)
+        private const val FLAG_GROUP_OPEN = 0x10
         private const val BATTERY_UNKNOWN_RAW = 0xFF
+        private const val BASE_SIZE = 10
+        private const val SIZE_WITH_INVITE = 13
+        private const val SHORT_ID_MASK = 0xFFFFFFL
 
         data class Decoded(
             val nodeId: Long,
             val sosActive: Boolean,
             val hasFix: Boolean,
             val batteryLow: Boolean,
-            val batteryPercent: Int?
+            val batteryPercent: Int?,
+            val inviteTarget: Int?,
+            val groupOpen: Boolean
         )
 
-        fun encode(nodeId: Long, sosActive: Boolean, hasFix: Boolean, batteryLow: Boolean, batteryPercent: Int?): ByteArray {
-            val buf = ByteBuffer.allocate(10)
+        /** BUG (MAKE THE INVITE ACTUALLY TRANSMIT) FIX PART 3.3/4.1: the
+         *  low 24 bits of a nodeId — the exact same truncation this app's
+         *  DNS-SD "id"/"gp" TXT fields already use (see
+         *  OfflineIdentity.hex(nodeId).takeLast(6), 6 hex chars = 24 bits),
+         *  just as a raw int instead of a hex string since this one goes on
+         *  the wire in 3 bytes, not as text. */
+        fun shortNodeId(nodeId: Long): Int = (nodeId and SHORT_ID_MASK).toInt()
+
+        fun encode(
+            nodeId: Long,
+            sosActive: Boolean,
+            hasFix: Boolean,
+            batteryLow: Boolean,
+            batteryPercent: Int?,
+            inviteTarget: Int? = null,
+            groupOpen: Boolean = false
+        ): ByteArray {
+            val buf = ByteBuffer.allocate(if (inviteTarget != null) SIZE_WITH_INVITE else BASE_SIZE)
             buf.putLong(nodeId)
             var flags = 0
             if (sosActive) flags = flags or FLAG_SOS_ACTIVE
             if (hasFix) flags = flags or FLAG_HAS_FIX
             if (batteryLow) flags = flags or FLAG_BATTERY_LOW
+            if (inviteTarget != null) flags = flags or FLAG_INVITE_ACTIVE
+            if (groupOpen) flags = flags or FLAG_GROUP_OPEN
             buf.put(flags.toByte())
             buf.put(((batteryPercent ?: BATTERY_UNKNOWN_RAW) and 0xFF).toByte())
+            if (inviteTarget != null) {
+                val t = inviteTarget and SHORT_ID_MASK.toInt()
+                buf.put(((t ushr 16) and 0xFF).toByte())
+                buf.put(((t ushr 8) and 0xFF).toByte())
+                buf.put((t and 0xFF).toByte())
+            }
             return buf.array()
         }
 
+        /** [BASE_SIZE] (10 bytes, no invite fields) is still the minimum —
+         *  an older build's shorter payload decodes exactly as it always
+         *  did, just with [Decoded.inviteTarget] absent, the same additive-
+         *  field compatibility this app's HELLO payload capability byte
+         *  already relies on (see MeshSigner.decodeHelloInner's doc). */
         fun decode(data: ByteArray): Decoded? {
-            if (data.size < 10) return null
+            if (data.size < BASE_SIZE) return null
             return try {
                 val buf = ByteBuffer.wrap(data)
                 val nodeId = buf.long
                 val flags = buf.get().toInt() and 0xFF
                 val battRaw = buf.get().toInt() and 0xFF
+                val inviteTarget = if (data.size >= SIZE_WITH_INVITE && (flags and FLAG_INVITE_ACTIVE) != 0) {
+                    val b0 = buf.get().toInt() and 0xFF
+                    val b1 = buf.get().toInt() and 0xFF
+                    val b2 = buf.get().toInt() and 0xFF
+                    (b0 shl 16) or (b1 shl 8) or b2
+                } else null
                 Decoded(
                     nodeId = nodeId,
                     sosActive = (flags and FLAG_SOS_ACTIVE) != 0,
                     hasFix = (flags and FLAG_HAS_FIX) != 0,
                     batteryLow = (flags and FLAG_BATTERY_LOW) != 0,
-                    batteryPercent = if (battRaw == BATTERY_UNKNOWN_RAW) null else battRaw
+                    batteryPercent = if (battRaw == BATTERY_UNKNOWN_RAW) null else battRaw,
+                    inviteTarget = inviteTarget,
+                    groupOpen = (flags and FLAG_GROUP_OPEN) != 0
                 )
             } catch (_: Exception) {
                 null
@@ -151,6 +226,13 @@ class MeshBleBeacon private constructor(context: Context) {
     @Volatile private var sosActive = false
     @Volatile private var running = false
     @Volatile private var canAdvertise = false
+    // BUG (MAKE THE INVITE ACTUALLY TRANSMIT) FIX PART 4: this device's own
+    // invite-target field — null when not currently hosting a createGroup
+    // fallback waiting on anyone (see setInviteTarget).
+    @Volatile private var inviteTarget: Int? = null
+    // PART "HASSLE-FREE JOIN" 2.1/2.3: this device's own "I'm hosting an
+    // open group" flag — see [setGroupOpen]/[FLAG_GROUP_OPEN].
+    @Volatile private var groupOpen = false
 
     private val ledger get() = MeshLedger.get(appContext)
     private val rssiHistory = ConcurrentHashMap<Long, ArrayDeque<Int>>()
@@ -163,6 +245,45 @@ class MeshBleBeacon private constructor(context: Context) {
      *  member — a BLE sighting of an already-connected peer is not a new
      *  "presence" state, just noise (they're already fully in the mesh). */
     var isConnectedOverWifiDirect: ((Long) -> Boolean)? = null
+    /** BUG (MAKE THE INVITE ACTUALLY TRANSMIT) FIX PART 4.2: fired with the
+     *  ADVERTISER's full nodeId the moment a scanned advertisement's
+     *  inviteTarget matches THIS device's own [shortNodeId] — see
+     *  [handleScanResult]. */
+    var onInviteTargetMatched: ((Long) -> Unit)? = null
+    /** PART "HASSLE-FREE JOIN" 2.2: fired on the main thread whenever a
+     *  scanned advertisement's [OcpBeaconPayload.Decoded.groupOpen] is
+     *  true — [rssi] lets the Nearby list show signal strength per item
+     *  2.2's own requirement. Not deduplicated/debounced here — the same
+     *  posture as [onPresenceUpdated] — the caller (Nearby screen) owns
+     *  turning a stream of sightings into one list row per host. */
+    var onOpenGroupSeen: ((hostNodeId: Long, rssi: Int) -> Unit)? = null
+
+    /** PART "HASSLE-FREE JOIN" 2.1/2.3: advertises (or stops advertising,
+     *  for false) this device's OWN open-group flag — call the moment
+     *  [WifiDirectManager.host] reports the group formed, and clear it on
+     *  leave-group OR the moment the group reaches [MAX_GROUP_PARTICIPANTS]
+     *  capacity (2.3) — see OfflineCallActivity's call sites. A no-op if
+     *  this device isn't currently advertising at all (mirrors
+     *  [setInviteTarget]'s identical guard). */
+    fun setGroupOpen(open: Boolean) {
+        if (groupOpen == open) return
+        groupOpen = open
+        if (canAdvertise) advertiseAs(Format.OCP_NATIVE)
+        if (open) Log.d("OFFTRACE", "BLE: hosting adv short=${OcpBeaconPayload.shortNodeId(localNodeId)} open=true")
+    }
+
+    /** BUG (MAKE THE INVITE ACTUALLY TRANSMIT) FIX PART 4.1: advertises (or
+     *  stops advertising, for null) an invite for the peer whose short node
+     *  id is [target] — call on tap (well, once the createGroup fallback
+     *  actually starts hosting), and clear on association, the 60s invite
+     *  timeout, or leave-group (see OfflineCallActivity.startWaitingForExplicitJoin/
+     *  stopWaitingForExplicitJoin). A no-op if this device isn't currently
+     *  advertising at all (no hardware support, or [start] never called). */
+    fun setInviteTarget(target: Int?) {
+        if (inviteTarget == target) return
+        inviteTarget = target
+        if (canAdvertise) advertiseAs(Format.OCP_NATIVE)
+    }
 
     private fun hasPermission(perm: String): Boolean =
         ContextCompat.checkSelfPermission(appContext, perm) == PackageManager.PERMISSION_GRANTED
@@ -273,7 +394,8 @@ class MeshBleBeacon private constructor(context: Context) {
         when (format) {
             Format.OCP_NATIVE -> {
                 val payload = OcpBeaconPayload.encode(
-                    localNodeId, sosActive, hasFix = false, batteryLow = false, batteryPercent = null
+                    localNodeId, sosActive, hasFix = false, batteryLow = false, batteryPercent = null,
+                    inviteTarget = inviteTarget, groupOpen = groupOpen
                 )
                 builder.addManufacturerData(OcpBeaconPayload.COMPANY_ID, payload)
             }
@@ -400,6 +522,27 @@ class MeshBleBeacon private constructor(context: Context) {
         }
         ledger.recordBlePresence(decoded.nodeId, smoothed, trend)
         mainHandler.post { onPresenceUpdated?.invoke(decoded.nodeId) }
+        // PART "HASSLE-FREE JOIN" 2.2: an open-group sighting — the
+        // no-camera join path. Fired on every sighting (not just changes);
+        // the Nearby list is the one that folds a stream of these into a
+        // single joinable row per host.
+        if (decoded.groupOpen) {
+            Log.d("OFFTRACE", "BLE: open group seen host=${MeshFrame.hex(decoded.nodeId)} rssi=$rssi")
+            mainHandler.post { onOpenGroupSeen?.invoke(decoded.nodeId, rssi) }
+        }
+        // BUG (MAKE THE INVITE ACTUALLY TRANSMIT) FIX PART 4.2/4.3: a peer
+        // advertising an active invite — check whether it's addressed to US.
+        if (decoded.inviteTarget != null) {
+            val mine = OcpBeaconPayload.shortNodeId(localNodeId)
+            val match = decoded.inviteTarget == mine
+            Log.d(
+                "OFFTRACE",
+                "BLE: invite seen from=${MeshFrame.hex(decoded.nodeId)} target=${decoded.inviteTarget} mine=$mine match=$match"
+            )
+            if (match) {
+                mainHandler.post { onInviteTargetMatched?.invoke(decoded.nodeId) }
+            }
+        }
     }
 
     /** 5-sample moving average, trend from the older half of the window vs. the

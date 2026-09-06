@@ -1,0 +1,714 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/bg_deep">
+
+    <!-- ── Title bar ────────────────────────────────────────────── -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="@color/bg_card"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/btn_settings_back"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="←"
+            android:textSize="20sp"
+            android:textColor="@color/text_primary"
+            android:clickable="true"
+            android:focusable="true"
+            android:paddingEnd="12dp"/>
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Settings"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="@color/text_primary"/>
+
+    </LinearLayout>
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true"
+        android:overScrollMode="never">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <!-- ── Account ──────────────────────────────────────── -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="ACCOUNT"
+                android:textSize="10sp"
+                android:textColor="@color/text_secondary"
+                android:letterSpacing="0.1"
+                android:layout_marginBottom="8dp"/>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="@drawable/card_bg"
+                android:padding="16dp"
+                android:layout_marginBottom="20dp">
+
+                <TextView
+                    android:id="@+id/tv_account_node_id"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="—"
+                    android:textSize="11sp"
+                    android:fontFamily="monospace"
+                    android:textColor="@color/text_muted"
+                    android:singleLine="true"
+                    android:ellipsize="middle"/>
+
+                <TextView
+                    android:id="@+id/tv_account_display_name"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="—"
+                    android:textSize="15sp"
+                    android:textColor="@color/text_primary"
+                    android:layout_marginTop="8dp"/>
+
+                <TextView
+                    android:id="@+id/tv_account_sim"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="No SIM number on file"
+                    android:textSize="13sp"
+                    android:textColor="@color/text_secondary"
+                    android:layout_marginTop="4dp"/>
+
+                <TextView
+                    android:id="@+id/tv_account_sip"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="No international calling account"
+                    android:textSize="13sp"
+                    android:textColor="@color/text_secondary"
+                    android:layout_marginTop="4dp"/>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginTop="12dp">
+
+                    <TextView
+                        android:id="@+id/tv_change_account"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Change account"
+                        android:textSize="12sp"
+                        android:textColor="@color/accent_blue"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                    <TextView
+                        android:id="@+id/tv_delete_account"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Delete account"
+                        android:textSize="12sp"
+                        android:textColor="#ff4d4d"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                </LinearLayout>
+
+            </LinearLayout>
+
+            <!-- ── Identity (PART 5.1, batch B): the NATIVE Ed25519 identity
+                 (AccountStore/OfflineIdentity) only — the PWA's own
+                 client-side identity is not surfaced here and not bridged.
+                 ─────────────────────────────────────────────────────── -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="IDENTITY"
+                android:textSize="10sp"
+                android:textColor="@color/text_secondary"
+                android:letterSpacing="0.1"
+                android:layout_marginBottom="8dp"/>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="@drawable/card_bg"
+                android:padding="16dp"
+                android:layout_marginBottom="20dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Display name"
+                    android:textSize="9sp"
+                    android:textColor="@color/text_secondary"
+                    android:letterSpacing="0.1"/>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="4dp">
+
+                    <TextView
+                        android:id="@+id/tv_identity_display_name"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="—"
+                        android:textSize="15sp"
+                        android:textColor="@color/text_primary"/>
+
+                    <TextView
+                        android:id="@+id/tv_identity_edit_name"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="edit"
+                        android:textSize="12sp"
+                        android:textColor="@color/accent_blue"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Node ID"
+                    android:textSize="9sp"
+                    android:textColor="@color/text_secondary"
+                    android:letterSpacing="0.1"
+                    android:layout_marginTop="14dp"/>
+
+                <TextView
+                    android:id="@+id/tv_identity_node_id"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="—"
+                    android:textSize="12sp"
+                    android:fontFamily="monospace"
+                    android:textColor="@color/text_muted"
+                    android:singleLine="true"
+                    android:ellipsize="middle"
+                    android:layout_marginTop="4dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="OCP address"
+                    android:textSize="9sp"
+                    android:textColor="@color/text_secondary"
+                    android:letterSpacing="0.1"
+                    android:layout_marginTop="14dp"/>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:background="@drawable/field_bg"
+                    android:layout_marginTop="4dp"
+                    android:padding="10dp"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:id="@+id/tv_identity_ocp_address"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="unavailable"
+                        android:textSize="12sp"
+                        android:fontFamily="monospace"
+                        android:textColor="@color/text_primary"
+                        android:singleLine="true"
+                        android:ellipsize="middle"/>
+
+                    <TextView
+                        android:id="@+id/tv_identity_copy_ocp"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="copy"
+                        android:textSize="9sp"
+                        android:textColor="@color/accent_blue"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginTop="14dp">
+
+                    <TextView
+                        android:id="@+id/tv_identity_backup"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Back up identity"
+                        android:textSize="12sp"
+                        android:textColor="@color/accent_blue"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                    <TextView
+                        android:id="@+id/tv_identity_show_qr"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Show my QR"
+                        android:textSize="12sp"
+                        android:textColor="@color/accent_blue"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                </LinearLayout>
+
+            </LinearLayout>
+
+            <!-- ── Offline mesh ─────────────────────────────────── -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="OFFLINE MESH"
+                android:textSize="10sp"
+                android:textColor="@color/text_secondary"
+                android:letterSpacing="0.1"
+                android:layout_marginBottom="8dp"/>
+
+            <LinearLayout
+                android:id="@+id/row_offline_mesh_settings"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:background="@drawable/card_bg"
+                android:padding="16dp"
+                android:layout_marginBottom="20dp"
+                android:clickable="true"
+                android:focusable="true">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Offline mesh settings"
+                    android:textSize="14sp"
+                    android:textColor="@color/text_primary"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="›"
+                    android:textSize="18sp"
+                    android:textColor="@color/text_secondary"/>
+
+            </LinearLayout>
+
+            <!-- ── Relay node (PART 1.3: moved from the old dashboard,
+                   verbatim — same ids, same behaviour) ──────────────── -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="RELAY NODE"
+                android:textSize="10sp"
+                android:textColor="@color/text_secondary"
+                android:letterSpacing="0.1"
+                android:layout_marginBottom="8dp"/>
+
+            <!-- CARD 1: Node status -->
+            <LinearLayout
+                android:id="@+id/relay_status_bar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="@drawable/card_bg"
+                android:padding="16dp"
+                android:layout_marginBottom="12dp"
+                android:clickable="true"
+                android:focusable="true">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Node status"
+                        android:textSize="10sp"
+                        android:textColor="@color/text_secondary"
+                        android:letterSpacing="0.1"
+                        android:textAllCaps="true"/>
+
+                    <Space
+                        android:layout_width="0dp"
+                        android:layout_height="1dp"
+                        android:layout_weight="1"/>
+
+                    <TextView
+                        android:id="@+id/tv_status_pill"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="STOPPED"
+                        android:textSize="9sp"
+                        android:textColor="@color/text_muted"
+                        android:background="@drawable/btn_primary"
+                        android:paddingTop="3dp"
+                        android:paddingBottom="3dp"
+                        android:paddingStart="10dp"
+                        android:paddingEnd="10dp"/>
+
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginTop="14dp">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical"
+                        android:background="@drawable/field_bg"
+                        android:padding="10dp"
+                        android:gravity="center">
+
+                        <TextView
+                            android:id="@+id/tv_calls_count"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="0"
+                            android:textSize="22sp"
+                            android:textStyle="bold"
+                            android:textColor="@color/text_primary"/>
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="calls"
+                            android:textSize="9sp"
+                            android:textColor="@color/text_secondary"
+                            android:letterSpacing="0.1"/>
+
+                    </LinearLayout>
+
+                    <Space android:layout_width="8dp" android:layout_height="1dp"/>
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical"
+                        android:background="@drawable/field_bg"
+                        android:padding="10dp"
+                        android:gravity="center">
+
+                        <TextView
+                            android:id="@+id/tv_active_count"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="0"
+                            android:textSize="22sp"
+                            android:textStyle="bold"
+                            android:textColor="@color/text_primary"/>
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="active"
+                            android:textSize="9sp"
+                            android:textColor="@color/text_secondary"/>
+
+                    </LinearLayout>
+
+                    <Space android:layout_width="8dp" android:layout_height="1dp"/>
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical"
+                        android:background="@drawable/field_bg"
+                        android:padding="10dp"
+                        android:gravity="center">
+
+                        <TextView
+                            android:id="@+id/tv_country"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="—"
+                            android:textSize="22sp"
+                            android:textStyle="bold"
+                            android:textColor="@color/accent_blue"/>
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="country"
+                            android:textSize="9sp"
+                            android:textColor="@color/text_secondary"/>
+
+                    </LinearLayout>
+
+                </LinearLayout>
+
+                <Button
+                    android:id="@+id/btn_toggle_relay"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="14dp"
+                    android:text="Start Relay"
+                    android:textSize="14sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/accent_green"
+                    android:background="@drawable/btn_primary"
+                    android:stateListAnimator="@null"/>
+
+            </LinearLayout>
+
+            <!-- CARD 2: Relay mode -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="@drawable/card_bg"
+                android:padding="16dp"
+                android:layout_marginBottom="12dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Relay mode"
+                    android:textSize="10sp"
+                    android:textColor="@color/text_secondary"
+                    android:letterSpacing="0.1"
+                    android:textAllCaps="true"/>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginTop="10dp">
+
+                    <TextView
+                        android:id="@+id/btn_mode_both"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Calls + SMS"
+                        android:textSize="10sp"
+                        android:gravity="center"
+                        android:paddingTop="6dp"
+                        android:paddingBottom="6dp"
+                        android:paddingStart="4dp"
+                        android:paddingEnd="4dp"
+                        android:background="@drawable/mode_btn_selected"
+                        android:textColor="@color/accent_blue"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                    <Space android:layout_width="6dp" android:layout_height="1dp"/>
+
+                    <TextView
+                        android:id="@+id/btn_mode_call"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Calls only"
+                        android:textSize="10sp"
+                        android:gravity="center"
+                        android:paddingTop="6dp"
+                        android:paddingBottom="6dp"
+                        android:paddingStart="4dp"
+                        android:paddingEnd="4dp"
+                        android:background="@drawable/mode_btn_normal"
+                        android:textColor="@color/text_muted"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                    <Space android:layout_width="6dp" android:layout_height="1dp"/>
+
+                    <TextView
+                        android:id="@+id/btn_mode_sms"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="SMS only"
+                        android:textSize="10sp"
+                        android:gravity="center"
+                        android:paddingTop="6dp"
+                        android:paddingBottom="6dp"
+                        android:paddingStart="4dp"
+                        android:paddingEnd="4dp"
+                        android:background="@drawable/mode_btn_normal"
+                        android:textColor="@color/text_muted"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Server"
+                    android:textSize="9sp"
+                    android:textColor="@color/text_secondary"
+                    android:letterSpacing="0.1"
+                    android:layout_marginTop="12dp"/>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:background="@drawable/field_bg"
+                    android:layout_marginTop="4dp"
+                    android:padding="10dp"
+                    android:gravity="center_vertical">
+
+                    <EditText
+                        android:id="@+id/et_server_url"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:hint="wss://your-server"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_primary"
+                        android:textColorHint="@color/text_muted"
+                        android:background="@null"
+                        android:inputType="textUri"
+                        android:singleLine="true"/>
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="edit"
+                        android:textSize="9sp"
+                        android:textColor="@color/text_muted"/>
+
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="OCP address"
+                    android:textSize="9sp"
+                    android:textColor="@color/text_secondary"
+                    android:layout_marginTop="10dp"/>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:background="@drawable/field_bg"
+                    android:layout_marginTop="4dp"
+                    android:padding="10dp"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:id="@+id/tv_ocp_address"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="ocp:loading..."
+                        android:textSize="12sp"
+                        android:textColor="@color/text_primary"
+                        android:singleLine="true"
+                        android:ellipsize="middle"/>
+
+                    <TextView
+                        android:id="@+id/tv_copy_ocp"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="copy"
+                        android:textSize="9sp"
+                        android:textColor="@color/accent_blue"
+                        android:clickable="true"
+                        android:focusable="true"/>
+
+                </LinearLayout>
+
+            </LinearLayout>
+
+            <!-- CARD 3: Credits -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:background="@drawable/card_bg"
+                android:paddingTop="12dp"
+                android:paddingBottom="12dp"
+                android:paddingStart="16dp"
+                android:paddingEnd="16dp"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="12dp">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:id="@+id/tv_credits"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="0"
+                        android:textSize="22sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/text_primary"/>
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="OCP credits"
+                        android:textSize="9sp"
+                        android:textColor="@color/text_secondary"
+                        android:letterSpacing="0.1"/>
+
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tv_credits_today"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="+0 today"
+                    android:textSize="10sp"
+                    android:textColor="@color/accent_green"
+                    android:background="@drawable/btn_primary"
+                    android:paddingTop="4dp"
+                    android:paddingBottom="4dp"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"/>
+
+            </LinearLayout>
+
+        </LinearLayout>
+    </ScrollView>
+
+</LinearLayout>

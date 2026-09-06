@@ -6,6 +6,7 @@ import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.ByteBuffer
@@ -118,5 +119,241 @@ class MeshSignerTest {
         listOf<Byte>(4, 7, 20, 28, 29, 100).forEach {
             assertTrue("type $it should be signed", MeshSigner.isSignedType(it))
         }
+    }
+
+    // ── FIX 3: pubkeys.json round trip — the actual persist/load format,
+    // exercised directly via the pure encode/decode companions (no File/
+    // Context needed). This is what proves loadPersistedPubkeys' own load
+    // path was never broken by the MeshLedger directory-glob bug — see
+    // MeshLedgerTest's isLedgerTrackFileName tests for that half of FIX 3. ──
+
+    private fun randomPubkey(seed: Byte): ByteArray = ByteArray(32) { (it + seed).toByte() }
+
+    @Test
+    fun `pubkeys json round trips several entries exactly`() {
+        val entries = mapOf(
+            0x1234567890ABCDEFL to randomPubkey(1),
+            0x00000000004D2000L to randomPubkey(2),
+            -1L to randomPubkey(3), // a nodeId whose high bit is set — must survive as a signed Long
+            0L to randomPubkey(4)
+        )
+        val encoded = MeshSigner.encodePubkeysJson(entries)
+        val decoded = MeshSigner.decodePubkeysJson(encoded)
+        assertEquals(entries.keys, decoded.keys)
+        entries.forEach { (id, key) ->
+            assertTrue("pubkey mismatch for nodeId=$id", key.contentEquals(decoded.getValue(id)))
+        }
+    }
+
+    @Test
+    fun `pubkeys json round trip is stable for a single entry`() {
+        val encoded = MeshSigner.encodePubkeysJson(mapOf(42L to randomPubkey(9)))
+        val decoded = MeshSigner.decodePubkeysJson(encoded)
+        assertEquals(1, decoded.size)
+        assertTrue(randomPubkey(9).contentEquals(decoded.getValue(42L)))
+    }
+
+    @Test
+    fun `empty pubkeys json round trips to an empty map`() {
+        val encoded = MeshSigner.encodePubkeysJson(emptyMap())
+        assertEquals(emptyMap<Long, ByteArray>(), MeshSigner.decodePubkeysJson(encoded))
+    }
+
+    @Test
+    fun `decodePubkeysJson never throws on foreign or malformed JSON`() {
+        assertEquals(emptyMap<Long, ByteArray>(), MeshSigner.decodePubkeysJson("not json at all"))
+        assertEquals(emptyMap<Long, ByteArray>(), MeshSigner.decodePubkeysJson("""{"unrelated":"shape"}"""))
+        assertEquals(emptyMap<Long, ByteArray>(), MeshSigner.decodePubkeysJson(""))
+    }
+
+    @Test
+    fun `a single malformed entry is skipped, not fatal to the rest of the file`() {
+        val good = randomPubkey(5)
+        val raw = """{"entries":[
+            {"nodeId":1,"pubkey":"${java.util.Base64.getEncoder().encodeToString(good)}"},
+            {"nodeId":"not-a-number","pubkey":"???"},
+            {"nodeId":3,"pubkey":"${java.util.Base64.getEncoder().encodeToString(randomPubkey(6))}"}
+        ]}"""
+        val decoded = MeshSigner.decodePubkeysJson(raw)
+        assertEquals(setOf(1L, 3L), decoded.keys)
+        assertTrue(good.contentEquals(decoded.getValue(1L)))
+    }
+
+    @Test
+    fun `encodePubkeysJson uses the entries wrapper key, matching the format MeshLedger must never try to parse as its own`() {
+        val encoded = MeshSigner.encodePubkeysJson(mapOf(1L to randomPubkey(1)))
+        val json = org.json.JSONObject(encoded)
+        assertTrue(json.has("entries"))
+    }
+
+    // ── OCP PHASE 3/G6: HELLO capability byte (decodeHelloInner) ────────────
+
+    private fun helloBytes(nodeId: Long, name: String, capabilities: Int?): ByteArray {
+        val nameBytes = name.toByteArray(Charsets.UTF_8)
+        val pubkey = randomPubkey(1)
+        val size = 8 + 1 + pubkey.size + 1 + nameBytes.size + (if (capabilities != null) 1 else 0)
+        val buf = ByteBuffer.allocate(size)
+        buf.putLong(nodeId)
+        buf.put(3) // MeshFrame.VERSION
+        buf.put(pubkey)
+        buf.put(nameBytes.size.toByte())
+        buf.put(nameBytes)
+        if (capabilities != null) buf.put(capabilities.toByte())
+        return buf.array()
+    }
+
+    @Test
+    fun `decodeHelloInner reads the capability byte when present`() {
+        val decoded = MeshSigner.decodeHelloInner(helloBytes(42L, "alice", capabilities = 0x01))
+        assertEquals(0x01, decoded!!.capabilities)
+    }
+
+    @Test
+    fun `decodeHelloInner defaults capabilities to 0 for a pre-PHASE-3 payload with no trailing byte`() {
+        // Simulates an OLDER peer's HELLO — exactly the pre-existing wire
+        // shape, no capability byte appended at all.
+        val decoded = MeshSigner.decodeHelloInner(helloBytes(42L, "alice", capabilities = null))
+        assertEquals(0, decoded!!.capabilities)
+    }
+
+    @Test
+    fun `decodeHelloInner ignores extra trailing bytes beyond the capability byte — future-proof for the NEXT additive field`() {
+        val base = helloBytes(42L, "alice", capabilities = 0x03)
+        val withExtraTail = base + byteArrayOf(0x7F, 0x00, 0x11) // simulates a future field this build doesn't know about
+        val decoded = MeshSigner.decodeHelloInner(withExtraTail)
+        assertEquals(0x03, decoded!!.capabilities) // still parses the prefix it knows correctly
+    }
+
+    @Test
+    fun `decodeHelloInner never throws on a truncated capability byte region`() {
+        val base = helloBytes(42L, "alice", capabilities = null)
+        assertEquals(0, MeshSigner.decodeHelloInner(base)!!.capabilities)
+    }
+
+    // ── PART A: carried (store-and-forward) SOS signature verification ──────
+    // Pure, Context-free — same spirit as the replay-window tests above.
+    // [verifyCarried]'s Context-dependent half (pubkey lookup, pending-queue,
+    // seen-signature dedupe) is deliberately NOT exercised here, matching
+    // this file's existing scope (verifyIncoming itself is never
+    // instance-tested either — only its pure building blocks are).
+
+    private val TYPE_SOS: Byte = 20
+
+    /** Builds a wire-format carried inner payload — innerPayload || timestamp
+     *  (4B) || signature (64B) — exactly what MeshSosManager.cacheForCarry now
+     *  stores and MeshCarrier hands back to dispatchCarriedInner (see A1). */
+    private fun buildCarriedPayload(
+        originId: Long,
+        finalDstId: Long,
+        innerType: Byte,
+        timestampSec: Long,
+        inner: ByteArray,
+        priv: Ed25519PrivateKeyParameters
+    ): ByteArray {
+        val material = MeshSigner.buildSignedMaterial(originId, finalDstId, innerType, timestampSec, inner)
+        val sig = sign(priv, material)
+        val buf = ByteBuffer.allocate(inner.size + 4 + 64)
+        buf.put(inner)
+        buf.putInt((timestampSec and 0xFFFFFFFFL).toInt())
+        buf.put(sig)
+        return buf.array()
+    }
+
+    @Test
+    fun `a carried SOS with a valid signature and a 2-hour-old signed timestamp verifies and is alarmable`() {
+        val (priv, pub) = randomKeypair()
+        val originId = 0x1122334455667788L
+        val finalDstId = MeshFrame.BROADCAST_ID
+        val nowSec = 1_700_000_000L
+        val twoHoursAgo = nowSec - 2 * 60 * 60L
+        val payload = buildCarriedPayload(originId, finalDstId, TYPE_SOS, twoHoursAgo, "sos-fix-bytes".toByteArray(), priv)
+
+        val split = MeshSigner.splitCarriedTrailer(payload)!!
+        assertEquals(twoHoursAgo, split.timestampSec)
+        assertTrue(MeshSigner.verifyCarriedTrailer(originId, finalDstId, TYPE_SOS, split, pub.encoded))
+
+        // A3: age comes from the SIGNED timestamp, not local receipt time —
+        // dispatchCarriedInner computes this exact subtraction.
+        val ageSec = nowSec - split.timestampSec
+        assertEquals(7200L, ageSec)
+        assertTrue(
+            "a 2h-old cryptographically verified carried SOS must still alarm",
+            MeshSosManager.computeAlarmable(active = true, isLive = false, ageSec = ageSec, isCarriedVerified = true, existingAlarmable = null)
+        )
+    }
+
+    @Test
+    fun `a carried SOS with one flipped payload byte fails verification`() {
+        val (priv, pub) = randomKeypair()
+        val originId = 42L
+        val finalDstId = MeshFrame.BROADCAST_ID
+        val timestampSec = 1_700_000_000L - 3600L
+        val payload = buildCarriedPayload(originId, finalDstId, TYPE_SOS, timestampSec, "sos-fix-bytes".toByteArray(), priv)
+        payload[0] = (payload[0].toInt() xor 0x01).toByte() // flip one byte of the inner payload
+
+        val split = MeshSigner.splitCarriedTrailer(payload)!!
+        assertFalse(MeshSigner.verifyCarriedTrailer(originId, finalDstId, TYPE_SOS, split, pub.encoded))
+    }
+
+    @Test
+    fun `a spoofed originId with no valid signature is rejected`() {
+        // Attacker signs with their OWN key, but the frame is stamped with a
+        // real party member's originId — the verifier looks up the REAL
+        // member's pubkey (simulated here by using a different keypair than
+        // the one that actually signed), so verification must fail.
+        val (attackerPriv, _) = randomKeypair()
+        val (_, realMemberPub) = randomKeypair()
+        val spoofedOriginId = 0x1234567890ABCDEFL // claims to be the real member
+        val finalDstId = MeshFrame.BROADCAST_ID
+        val timestampSec = 1_700_000_000L - 60L
+        val payload = buildCarriedPayload(spoofedOriginId, finalDstId, TYPE_SOS, timestampSec, "fake distress".toByteArray(), attackerPriv)
+
+        val split = MeshSigner.splitCarriedTrailer(payload)!!
+        assertFalse(MeshSigner.verifyCarriedTrailer(spoofedOriginId, finalDstId, TYPE_SOS, split, realMemberPub.encoded))
+    }
+
+    @Test
+    fun `a trailer-less carried payload is rejected outright, never accepted as unsigned`() {
+        val bareInner = "no trailer at all, just raw bytes".toByteArray()
+        assertNull(MeshSigner.splitCarriedTrailer(bareInner))
+        // Even a payload that happens to be exactly one byte short of a full
+        // trailer must still be rejected — there is no partial-trailer leniency.
+        val almostTrailer = ByteArray(MeshSigner.SIGNATURE_TRAILER_BYTES - 1)
+        assertNull(MeshSigner.splitCarriedTrailer(almostTrailer))
+    }
+
+    @Test
+    fun `the same valid carried SOS delivered twice produces the identical dedupe key both times`() {
+        // verifyCarried's seen-signature dedupe (A4) is keyed on the raw
+        // signature bytes — proving two independent splits of the SAME wire
+        // bytes yield byte-identical signatures is exactly the precondition
+        // that check relies on to recognize (and reject) the second delivery,
+        // so the underlying SOS alarms only once.
+        val (priv, _) = randomKeypair()
+        val originId = 7L
+        val finalDstId = MeshFrame.BROADCAST_ID
+        val timestampSec = 1_700_000_000L - 600L
+        val payload = buildCarriedPayload(originId, finalDstId, TYPE_SOS, timestampSec, "sos-fix-bytes".toByteArray(), priv)
+
+        // Two different mules independently hand back the identical wire bytes.
+        val firstDelivery = MeshSigner.splitCarriedTrailer(payload.copyOf())!!
+        val secondDelivery = MeshSigner.splitCarriedTrailer(payload.copyOf())!!
+        assertTrue(firstDelivery.signature.contentEquals(secondDelivery.signature))
+    }
+
+    @Test
+    fun `replay-window check is never consulted by the carried verification core`() {
+        // A3: a carried SOS is legitimately hours old — splitCarriedTrailer/
+        // verifyCarriedTrailer take no "now" parameter at all, unlike
+        // verifyIncoming's live path (isWithinReplayWindow). This test simply
+        // documents that a 6-hour-old signed timestamp still splits and
+        // verifies successfully with no freshness gate in the way.
+        val (priv, pub) = randomKeypair()
+        val originId = 99L
+        val finalDstId = MeshFrame.BROADCAST_ID
+        val sixHoursAgo = 1_700_000_000L - 6 * 60 * 60L
+        val payload = buildCarriedPayload(originId, finalDstId, TYPE_SOS, sixHoursAgo, "sos-fix-bytes".toByteArray(), priv)
+        val split = MeshSigner.splitCarriedTrailer(payload)!!
+        assertTrue(MeshSigner.verifyCarriedTrailer(originId, finalDstId, TYPE_SOS, split, pub.encoded))
     }
 }

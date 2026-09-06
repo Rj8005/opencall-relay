@@ -2,6 +2,9 @@ package com.opencall.relay.offline
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -15,6 +18,7 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaRecorder
 import android.os.Build
@@ -22,6 +26,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import android.view.Surface
 import java.io.ByteArrayInputStream
@@ -32,6 +37,7 @@ import java.io.IOException
 import java.net.BindException
 import java.net.ConnectException
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -39,6 +45,9 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -220,6 +229,141 @@ class OfflineMediaTransport(
         }
     }
 
+    /** PHASE 5.1: which quick-phrase category a code belongs to, for the
+     *  bottom-sheet's grouping. Purely a UI grouping — never travels on the
+     *  wire (only [PhraseCode.code] does, 1 byte, unchanged format). */
+    enum class PhraseCategory(val label: String) { EVERYDAY("Everyday"), OUTDOOR("Outdoor"), EMERGENCY("Emergency") }
+
+    /** OFFLINE UI STEP 4 / PHASE 5.1: the closed set of canned phrases — NO
+     *  free text ever rides TYPE_PHRASE (see that type's wire doc); a
+     *  receiver always maps [code] through this table to a LOCAL string,
+     *  never trusts bytes off the wire as displayable text. Code 7 is
+     *  deliberately reserved (no entry here) — [fromCode] returns null for
+     *  it exactly like any other unrecognized code, which is what drives
+     *  "unknown message" rendering (see handlePhraseFrame's doc: still
+     *  relayed, just not understood).
+     *
+     *  PHASE 5.1: codes 0-6 KEEP THEIR EXACT PRE-EXISTING (code, text) pairs
+     *  byte-for-byte — a phrase that changes meaning between app versions is
+     *  a safety bug (see PhraseCodeTest's per-code assertions). Code 7 stays
+     *  reserved. New codes start at 8, wire format stays the same 1 byte
+     *  (fits to 255; this table uses under 70). isUrgentRelayFrame (PHASE 4)
+     *  deliberately still checks ONLY code==6 (NEED_HELP) — none of the new
+     *  codes below are added to that bypass; that set is unchanged by this
+     *  phase. */
+    enum class PhraseCode(val code: Int, val text: String, val category: PhraseCategory) {
+        IM_OK(0, "I'm OK", PhraseCategory.EVERYDAY),
+        HOLD_POSITION(1, "Hold position", PhraseCategory.EVERYDAY),
+        MOVING_TO_YOU(2, "Moving to you", PhraseCategory.EVERYDAY),
+        TURNING_BACK(3, "Turning back", PhraseCategory.EVERYDAY),
+        WEATHER_TURNING(4, "Weather turning", PhraseCategory.OUTDOOR),
+        REGROUP_LAST_POINT(5, "Regroup last point", PhraseCategory.EVERYDAY),
+        NEED_HELP(6, "Need help", PhraseCategory.EMERGENCY),
+        // code 7 reserved — no entry.
+
+        // ── Everyday (8-27) ──────────────────────────────────────────────
+        ON_MY_WAY(8, "On my way", PhraseCategory.EVERYDAY),
+        RUNNING_LATE(9, "Running late", PhraseCategory.EVERYDAY),
+        ARRIVED(10, "Arrived", PhraseCategory.EVERYDAY),
+        WAITING_FOR_YOU(11, "Waiting for you", PhraseCategory.EVERYDAY),
+        READY_TO_GO(12, "Ready to go", PhraseCategory.EVERYDAY),
+        TAKING_A_BREAK(13, "Taking a break", PhraseCategory.EVERYDAY),
+        LOST_SIGNAL_EARLIER(14, "Lost signal earlier", PhraseCategory.EVERYDAY),
+        CHECK_IN(15, "Check-in — all fine", PhraseCategory.EVERYDAY),
+        NEED_FIVE_MINUTES(16, "Need five minutes", PhraseCategory.EVERYDAY),
+        GO_AHEAD_WITHOUT_ME(17, "Go ahead without me", PhraseCategory.EVERYDAY),
+        CATCHING_UP(18, "Catching up", PhraseCategory.EVERYDAY),
+        STOPPED_FOR_PHOTOS(19, "Stopped for photos", PhraseCategory.EVERYDAY),
+        STOPPED_FOR_FOOD(20, "Stopped for food", PhraseCategory.EVERYDAY),
+        BATHROOM_BREAK(21, "Bathroom break", PhraseCategory.EVERYDAY),
+        CHANGING_ROUTE(22, "Changing route", PhraseCategory.EVERYDAY),
+        FOUND_A_SHORTCUT(23, "Found a shortcut", PhraseCategory.EVERYDAY),
+        TRAIL_BLOCKED(24, "Trail blocked", PhraseCategory.EVERYDAY),
+        GROUP_SPLITTING_UP(25, "Group splitting up", PhraseCategory.EVERYDAY),
+        MEETING_POINT_AHEAD(26, "Meeting point ahead", PhraseCategory.EVERYDAY),
+        ALL_ACCOUNTED_FOR(27, "All accounted for", PhraseCategory.EVERYDAY),
+
+        // ── Outdoor (28-47) ──────────────────────────────────────────────
+        LOW_ON_WATER(28, "Low on water", PhraseCategory.OUTDOOR),
+        LOW_ON_FOOD(29, "Low on food", PhraseCategory.OUTDOOR),
+        LOW_ON_BATTERY(30, "Low on battery", PhraseCategory.OUTDOOR),
+        GOOD_CAMPSITE_AHEAD(31, "Good campsite ahead", PhraseCategory.OUTDOOR),
+        WATER_SOURCE_AHEAD(32, "Water source ahead", PhraseCategory.OUTDOOR),
+        STEEP_TERRAIN_AHEAD(33, "Steep terrain ahead", PhraseCategory.OUTDOOR),
+        RIVER_CROSSING_AHEAD(34, "River crossing ahead", PhraseCategory.OUTDOOR),
+        WILDLIFE_SPOTTED(35, "Wildlife spotted", PhraseCategory.OUTDOOR),
+        TRAIL_MARKER_LOST(36, "Trail marker lost", PhraseCategory.OUTDOOR),
+        SETTING_UP_CAMP(37, "Setting up camp", PhraseCategory.OUTDOOR),
+        BREAKING_CAMP(38, "Breaking camp", PhraseCategory.OUTDOOR),
+        SUNSET_SOON_MOVE(39, "Sunset soon — move", PhraseCategory.OUTDOOR),
+        FOG_ROLLING_IN(40, "Fog rolling in", PhraseCategory.OUTDOOR),
+        GOOD_SIGNAL_HERE(41, "Good signal here", PhraseCategory.OUTDOOR),
+        NO_SIGNAL_AHEAD(42, "No signal ahead", PhraseCategory.OUTDOOR),
+        ICE_ON_TRAIL(43, "Ice on trail", PhraseCategory.OUTDOOR),
+        ROCKFALL_RISK(44, "Rockfall risk", PhraseCategory.OUTDOOR),
+        STREAM_CROSSED_SAFELY(45, "Stream crossed safely", PhraseCategory.OUTDOOR),
+        SUMMIT_REACHED(46, "Summit reached", PhraseCategory.OUTDOOR),
+        DESCENDING_NOW(47, "Descending now", PhraseCategory.OUTDOOR),
+
+        // ── Emergency (48-69) ────────────────────────────────────────────
+        // Only NEED_HELP(6) is urgent-bypassed (PHASE 4.3) — these are
+        // catalog entries forwarded via the normal PHRASE(35) allowlisted
+        // path, same as everyday/outdoor phrases.
+        INJURED_MINOR(48, "Injured — minor", PhraseCategory.EMERGENCY),
+        INJURED_SERIOUS(49, "Injured — serious, need assistance", PhraseCategory.EMERGENCY),
+        LOST_TRAIL(50, "Lost the trail", PhraseCategory.EMERGENCY),
+        SEPARATED_FROM_GROUP(51, "Separated from group", PhraseCategory.EMERGENCY),
+        WEATHER_EMERGENCY(52, "Weather emergency", PhraseCategory.EMERGENCY),
+        ANIMAL_THREAT(53, "Animal threat nearby", PhraseCategory.EMERGENCY),
+        NEED_FIRST_AID(54, "Need first aid supplies", PhraseCategory.EMERGENCY),
+        NEED_WATER_URGENT(55, "Need water urgently", PhraseCategory.EMERGENCY),
+        STRANDED(56, "Stranded — cannot proceed", PhraseCategory.EMERGENCY),
+        CALLING_FOR_RESCUE(57, "Calling for rescue", PhraseCategory.EMERGENCY),
+        STAY_WHERE_YOU_ARE(58, "Stay where you are", PhraseCategory.EMERGENCY),
+        SENDING_HELP(59, "Sending help your way", PhraseCategory.EMERGENCY),
+        HELP_ARRIVED(60, "Help arrived", PhraseCategory.EMERGENCY),
+        FALSE_ALARM(61, "False alarm — disregard", PhraseCategory.EMERGENCY),
+        EQUIPMENT_FAILURE(62, "Equipment failure", PhraseCategory.EMERGENCY),
+        SHELTER_NEEDED(63, "Shelter needed", PhraseCategory.EMERGENCY),
+        HYPOTHERMIA_RISK(64, "Hypothermia risk", PhraseCategory.EMERGENCY),
+        DEHYDRATION_RISK(65, "Dehydration risk", PhraseCategory.EMERGENCY),
+        NIGHTFALL_STRANDED(66, "Stranded after nightfall", PhraseCategory.EMERGENCY),
+        GROUP_REGROUPED(67, "Group regrouped safely", PhraseCategory.EMERGENCY),
+        EVERYONE_SAFE(68, "Everyone safe", PhraseCategory.EMERGENCY),
+        EMERGENCY_OVER(69, "Emergency over", PhraseCategory.EMERGENCY);
+
+        companion object {
+            fun fromCode(code: Int): PhraseCode? = values().firstOrNull { it.code == code }
+
+            /** Pure wire codec — [1B code][4B seq], no signature envelope
+             *  here (that's applied uniformly by writeRawFrame/
+             *  meshSigner.signIfNeeded for every signed type, PHRASE
+             *  included — see TYPE_PHRASE's own doc). Off-device-testable
+             *  (see PhraseCodeTest) without constructing an
+             *  OfflineMediaTransport, same "pure codec" pattern as
+             *  MeshLocation.encode/decode. */
+            fun encode(code: Int, seq: Long): ByteArray {
+                val buf = ByteBuffer.allocate(5)
+                buf.put((code and 0xFF).toByte())
+                buf.putInt((seq and 0xFFFFFFFFL).toInt())
+                return buf.array()
+            }
+
+            /** Returns (code, seq) for any structurally-valid 5-byte
+             *  payload — [code] may be OUTSIDE the known table (including
+             *  the reserved 7): decode still succeeds, only [fromCode]
+             *  distinguishes "known" from "unknown" afterward. Null only for
+             *  a malformed (wrong-length) payload — never throws. */
+            fun decode(bytes: ByteArray): Pair<Int, Long>? {
+                if (bytes.size != 5) return null
+                val buf = ByteBuffer.wrap(bytes)
+                val code = buf.get().toInt() and 0xFF
+                val seq = buf.int.toLong() and 0xFFFFFFFFL
+                return code to seq
+            }
+        }
+    }
+
     /** PHASE 3B: GO-authoritative state for the current group call — null when none is
      *  active. Every device (GO included) keeps one of these once it's a participant,
      *  but only the GO's copy is authoritative; a client's is just a mirror of the
@@ -279,7 +423,10 @@ class OfflineMediaTransport(
         private const val TYPE_CONFIG: Byte = 1
         private const val TYPE_FRAME: Byte = 2
         private const val TYPE_AUDIO: Byte = 3
-        private const val TYPE_CHAT: Byte = 4
+        // PART 2.4 (optical transfer): visible (not private) — OpticalFrame.kt
+        // reuses this exact byte so a text/file payload sent optically is a
+        // real TYPE_CHAT frame, wire-identical to one sent over radio.
+        const val TYPE_CHAT: Byte = 4
         private const val TYPE_MODE: Byte = 5
         private const val TYPE_AUDIO_CODEC: Byte = 6
         private const val TYPE_HELLO: Byte = 7
@@ -302,10 +449,20 @@ class OfflineMediaTransport(
         // dst=the requester only, no payload — sent instead of the TYPE_CAM broadcast
         // when MAX_LIVE_CAMERAS is already reached and this wasn't already-on.
         private const val TYPE_CAM_DENIED: Byte = 19
+        // PHASE 8 TRACK C2: SELECTIVE SUBSCRIPTION — claims the gap left at 10.
+        // dst=this device's current uplink (the GO, in today's flat topology —
+        // see uplinkNodeId()), one hop only. Payload [1B count][count*8B
+        // srcId]: the exact set of srcIds this device currently wants
+        // TYPE_FRAME (video) from — see handleSubscribeFrame/
+        // maybeSendVideoSubscription. Never affects TYPE_AUDIO or any control
+        // type, including this one. A device that has never sent one is
+        // treated as "wants everyone" (see PeerLink.videoSubscription's doc)
+        // so a pre-C2 client, or any 2/3-device call where nobody ever crosses
+        // the tile-budget threshold, behaves exactly as before this track.
+        private const val TYPE_SUBSCRIBE: Byte = 10
         // PHASE 5A: SOS / FIND-over-mesh — see the class doc's SOS/FIND paragraph
         // below, MeshSosManager for the actual logic, and MeshLocation for the
-        // shared payload. Purely additive; types 1-19 are unchanged. Gap at 10
-        // deliberately left alone.
+        // shared payload. Purely additive; types 1-19 are unchanged.
         private const val TYPE_SOS: Byte = 20
         private const val TYPE_FIND_REQ: Byte = 21
         private const val TYPE_FIND_RESP: Byte = 22
@@ -319,7 +476,10 @@ class OfflineMediaTransport(
         //             the SOS/FIND/POSITION dedupe scope (see
         //             MeshSosManager.isSosFindType's doc) — an ack is idempotent by
         //             construction (a Set of ackers absorbs a duplicate for free).
-        private const val TYPE_POSITION: Byte = 23
+        // PART 2.4 (optical transfer): visible (not private) — OpticalFrame.kt
+        // reuses this exact byte so a Group Alert sent optically is a real
+        // TYPE_POSITION frame, wire-identical to one sent over radio.
+        const val TYPE_POSITION: Byte = 23
         private const val TYPE_SOS_ACK: Byte = 24
         // PHASE 6 TRACK A: generalized store-and-forward — see MeshCarrier.kt for
         // the envelope layout and the SOS-carry migration off PHASE 5BC's
@@ -355,6 +515,271 @@ class OfflineMediaTransport(
         // performs locally in response to other triggers, now reachable from a
         // remote peer instead of only from local camera-state events.
         private const val TYPE_KEYFRAME_REQUEST: Byte = 29
+        // PHASE 8 TRACK C3: relay tree. Types 1-29 unchanged; these are all
+        // one-hop-to-uplink or GO-broadcast, same shape as TYPE_VAD/TYPE_ROSTER.
+        //   type 30 = LINK_REPORT — dst=BROADCAST, every node, every 10s:
+        //             [8B rttToUplinkMs][1B bleCount][bleCount*(8B nodeId,1B
+        //             rssiDbm-signed)] — GO-side input to computeTree.
+        //   type 31 = LINK_PROBE — dst=current uplink, one hop, [8B echoToken].
+        //   type 32 = LINK_PROBE_ACK — dst=original requester, one hop back,
+        //             [8B echoToken] — the LINK_PROBE/ACK round trip is this
+        //             device's own RTT-to-uplink measurement.
+        //   type 33 = TREE_ASSIGN — dst=BROADCAST, GO only, on rebuild:
+        //             [4B genId][1B nodeCount][nodeCount*(8B nodeId,8B
+        //             parentNodeId-or-TREE_ROOT_SENTINEL,4B ipv4,2B port)].
+        //   type 34 = UPLINK_STATUS — dst=BROADCAST (GO-consumed), any node,
+        //             on actual-parent change: [8B actualParentNodeId][1B
+        //             mode: 0=assigned,1=fallback-to-go].
+        private const val TYPE_LINK_REPORT: Byte = 30
+        private const val TYPE_LINK_PROBE: Byte = 31
+        private const val TYPE_LINK_PROBE_ACK: Byte = 32
+        private const val TYPE_TREE_ASSIGN: Byte = 33
+        private const val TYPE_UPLINK_STATUS: Byte = 34
+        // OFFLINE UI: canned-phrase messaging — dst=BROADCAST, same
+        // live+carry dual delivery as TYPE_CHAT (see enqueueChatSend's
+        // pattern, mirrored by sendPhrase). [1B phraseCode][4B seq] — no
+        // free text on the wire (see PhraseCode's doc); the existing
+        // TYPE_CHAT free-text path is untouched, these are deliberately
+        // separate types.
+        private const val TYPE_PHRASE: Byte = 35
+
+        // TOPO PHASE 3.4: voice messages — RESERVED, next free number in the
+        // 36-127 range (35 was the previous highest, TYPE_PHRASE). Payload
+        // envelope (never a header/VERSION change — see G2): [4B durationMs
+        // LE][4B opusByteLength LE][opus bytes] for the payload itself, sent
+        // dst=peer (1:1) or dst=BROADCAST (group) exactly like TYPE_CHAT,
+        // and routed through TYPE_STORE_FWD for out-of-range delivery
+        // exactly as TYPE_CHAT already is. NOT YET WIRED to
+        // send/receive/dispatch in this build — see the OUTPUT report's
+        // Phase 3.4 disclosure for exactly what is and isn't implemented.
+        // The constant is declared now so the number is reserved and
+        // documented rather than left ambiguous for whoever wires the rest.
+        const val TYPE_VOICE_NOTE: Byte = 36
+
+        // OCP PHASE 3.1 (AUTHORISED WIRE ADDITION #1): timestamped video/audio
+        // — next free numbers after TYPE_VOICE_NOTE(36, reserved but not yet
+        // wired). Types 1-36 are UNCHANGED; VERSION stays 3 (G2). Payload =
+        // [8B BE monotonic capture micros] + the SAME raw encoder bytes
+        // TYPE_FRAME/TYPE_AUDIO already carry, unchanged. Sent only toward a
+        // peer whose HELLO advertised CAP_FRAME_AGE (G6) — see
+        // PeerLink.supportsFrameAge / writeRawFrame's dual-wrap. An older
+        // peer that never advertised support only ever receives the legacy
+        // type, so it needs no awareness these two numbers exist at all.
+        private const val TYPE_FRAME_TS: Byte = 37
+        private const val TYPE_AUDIO_TS: Byte = 38
+        // OCP PHASE 5.1 (AUTHORISED WIRE ADDITION #2): the low-layer video
+        // stream — next free numbers after TYPE_AUDIO_TS(38). The brief
+        // asks for "the next free type" (singular); correctness needs TWO
+        // here for the exact reason Phase 3 needed two despite similarly
+        // loose phrasing — a receiver's decoder needs its OWN low-resolution
+        // csd, never mixed with the high stream's (TYPE_CONFIG/TYPE_FRAME
+        // are UNCHANGED and untouched by this — a low-layer-unaware peer
+        // never receives either new type, see CAP_SIMULCAST below). Types
+        // 1-38 unchanged; VERSION stays 3 (G2).
+        private const val TYPE_CONFIG_LOW: Byte = 39
+        private const val TYPE_FRAME_LOW: Byte = 40
+        // OCP PHASE 3/G6: HELLO capability bitfield — bit 0 only until now.
+        // Additive: a future capability takes the next free bit, never
+        // renumbers an existing one.
+        private const val CAP_FRAME_AGE = 0x01
+        // OCP PHASE 5.1/G6: advertised only once this build actually
+        // understands TYPE_CONFIG_LOW/TYPE_FRAME_LOW and the extended
+        // TYPE_SUBSCRIBE low-layer list — see maybeSendVideoSubscription.
+        private const val CAP_SIMULCAST = 0x02
+        // OCP PHASE 5.1: 320x240 ~250kbps — deliberately far below
+        // WIDTH_DEFAULT/HEIGHT_DEFAULT/BITRATE_DEFAULT; this is a grid
+        // THUMBNAIL feed, never the pinned/active-speaker tile's stream.
+        private const val LOW_LAYER_WIDTH = 320
+        private const val LOW_LAYER_HEIGHT = 240
+        private const val LOW_LAYER_BITRATE = 250_000
+        // Lower than FPS_DEFAULT(30) — a thumbnail tile doesn't need full
+        // motion smoothness, and halving fps roughly halves bandwidth on
+        // top of the resolution cut, for the participants>4 case this only
+        // ever runs in.
+        private const val LOW_LAYER_FPS = 15
+        // OCP PHASE 3.4: age budgets — the actual lag fix. A frame older
+        // than its budget is dropped before decode (and, on a relay, before
+        // it would otherwise be forwarded — see resolveFrameAge/routeFrame).
+        private const val AUDIO_AGE_BUDGET_MS = 200L
+        private const val VIDEO_AGE_BUDGET_MS = 250L
+
+        /** OCP PHASE 3.4: pure keep/drop decision — [isIdr] and
+         *  [isAtLeastAsNewAsLastAcceptedIdr] are only ever consulted when
+         *  [ageMs] is already over [budgetMs] (an in-budget frame is always
+         *  kept outright); extracted for direct unit testing. */
+        fun shouldKeepAgedFrame(ageMs: Long, budgetMs: Long, isIdr: Boolean, isAtLeastAsNewAsLastAcceptedIdr: Boolean): Boolean {
+            if (ageMs <= budgetMs) return true
+            return isIdr && isAtLeastAsNewAsLastAcceptedIdr
+        }
+
+        /** OCP PHASE 4.3: pure derivations — extracted from [initTileBudget]
+         *  for direct unit testing of "no hardcoded 4 anywhere." */
+        /** OCP PHASE 5.4: pure mapping from PowerManager's THERMAL_STATUS_*
+         *  int constants to the short string used in both the CAP line
+         *  (Phase 0.1) and the THERMAL: log line (Phase 5.4) — extracted so
+         *  it's directly unit-testable without a PowerManager instance. */
+        fun thermalStatusString(status: Int): String = when (status) {
+            PowerManager.THERMAL_STATUS_NONE -> "none"
+            PowerManager.THERMAL_STATUS_LIGHT -> "light"
+            PowerManager.THERMAL_STATUS_MODERATE -> "moderate"
+            PowerManager.THERMAL_STATUS_SEVERE -> "severe"
+            PowerManager.THERMAL_STATUS_CRITICAL -> "critical"
+            PowerManager.THERMAL_STATUS_EMERGENCY -> "emergency"
+            PowerManager.THERMAL_STATUS_SHUTDOWN -> "shutdown"
+            else -> "unknown"
+        }
+
+        /** OCP CONNECT REBUILD PART 6: same probing logic as the instance-
+         *  level probeMaxAvcDecoderInstances/probeMaxAvcEncoderInstances,
+         *  exposed as a pure companion function so the CAP line can print
+         *  at APP START, before any OfflineMediaTransport instance exists
+         *  (no call has ever needed to succeed for this to run — see
+         *  OfflineCallActivity.logCapabilityLineAtAppStart). */
+        fun probeMaxAvcInstancesStatic(isEncoder: Boolean): Int {
+            return try {
+                val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+                var min = Int.MAX_VALUE
+                for (info in list.codecInfos) {
+                    if (info.isEncoder != isEncoder) continue
+                    if (!info.supportedTypes.any { it.equals("video/avc", ignoreCase = true) }) continue
+                    val caps = try { info.getCapabilitiesForType("video/avc") } catch (e: Exception) { continue }
+                    val n = caps.maxSupportedInstances
+                    if (n > 0) min = minOf(min, n)
+                }
+                if (min == Int.MAX_VALUE) DECODER_PROBE_FALLBACK else min
+            } catch (e: Exception) {
+                Log.w("OFFTRACE", "SCALE: ${if (isEncoder) "encoder" else "decoder"} probe failed (${e.message}) — using fallback=$DECODER_PROBE_FALLBACK")
+                DECODER_PROBE_FALLBACK
+            }
+        }
+
+        fun deriveTileBudget(probedDecoders: Int): Int = (probedDecoders - 1).coerceIn(TILE_BUDGET_MIN, TILE_BUDGET_CEILING)
+        fun deriveMaxLiveCameras(probedDecoders: Int): Int = (probedDecoders - 1).coerceIn(MIN_LIVE_CAMERAS, MAX_GROUP_PARTICIPANTS)
+
+        /** OCP PHASE 5.1: splits [visiblePeersRanked] (everyone this device
+         *  intends to decode SOMETHING for — pin-first, then speaker, then
+         *  recency, then join order; see evaluateTileBudget's own
+         *  comparator, which is what actually produces this ordering) into
+         *  a HIGH set (pinned tile + active speaker only) and a LOW set
+         *  (everyone else) — only when [simulcastActive]; otherwise every
+         *  visible peer stays HIGH and low is empty, i.e. byte-for-byte
+         *  Phase 4 behavior for any call at or below
+         *  SIMULCAST_PARTICIPANT_THRESHOLD. If NEITHER pin nor active
+         *  speaker is currently visible (nobody pinned, nobody speaking
+         *  yet), the highest-ranked visible peer becomes HIGH so the grid
+         *  is never 100% low-resolution. Decoder COUNT is never affected
+         *  either way — every peer in [visiblePeersRanked] already has (or
+         *  is about to get) a decoder slot; this only decides which bytes
+         *  feed it. */
+        fun splitHighLow(
+            visiblePeersRanked: List<Long>,
+            pin: Long?,
+            activeSpeakerId: Long?,
+            simulcastActive: Boolean
+        ): Pair<Set<Long>, Set<Long>> {
+            if (!simulcastActive) return visiblePeersRanked.toSet() to emptySet()
+            val visible = visiblePeersRanked.toSet()
+            var high = setOfNotNull(pin, activeSpeakerId).filter { it in visible }.toSet()
+            if (high.isEmpty()) high = visiblePeersRanked.take(1).toSet()
+            return high to (visible - high)
+        }
+
+        // ── PHASE 4: relay suppression (battery-weighted delay + duplicate
+        // suppression) — pure, off-device-testable companions. Types 1-19
+        // (every media/group-call type, including TYPE_AUDIO/TYPE_FRAME)
+        // have NO dedup today and carry live audio/video — deferring those
+        // by hundreds of ms would destroy every call on the mesh. This is
+        // therefore an explicit ALLOWLIST, never an exclusion list: a new
+        // media type added later defaults to the existing immediate-forward
+        // path (routeFrame only calls into this suppression path when
+        // isRelaySuppressionAllowlisted(header.type) is true).
+        private val RELAY_SUPPRESSION_ALLOWLIST: Set<Byte> = setOf(
+            TYPE_CHAT, TYPE_ROSTER, TYPE_SOS, TYPE_FIND_REQ, TYPE_FIND_RESP,
+            TYPE_POSITION, TYPE_SOS_ACK, TYPE_STORE_FWD, TYPE_SF_ACK, TYPE_PHRASE
+        )
+        fun isRelaySuppressionAllowlisted(type: Byte): Boolean = type in RELAY_SUPPRESSION_ALLOWLIST
+
+        const val RELAY_K_SUPPRESS = 2
+        const val RELAY_CACHE_CAPACITY = 512
+        const val RELAY_CACHE_TTL_MS = 10 * 60 * 1000L
+
+        /** 64-bit FNV-1a over (srcId, type, payload) — no wire field added,
+         *  purely an in-memory dedup key for the relay-suppression caches
+         *  (a THIRD cache; MeshSosManager's and MeshCarrier's own dedupe
+         *  caches, above, are never touched by this phase). Stable across
+         *  identical inputs; a single flipped payload byte changes it. */
+        fun relayFrameId(srcId: Long, type: Byte, payload: ByteArray): Long {
+            var hash = -3750763034362895579L // FNV-1a 64 offset basis (0xcbf29ce484222325)
+            val prime = 1099511628211L
+            for (i in 7 downTo 0) {
+                hash = hash xor ((srcId ushr (i * 8)) and 0xFF)
+                hash *= prime
+            }
+            hash = hash xor (type.toLong() and 0xFF)
+            hash *= prime
+            for (b in payload) {
+                hash = hash xor (b.toLong() and 0xFF)
+                hash *= prime
+            }
+            return hash
+        }
+
+        /** SOS(20)/SOS_ACK(24)/FIND_REQ(21) unconditionally, or PHRASE(35)
+         *  whose first payload byte (the wire code — see PhraseCode.encode's
+         *  [1B code][4B seq] doc) is NEED_HELP(6). Bypasses ALL THREE
+         *  relayDelayMs gates (disabled / not-charging-only / below-minimum-
+         *  battery) and is never delayed or dupCount-suppressed — see
+         *  routeFrame's call site. */
+        fun isUrgentRelayFrame(type: Byte, payload: ByteArray): Boolean = when (type) {
+            TYPE_SOS, TYPE_SOS_ACK, TYPE_FIND_REQ -> true
+            TYPE_PHRASE -> payload.isNotEmpty() && (payload[0].toInt() and 0xFF) == PhraseCode.NEED_HELP.code
+            else -> false
+        }
+
+        /** Null means NEVER relay this device's deferred copy (one of the
+         *  three gates fired). [random] is injectable (defaults to a real
+         *  RNG) so tests can pin the jitter term and assert the deterministic
+         *  base formula exactly. Formula and constants exactly as specified:
+         *  score = batteryPct/100, +0.4 (capped at 1.0) if charging; delay =
+         *  800ms * (1.05 - score) * (0.5 + random[0,1)). */
+        fun relayDelayMs(
+            relayEnabled: Boolean,
+            relayOnlyWhenCharging: Boolean,
+            charging: Boolean,
+            batteryPct: Int,
+            relayMinBattery: Int,
+            random: () -> Float = { kotlin.random.Random.nextFloat() }
+        ): Long? {
+            if (!relayEnabled) return null
+            if (relayOnlyWhenCharging && !charging) return null
+            if (batteryPct < relayMinBattery && !charging) return null
+            var score = batteryPct / 100f
+            if (charging) score = kotlin.math.min(1f, score + 0.4f)
+            val jitter = 0.5f + random()
+            return (800L * (1.05f - score) * jitter).toLong()
+        }
+
+        /** OCP PHASE 2.2: pure seeding logic for tickGoMix's initial
+         *  committedMixSpeakers commit on a threshold crossing — extracted
+         *  so it's directly unit-testable without a live transport
+         *  instance. Prefers the most recent VAD-active peers
+         *  ([rawMixSpeakers], already ranked by GroupCallMixer); falls back
+         *  to the first up-to-3 participants by join order only when no VAD
+         *  data exists yet at all (e.g. the 4th participant joins silently,
+         *  before anyone has spoken a word since the crossing). */
+        fun seedMixSpeakers(
+            rawMixSpeakers: List<Long>,
+            participants: Collection<Long>,
+            localNodeId: Long,
+            joinSequence: Map<Long, Int>
+        ): List<Long> {
+            val fromRaw = rawMixSpeakers.take(3)
+            if (fromRaw.isNotEmpty()) return fromRaw
+            return participants.filter { it != localNodeId }
+                .sortedBy { joinSequence[it] ?: Int.MAX_VALUE }
+                .take(3)
+        }
+
         private const val MAX_CHAT_PAYLOAD_BYTES = 4096
         // Envelope header (42B, see MeshCarrier.ENVELOPE_HEADER_SIZE) + the
         // largest inner payload this mesh currently carries (a chat message).
@@ -367,11 +792,81 @@ class OfflineMediaTransport(
         // PHASE 3B: group calls
         private const val MAX_GROUP_PARTICIPANTS = 8 // WiFi Direct GO client ceiling
         private const val BUSY_REASON_CALL_FULL: Byte = 1
-        // PHASE 3C: simultaneous-live-camera ceiling — the honest WiFi Direct radio
-        // limit; without this, every participant's camera turning on saturates the
-        // link. Audio-only participation beyond this cap is unlimited (up to
-        // MAX_GROUP_PARTICIPANTS).
-        private const val MAX_LIVE_CAMERAS = 4
+        // PHASE 3C / OCP PHASE 4.3: simultaneous-live-camera ceiling — the
+        // honest WiFi Direct radio limit; without this, every participant's
+        // camera turning on saturates the link. Audio-only participation
+        // beyond this cap is unlimited (up to MAX_GROUP_PARTICIPANTS). REMOVED
+        // the flat "= 4" — see [initTileBudget], which now derives this
+        // device's own maxLiveCameras from the SAME decoder probe tileBudget
+        // uses, coerced into 2..MAX_GROUP_PARTICIPANTS. 2 is this app's
+        // documented floor (a stronger device can host more; nothing weaker
+        // than 2 simultaneous cameras is a useful video call at all).
+        private const val MIN_LIVE_CAMERAS = 2
+        // PHASE 8 STEP 2: automatic recovery for a degraded group tile decoder.
+        private const val DEGRADED_RETRY_INTERVAL_MS = 10_000L
+        private const val DEGRADED_MAX_RETRY_ATTEMPTS = 5
+        // PHASE 8 STEP 3: GO-side audio mixing — BELOW this participant count,
+        // the existing forward-and-mix-locally path (unchanged, see audioDst/
+        // dispatchLocal's TYPE_AUDIO branch) stays exactly as it works today.
+        // AT or above it, the GO stops relaying raw per-sender audio and
+        // instead mixes+redistributes (see tickGoMix).
+        private const val GO_MIX_PARTICIPANT_THRESHOLD = 4
+        // OCP PHASE 5.1: the low encoder runs only once a group call
+        // actually needs grid thumbnails at all — reuses
+        // GO_MIX_PARTICIPANT_THRESHOLD's ">4" boundary deliberately (not a
+        // second, independently-tunable number), matching this file's own
+        // established pattern for its other N-scaling behaviors (see
+        // TREE_MIN_SIZE_FOR_RELAY's identical reuse, below).
+        private const val SIMULCAST_PARTICIPANT_THRESHOLD = GO_MIX_PARTICIPANT_THRESHOLD
+        // PHASE 8 TRACK C3: relay tree — GO=depth0, direct children=depth1,
+        // grandchildren=depth2. TREE_MIN_SIZE_FOR_RELAY reuses
+        // GO_MIX_PARTICIPANT_THRESHOLD deliberately (not a second,
+        // independently-tunable number) — this is the ONE size threshold
+        // where any of this phase's N-scaling behavior activates at all;
+        // below it, computeTree's own first check never even looks at RSSI/
+        // RTT and every node's parent is unconditionally the GO (see
+        // computeTree's doc — this is also the <=3-device proof).
+        private const val TREE_FANOUT_CAP = 3
+        private const val TREE_MAX_DEPTH = 2
+        private const val TREE_MIN_SIZE_FOR_RELAY = GO_MIX_PARTICIPANT_THRESHOLD
+        private const val TREE_REBUILD_COOLDOWN_MS = 5_000L
+        private const val LINK_REPORT_INTERVAL_MS = 10_000L
+        private const val LINK_PROBE_INTERVAL_MS = 10_000L
+        private const val RSSI_STALE_MS = 30_000L
+        // A candidate parent must be measurably better than the GO directly —
+        // avoids reshuffling the tree over noise-level RSSI/RTT differences.
+        private const val RSSI_MARGIN_DBM = 10
+        // GO-only, unreachability confirmed after this many silent LINK_REPORT
+        // cycles (~30s) — same order of magnitude as GO_HEARTBEAT's 3-miss
+        // (30s) GO-loss detection, deliberately not tighter.
+        private const val LINK_REPORT_STALE_MS = 30_000L
+        // Sentinel "no parent — I am the root" value for treeParentOf/
+        // assignedParentId — deliberately NOT MeshFrame.BROADCAST_ID or
+        // PENDING_ID, which already mean other things in this codebase; a
+        // fixed value nowhere near a real SHA-256-derived nodeId.
+        private const val TREE_ROOT_SENTINEL: Long = Long.MIN_VALUE
+        private const val GO_MIX_TICK_MS = 20L
+        private const val MIX_SPEAKER_EVAL_INTERVAL_MS = 500L
+        private const val MIX_SPEAKER_HOLD_MS = 1_500L
+        // Sentinel key into groupAudioDecoders/groupLatestPcm for a CLIENT's
+        // single incoming GO-mixed stream — there is exactly one, never one
+        // per sender, so it is never keyed by a real nodeId. Distinct from
+        // every other sentinel this file/MeshFrame already defines.
+        private const val GO_MIX_DECODER_KEY: Long = -100L
+        // PHASE 8 STEP 4: video tile decoder budget — runs on EVERY device
+        // (unlike STEP 3's audio mixing, which is GO-only), since decoder
+        // limits are a per-DEVICE hardware constraint. Fallback used only if
+        // MediaCodecList probing itself throws — see probeMaxAvcDecoderInstances.
+        private const val DECODER_PROBE_FALLBACK = 4
+        // OCP PHASE 4.3: REMOVED the flat TILE_BUDGET_MAX=4 — tileBudget is
+        // now coerced into TILE_BUDGET_MIN..TILE_BUDGET_CEILING (2..8) around
+        // whatever probeMaxAvcDecoderInstances actually reports, so a
+        // stronger device is no longer artificially capped at the same 4
+        // tiles as the weakest one this app supports. See [initTileBudget].
+        private const val TILE_BUDGET_MIN = 2
+        private const val TILE_BUDGET_CEILING = 8
+        private const val TILE_BUDGET_EVAL_INTERVAL_MS = 1_000L
+        private const val TILE_SWAP_HYSTERESIS_MS = 3_000L
         // TYPE_SPEAKER's nodeId field sentinel for "nobody is currently speaking" —
         // distinct from MeshFrame's own PENDING_ID/BROADCAST_ID, which belong to the
         // envelope layer, not this application-level concept.
@@ -398,15 +893,39 @@ class OfflineMediaTransport(
         private const val ACTIVE_SPEAKER_DEBOUNCE_MS = 2_000L
 
         private const val TTL_UNICAST: Byte = 8
-        private const val TTL_BROADCAST: Byte = 4
+        // PHASE 8 TRACK C3: bumped 4->6 — a broadcast now potentially crosses
+        // up to 3 real hops (grandchild -> its parent -> GO -> other parent ->
+        // other grandchild, TREE_MAX_DEPTH=2 each side) plus margin for a
+        // make-before-break transition window; a plain constant tune, not a
+        // frame-type-value change, so it doesn't touch the "never change an
+        // existing frame type constant" rule (that's about the type byte).
+        private const val TTL_BROADCAST: Byte = 6
         private const val MAX_VIDEO_PAYLOAD_BYTES = 256 * 1024
         private const val MAX_AUDIO_PAYLOAD_BYTES = 4096
         private const val MAX_CONFIG_PAYLOAD_BYTES = 4096
         private const val MAX_CONTROL_PAYLOAD_BYTES = 1024 // mode/audio-codec/hello/busy/hangup/roster
-        private const val WIDTH = 1280
-        private const val HEIGHT = 720
-        private const val FPS = 30
-        private const val BITRATE = 2_000_000
+        // PHASE 8 STEP 5: DEFAULT/tier-1 values only now — see the mutable
+        // WIDTH/HEIGHT/FPS/BITRATE instance fields below (this class's own
+        // resolution ladder rewrites those live as participant count
+        // crosses a tier boundary; these constants are what a fresh call
+        // always starts at, and what LADDER_TIER_1 always resolves to).
+        private const val WIDTH_DEFAULT = 1280
+        private const val HEIGHT_DEFAULT = 720
+        private const val FPS_DEFAULT = 30
+        private const val BITRATE_DEFAULT = 2_000_000
+        // PHASE 8 STEP 5 / TRACK C5 REVISED LADDER: resolution ladder tiers —
+        // see ladderTierFor. Bitrates are standard-ish mobile-video
+        // conventions for each resolution (not given explicitly by the spec,
+        // which only fixes resolution+fps per tier). Bumped from the original
+        // (4/8) breakpoints to (8/20) now that C2 (selective subscription) and
+        // C3 (relay tree) remove the bandwidth ceiling that justified the more
+        // conservative original tiering — quality now HOLDS at 720p up to 8
+        // peers, per this phase's explicit requirement. <=8 still reuses the
+        // exact pre-existing default values, so a 2/3 device call remains
+        // byte-for-byte identical to before this phase.
+        private const val LADDER_TIER1_MAX = 8
+        private const val LADDER_TIER2_MAX = 20
+        private const val LADDER_TIER3_MAX = 20
         private const val AUDIO_SAMPLE_RATE = 16000
         private const val AUDIO_CHANNEL_IN = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_CHANNEL_OUT = AudioFormat.CHANNEL_OUT_MONO
@@ -441,7 +960,24 @@ class OfflineMediaTransport(
         private const val DROP_LOG_INTERVAL = 100
         // FIX 1: hard cap per call-scoped media thread when tearing down just the
         // current call (endLocalCallState/endGroupCallState) — see stopCallThreads().
-        private const val CALL_THREAD_JOIN_MS = 500L
+        // PART B / B2: raised from the original 500ms — Thread.interrupt() does
+        // NOT unblock a thread parked inside a native AudioRecord.read() or
+        // MediaCodec.dequeueOutputBuffer() call (only Java-level blocking, like
+        // a BlockingQueue.poll, actually responds to it), so 500ms left too
+        // little margin for those calls' own timeouts to naturally elapse and
+        // let the loop notice callActive==false on its own. This alone is
+        // still just a best-effort budget, not a guarantee — see
+        // [CODEC_RELEASE_WAIT_MS]/[waitForCodecFree] for the actual gate.
+        private const val CALL_THREAD_JOIN_MS = 1_500L
+        // PART B / B2: a SEPARATE, second wait — applied at the point a
+        // release function is about to call stop()/release() on a codec/
+        // AudioRecord a worker thread might still be inside, gated on that
+        // worker's OWN "I am inside a native call right now" flag rather than
+        // trusting stopCallThreads()'s join() alone. Short: by the time a
+        // release function runs, stopCallThreads() has already spent up to
+        // [CALL_THREAD_JOIN_MS] joining — this is only the final margin for
+        // the flag to clear.
+        private const val CODEC_RELEASE_WAIT_MS = 300L
 
         private const val AUDIO_RECORD_RETRY_DELAY_MS = 500L
         private const val MIC_READ_ERROR_REBUILD_THRESHOLD = 100
@@ -457,6 +993,116 @@ class OfflineMediaTransport(
         // logging every one would drown out everything else.
         private const val FORWARD_MEDIA_LOG_SAMPLE = 50
         private const val UNKNOWN_DST_LOG_INTERVAL = 100
+        // OCP PHASE 0.2: LAT line — 1/sec/peer, per the brief's own spec.
+        private const val LAT_LOG_INTERVAL_MS = 1_000L
+
+        /** Pure throttle decision — extracted from [maybeLogPeerLatency] so
+         *  "1/sec/peer" is directly unit-testable without a live transport
+         *  instance (this project has no Robolectric — see
+         *  OfflineMediaTransportTest's class doc for the same constraint). */
+        fun shouldLogLatNow(lastLogAtMs: Long, now: Long): Boolean = now - lastLogAtMs >= LAT_LOG_INTERVAL_MS
+        // OCP PHASE 3.5: sentinel for "no age known yet" — a peer that has
+        // never sent a TYPE_FRAME_TS/TYPE_AUDIO_TS frame (never advertised
+        // CAP_FRAME_AGE, or hasn't sent media since resolving).
+        private const val AGE_MS_NOT_YET_IMPLEMENTED = -1L
+    }
+
+    /** Pure, off-device-testable — the exact seen/dupCount/bounds/TTL logic
+     *  scheduleAllowlistedForward uses, extracted into its own plain class
+     *  (no Android/Context dependency) specifically so cache bounds and
+     *  TTL-expiry behavior are unit-testable without a real
+     *  OfflineMediaTransport instance (which needs sockets/camera/audio to
+     *  construct). Matches MeshSosManager's/MeshCarrier's own
+     *  LinkedHashMap+removeEldestEntry+prune-on-access pattern exactly.
+     *  Declared here, at class level rather than inside the companion
+     *  object above, for the same reason PartyRingView.RenderMode is: a
+     *  type nested inside a companion object is only reachable from outside
+     *  as Outer.Companion.Nested, not the shorter Outer.Nested this class's
+     *  own test file needs. */
+    class RelayDedupeCache(
+        private val capacity: Int = RELAY_CACHE_CAPACITY,
+        private val ttlMs: Long = RELAY_CACHE_TTL_MS
+    ) {
+        private val seenAtMs = object : LinkedHashMap<Long, Long>(16, 0.75f, false) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Long>?): Boolean = size > capacity
+        }
+        private val dupCount = HashMap<Long, Int>()
+
+        /** Prunes TTL-expired entries, then: true + increments dupCount if
+         *  [id] was already seen; false + records it as newly-seen
+         *  otherwise. */
+        @Synchronized
+        fun observe(id: Long, nowMs: Long): Boolean {
+            prune(nowMs)
+            val seen = seenAtMs.containsKey(id)
+            if (seen) dupCount[id] = (dupCount[id] ?: 0) + 1 else seenAtMs[id] = nowMs
+            return seen
+        }
+
+        @Synchronized
+        fun dupCountFor(id: Long): Int = dupCount[id] ?: 0
+
+        @Synchronized
+        fun size(): Int = seenAtMs.size
+
+        private fun prune(nowMs: Long) {
+            val it = seenAtMs.entries.iterator()
+            while (it.hasNext()) {
+                val e = it.next()
+                if (nowMs - e.value > ttlMs) {
+                    dupCount.remove(e.key)
+                    it.remove()
+                }
+            }
+        }
+    }
+
+    /** OCP PHASE 3.3: per-source clock-offset baseline + age computation.
+     *  Pure, off-device-testable (no Android/Context dependency — same
+     *  rationale as [RelayDedupeCache], declared here rather than inside the
+     *  companion object for the identical reason that class's own doc gives).
+     *  Clocks are NOT synchronized between devices, so age is a DELTA
+     *  against a baseline recorded on this source's FIRST frame, never a
+     *  raw comparison of [theirStampMicros] against this device's own clock
+     *  — see [ageMs]'s doc for the exact formula. */
+    class FrameAgeTracker {
+        private class Baseline(@Volatile var offsetMicros: Long, @Volatile var lastTheirStampMicros: Long)
+        private val baselines = ConcurrentHashMap<Long, Baseline>()
+
+        /** [nowMicros] and [theirStampMicros] must be the SAME kind of
+         *  monotonic-since-boot micros both sides already use for encoder
+         *  PTS (System.nanoTime()/1000 — see writeRawFrame's capture-time
+         *  call site) — never System.currentTimeMillis(), which is
+         *  wall-clock and unrelated to either device's boot-relative clock.
+         *  On the first frame from [srcId]: offset = nowMicros -
+         *  theirStampMicros (this call returns age=0). On every later
+         *  frame: age = (nowMicros - theirStampMicros) - offset — the
+         *  elapsed time since capture, correct regardless of the constant
+         *  absolute offset between the two devices' independent clocks, AS
+         *  LONG AS both clocks tick at the same rate (true of monotonic
+         *  device clocks modulo drift). Re-baselines (offset recomputed)
+         *  if [theirStampMicros] ever goes backward relative to the last
+         *  frame seen from this source — a sender clock reset/restart mid-
+         *  session, the one case a fixed offset would otherwise silently
+         *  invalidate for the rest of the call. */
+        fun ageMs(srcId: Long, theirStampMicros: Long, nowMicros: Long): Long {
+            val b = baselines.compute(srcId) { _, existing ->
+                if (existing == null) {
+                    Baseline(offsetMicros = nowMicros - theirStampMicros, lastTheirStampMicros = theirStampMicros)
+                } else {
+                    if (theirStampMicros < existing.lastTheirStampMicros) {
+                        existing.offsetMicros = nowMicros - theirStampMicros
+                    }
+                    existing.lastTheirStampMicros = theirStampMicros
+                    existing
+                }
+            }!!
+            val ageMicros = (nowMicros - theirStampMicros) - b.offsetMicros
+            return (ageMicros / 1000L).coerceAtLeast(0L)
+        }
+
+        fun reset(srcId: Long) { baselines.remove(srcId) }
+        fun resetAll() { baselines.clear() }
     }
 
     private val running = AtomicBoolean(false)
@@ -500,6 +1146,43 @@ class OfflineMediaTransport(
     // top-speaker signal (see onActiveSpeakersChanged wiring in startGroupCallMixer).
     @Volatile private var speakerCandidateId: Long? = null
     @Volatile private var speakerCandidateSinceMs: Long = 0L
+
+    // PHASE 8 STEP 3: GO-side audio mixing (participants >= 4 only — see
+    // GO_MIX_PARTICIPANT_THRESHOLD). Everything here runs on its OWN
+    // dedicated thread (goMixHandler/tickGoMix), never the read/write
+    // threads — the original GO-mixing attempt's documented failure (see
+    // GroupCallMixer's class doc) was a per-tick decode-all loop running
+    // inline; this avoids that by only ever reading PCM that each sender's
+    // OWN read thread already decoded into groupLatestPcm (unchanged).
+    private var goMixThread: HandlerThread? = null
+    private var goMixHandler: Handler? = null
+    private var goMixRunnable: Runnable? = null
+    private var goMixEncoder: MediaCodec? = null
+    // Raw (undebounced) top-3 from GroupCallMixer — same source
+    // onRawActiveSpeakersChanged already consumes for the video-highlight
+    // debounce; this is a SEPARATE hysteresis on top of the same signal (see
+    // evaluateMixSpeakerHysteresis) since flapping here means creating/
+    // destroying Opus decode work, not just moving a UI highlight.
+    @Volatile private var rawMixSpeakers: List<Long> = emptyList()
+    private var pendingMixSpeakers: List<Long> = emptyList()
+    private var pendingMixSpeakersSinceMs = 0L
+    private var committedMixSpeakers: List<Long> = emptyList()
+    // OCP PHASE 2.1: single source of truth for "is the GO mix actually
+    // live and delivering audio right now" — read by
+    // isGoMixReplacingBroadcastAudio (raw forwarding suppression) and
+    // dispatchLocal's TYPE_AUDIO branch (GO's own local-playback gate)
+    // instead of either one re-deriving it from the raw participant count.
+    // Flips true only once tickGoMix has actually sent this episode's first
+    // mixed frame; flips false the instant eligibility is lost, in the same
+    // tick, before any frame is dropped — see tickGoMix.
+    private val goMixLive = AtomicBoolean(false)
+    // OCP PHASE 0.3/2.4: last time ANY audio — raw-forwarded (forwardBroadcast)
+    // or GO-mixed (tickGoMix) or the GO's own local raw-mix playback
+    // (dispatchLocal) — was actually delivered to at least one recipient.
+    // Consumed only by tickGoMix's gapMs computation on a threshold crossing.
+    @Volatile private var lastAudioDeliveredAtMs = 0L
+    private var lastMixSpeakerEvalMs = 0L
+    private var lastGoMixLogMs = 0L
     // FIX 2: gates the once-per-second "candidate pending" log in onRawActiveSpeakersChanged.
     private var lastSpeakerCandidateLogMs: Long = 0L
     // FIX 4: the callId whose audio senders are currently started — startGroupCallAudio
@@ -526,6 +1209,26 @@ class OfflineMediaTransport(
     private var incompatibleVersionLogged = false
     private var wrongDstDropCount = 0
     private var ttlZeroDropCount = 0
+    // OCP PHASE 3.3/3.4: see FrameAgeTracker's/resolveFrameAge's docs.
+    private val frameAgeTracker = FrameAgeTracker()
+    private val lastAcceptedIdrCaptureMicros = ConcurrentHashMap<Long, Long>()
+    private var staleAgedFrameDropCount = 0
+    // OCP PHASE 3.5: most recent age computed for ANY TYPE_FRAME_TS/
+    // TYPE_AUDIO_TS frame from this srcId (kept EVEN for a frame that was
+    // then dropped for being over budget — the LAT line should show the
+    // real, current age, not silently reset to "unknown" the moment
+    // degradation starts). Read by maybeLogPeerLatency; -1 (never
+    // overwritten) means this peer has never sent a timestamped frame.
+    private val lastKnownAgeMs = ConcurrentHashMap<Long, Long>()
+    // Throttles logIfRelayed's "MESH: relayed $n frames from ..." line
+    // (below) — this used to log every single relayed frame unconditionally
+    // (419 lines in 25s on a 3-device call, 76% of all OFFTRACE output),
+    // same noise problem as feedGroupDecoder's per-frame exceptions — see
+    // logDroppedGroupFrame for the identical pattern this mirrors.
+    private val relayedFrameCount = ConcurrentHashMap<Long, Int>()
+    private val relayedLogAtMs = ConcurrentHashMap<Long, Long>()
+    // OCP PHASE 0.2: LAT line throttle — one entry per peer nodeId.
+    private val lastLatLogAtMs = ConcurrentHashMap<Long, Long>()
     private var unknownDstDropCount = 0
     private var staleMediaDropCount = 0
     // FIX 4: media arriving with no active call at all (previously silently
@@ -533,6 +1236,87 @@ class OfflineMediaTransport(
     private var noActiveCallMediaDropCount = 0
     private val forwardLogCounters = ConcurrentHashMap<Long, Int>()
     private val disconnectedLinks = ConcurrentHashMap.newKeySet<PeerLink>()
+
+    // ── PHASE 8 TRACK C3: relay tree ─────────────────────────────────────────
+    // routingTable itself is UNCHANGED — still holds every direct neighbor
+    // (parent included) exactly as it always has (see hasChildren()'s doc for
+    // why redefining it was unnecessary and would have broken several
+    // existing call sites — currentOtherMemberCount, isConnectedOverWifiDirect,
+    // handlePeerDisconnected's active-call detection — that all assume a
+    // client's uplink is a normal routingTable entry). This section only adds
+    // a parallel, purely-additive notion of "which of my direct neighbors is
+    // my uplink."
+    //
+    // nodeId of this device's current uplink neighbor — the one directly-
+    // connected PeerLink THIS device itself dialed out to (as opposed to
+    // accepted). Null on the GO (always root) and null before this device's
+    // first connection resolves.
+    @Volatile private var parentNodeId: Long? = null
+    // Staged during a make-before-break reassignment (see reassignParentIfNeeded)
+    // — the NEW parent link, not yet promoted. Every enqueue() before the swap
+    // still targets the OLD (still fully live) parentNodeId's link, so no
+    // audio/video interruption ever happens mid-swap.
+    @Volatile private var pendingParentLink: PeerLink? = null
+    // From the latest TYPE_TREE_ASSIGN — what the GO wants this node's parent
+    // to be. TREE_ROOT_SENTINEL = "the GO" (also this field's initial value,
+    // which is why every device's fallback target is always the GO by
+    // default, with zero tree-specific code needing to run first).
+    @Volatile private var assignedParentId: Long = TREE_ROOT_SENTINEL
+    // GO-computed, mirrored to every node via TYPE_TREE_ASSIGN — nodeId ->
+    // its assigned parent nodeId. Used only by nextHopFor's multi-hop routing
+    // decision; empty (and never consulted) for the whole life of any call
+    // that never crosses TREE_MIN_SIZE_FOR_RELAY participants.
+    private val treeParentOf = ConcurrentHashMap<Long, Long>()
+    private val treeAssignedAddress = ConcurrentHashMap<Long, InetSocketAddress>()
+    // GO-only: nodeId -> the real, socket-observed remote address a HELLO
+    // resolved from (see handleHelloFrame) — ground truth, unspoofable, no
+    // wire-protocol addition needed. Assembled into TYPE_TREE_ASSIGN's payload.
+    private val nodeDialAddress = ConcurrentHashMap<Long, InetSocketAddress>()
+    @Volatile private var treeGenId = 0
+    @Volatile private var lastTreeRebuildAtMs = 0L
+    // Any node can accept CHILD connections once the GO assigns it some —
+    // lazily bound the first time that happens (see ensureRelayServerStarted).
+    // Still null for the entire life of a call that never grows a relay node.
+    private var relayServerSocket: ServerSocket? = null
+    // GO-side inputs to computeTree — refreshed by each node's periodic
+    // TYPE_LINK_REPORT broadcast (RTT to ITS OWN uplink, plus fresh BLE
+    // neighbor RSSI) and the TYPE_LINK_PROBE/PROBE_ACK round trip (this
+    // device's own RTT measurement to whatever it currently dials as uplink).
+    private val rttToUplinkByNode = ConcurrentHashMap<Long, Long>()
+    private val bleRssiByNodePair = ConcurrentHashMap<Long, ConcurrentHashMap<Long, Int>>()
+    private val lastLinkReportAtMs = ConcurrentHashMap<Long, Long>()
+
+    // ── PHASE 4: relay suppression instance state ────────────────────────────
+    // Bounded exactly like MeshSosManager's/MeshCarrier's own dedupe caches
+    // (LinkedHashMap + removeEldestEntry, cap 512, TTL 10min, pruned on
+    // access) — a THIRD cache, scoped only to this suppression path; neither
+    // of theirs is ever touched here. Logic lives in the pure, directly-
+    // tested RelayDedupeCache (see companion object) — this is just an
+    // instance of it, @Synchronized internally so no extra lock is needed here.
+    private val relayDedupeCache = RelayDedupeCache()
+    // Single dedicated background thread — relay deferrals are lightweight
+    // (eventually call an existing forward* function), never CPU-bound, so
+    // one thread is enough. Deliberately NOT a per-link reader thread (those
+    // must stay free to keep reading their socket, see runReadLoop) and NOT
+    // mainHandler (UI-only, see that field's doc) — a clearly separate,
+    // named, daemon thread so it can never keep the process alive on its own.
+    private val relayScheduler: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "RelaySuppression").apply { isDaemon = true } }
+    private val relayDeferrals = ConcurrentHashMap<Long, ScheduledFuture<*>>()
+    private var pendingProbeToken: Long = 0L
+    private var pendingProbeSentAtMs: Long = 0L
+    // This device's own last-measured RTT to ITS OWN current uplink — what it
+    // reports in its own TYPE_LINK_REPORT. Null until the first PROBE/ACK
+    // round trip completes.
+    @Volatile private var rttToOwnUplinkMs: Long? = null
+    // The GO's real nodeId — captured once, the moment this device's very
+    // FIRST connection ever resolves (always a direct dial to the GO; see
+    // startAsClient/handleHelloFrame), so a later TYPE_TREE_ASSIGN that
+    // reassigns this node straight back to TREE_ROOT_SENTINEL ("the GO") has
+    // a real nodeId to dial/compare against without needing a second sentinel
+    // meaning. Never set on the GO itself (it has no uplink to record).
+    @Volatile private var goNodeId: Long? = null
+    private var linkTickerRunnable: Runnable? = null
 
     /** This device's stable mesh node id — first 8 bytes of SHA-256(Ed25519 public
      *  key), persisted across launches. PHASE 3: public so the Activity can tell "is
@@ -556,7 +1340,12 @@ class OfflineMediaTransport(
         context = context,
         localNodeId = localNodeId,
         routingTable = routingTable,
-        retryFrame = { header, payload, fromLink -> routeFrame(header, payload, fromLink) }
+        retryFrame = { header, payload, fromLink -> routeFrame(header, payload, fromLink) },
+        // PART A: retries a carried frame that was queued pending an unknown
+        // originId pubkey — see MeshSigner.verifyCarried/drainPendingCarried.
+        retryCarried = { originId, finalDstId, innerType, inner, carrierId, hopCount ->
+            dispatchCarriedInner(originId, finalDstId, innerType, inner, carrierId, hopCount)
+        }
     )
 
     // PHASE 5A/5BC: SOS/FIND/POSITION/carry — see MeshSosManager's class doc.
@@ -676,8 +1465,8 @@ class OfflineMediaTransport(
         carrier.configure(localNodeId, TYPE_STORE_FWD, TYPE_SOS)
         carrier.sendStoreFwd = { dst, payload -> writeFrame(dst, TYPE_STORE_FWD, payload) }
         carrier.sendAck = { dst, payload -> writeFrame(dst, TYPE_SF_ACK, payload) }
-        carrier.dispatchInner = { originId, finalDstId, innerType, inner ->
-            dispatchCarriedInner(originId, finalDstId, innerType, inner)
+        carrier.dispatchInner = { originId, finalDstId, innerType, inner, carrierId, hopCount ->
+            dispatchCarriedInner(originId, finalDstId, innerType, inner, carrierId, hopCount)
         }
         sosTriggers.onFire = { startSos(null) }
         // BUG 1 FIX 5: hardened — "roster currently has 0 other members" alone
@@ -740,7 +1529,47 @@ class OfflineMediaTransport(
      *  PHASE 5BC is unchanged — see MeshCarrier's class doc. Deliberately calls
      *  [dispatchLocal] directly, NOT [routeFrame] — a carried message's forwarding
      *  onward is MeshCarrier's own peer-by-peer offer, not a TTL broadcast fan-out. */
-    private fun dispatchCarriedInner(originId: Long, finalDstId: Long, innerType: Byte, inner: ByteArray) {
+    private fun dispatchCarriedInner(originId: Long, finalDstId: Long, innerType: Byte, inner: ByteArray, carrierId: Long, hopCount: Int) {
+        // PART A: a carried SOS is the one carried type with real-world
+        // alarm consequences — it must be cryptographically verified against
+        // its claimed originId before it can ever reach dispatchLocal/
+        // handleSosFrame, unlike every other carried type below (which keeps
+        // the exact pre-existing dedupe-then-dispatch behavior). See
+        // MeshSigner.verifyCarried's doc for the full A2-A5 rationale.
+        if (innerType == TYPE_SOS) {
+            when (val result = meshSigner.verifyCarried(originId, finalDstId, innerType, inner, carrierId, hopCount)) {
+                is MeshSigner.CarriedVerifyResult.Accepted -> {
+                    // Re-applies MeshSosManager's own msgSeq-based dedupe to the
+                    // VERIFIED inner payload (trailer already stripped by
+                    // verifyCarried) — same "never re-alarm a device that
+                    // already saw this SOS" guarantee as every other carried
+                    // type below, and the same shape the live path dedupes in
+                    // (see routeFrame — always on the trailer-stripped bytes).
+                    if (meshSosManager.checkAndRecordDuplicate(originId, innerType, result.innerPayload)) {
+                        log("MESH: dropped duplicate carried inner type=$innerType from=${MeshFrame.hex(originId)}")
+                        return
+                    }
+                    val syntheticHeader = MeshFrame.Header(
+                        MeshFrame.VERSION, originId, finalDstId, TTL_UNICAST, innerType, result.innerPayload.size
+                    )
+                    // A3: age comes from the SIGNED wire timestamp, never local
+                    // receipt time or the payload's own embedded unixSeconds —
+                    // see MeshSosManager.handleSosFrame's carriedVerifiedAgeSec doc.
+                    val carriedAgeSec = (System.currentTimeMillis() / 1000L - result.signedTimestampSec).coerceAtLeast(0L)
+                    dispatchLocal(
+                        syntheticHeader, result.innerPayload, isLive = false,
+                        carrierInfo = carrierId to hopCount, carriedAgeSecOverride = carriedAgeSec
+                    )
+                }
+                MeshSigner.CarriedVerifyResult.Reject -> {
+                    log("MESH: dropped carried SOS from=${MeshFrame.hex(originId)} reason=verify_failed")
+                }
+                MeshSigner.CarriedVerifyResult.Queued -> {
+                    log("MESH: carried SOS from=${MeshFrame.hex(originId)} queued pending pubkey")
+                }
+            }
+            return
+        }
         if (meshSosManager.isSosFindType(innerType) &&
             meshSosManager.checkAndRecordDuplicate(originId, innerType, inner)
         ) {
@@ -752,7 +1581,11 @@ class OfflineMediaTransport(
         // frame that just arrived off a real link. See dispatchLocal's isLive
         // param / MeshSosManager.handleSosFrame's doc for what this changes
         // (only TYPE_SOS's alarmability; every other type ignores it).
-        dispatchLocal(syntheticHeader, inner, isLive = false)
+        // OFFLINE UI STEP 4: carrierId/hopCount passed through so a
+        // PHRASE/CHAT handler can show "carried via X, N hops" — every OTHER
+        // existing handler simply ignores the new parameter (default null),
+        // unchanged behavior.
+        dispatchLocal(syntheticHeader, inner, isLive = false, carrierInfo = carrierId to hopCount)
     }
 
     // Camera2 (local send path) — shared by 1:1 and group video, since a device only
@@ -792,12 +1625,52 @@ class OfflineMediaTransport(
     // false as the very FIRST thing releaseEncoder() does, checked by the drain
     // loop before every call into the encoder.
     @Volatile private var encoderRunning = false
+    // OCP PHASE 5.1: the low-layer simulcast encoder — mirrors encoder/
+    // encoderInputSurface/encoderRunning exactly, one instance, only ever
+    // running alongside the high encoder (never instead of it, never
+    // outliving it — see releaseEncoder's fold-in). See shouldRunLowEncoder.
+    private var lowEncoder: MediaCodec? = null
+    private var lowEncoderInputSurface: Surface? = null
+    @Volatile private var lowEncoderRunning = false
+    private var lowEncoderDrainThread: Thread? = null
     // FIX: this device's own last-broadcast combined csd (SPS+PPS), captured once
     // drainEncoderLoop's one-shot TYPE_CONFIG actually goes out — replayed to a
     // late-joining peer by sendGroupCallStateTo, since that peer's connection
     // didn't exist yet for the original one-shot broadcast to ever reach it. Reset
     // per call, same lifecycle as decoderReady/pendingCsd below.
     @Volatile private var lastCsdOut: ByteArray? = null
+
+    // PHASE 8 STEP 5: THIS device's own outgoing encoder ladder settings —
+    // mutable (unlike the old const vals), rewritten by applyResolutionLadder
+    // whenever participant count crosses a tier boundary. Always start a
+    // fresh call at the tier-1/default values, same as before this phase.
+    @Volatile private var WIDTH = WIDTH_DEFAULT
+    @Volatile private var HEIGHT = HEIGHT_DEFAULT
+    @Volatile private var FPS = FPS_DEFAULT
+    @Volatile private var BITRATE = BITRATE_DEFAULT
+    private data class LadderTier(val width: Int, val height: Int, val fps: Int, val bitrate: Int)
+    private val LADDER_TIER1 = LadderTier(WIDTH_DEFAULT, HEIGHT_DEFAULT, FPS_DEFAULT, BITRATE_DEFAULT)
+    private val LADDER_TIER2 = LadderTier(640, 360, 20, 700_000)
+    private val LADDER_TIER3 = LadderTier(320, 240, 15, 300_000)
+    @Volatile private var currentLadderTier: LadderTier? = null
+    // OCP PHASE 5.4: see applyResolutionLadder's doc.
+    @Volatile private var thermalForcedTier: LadderTier? = null
+
+    /** <=4: unchanged tier-1 defaults (byte-identical to pre-Phase-8
+     *  behavior — this is what keeps the 2/3-device path exactly as it was).
+     *  5-8/9-20 step down resolution+fps+bitrate together. >20 has no tier
+     *  of its own here — MAX_LIVE_CAMERAS/MAX_GROUP_PARTICIPANTS already cap
+     *  this app well below 20 today (see this function's own doc comment at
+     *  its call site for why), so tier-3 values double as the "if a camera
+     *  is ever explicitly opted into beyond 20" fallback; ordinary camera
+     *  activation is already opt-in-only (see [applyCamState]), so "video
+     *  off by default" past this tier is already the structural default,
+     *  not something this function needs to separately enforce. */
+    private fun ladderTierFor(participantCount: Int): LadderTier = when {
+        participantCount <= LADDER_TIER1_MAX -> LADDER_TIER1
+        participantCount <= LADDER_TIER2_MAX -> LADDER_TIER2
+        else -> LADDER_TIER3
+    }
 
     // Decoder (remote receive path, 1:1 ONLY) — PHASE 3: this call's decode
     // bookkeeping, reset per call by endLocalCallState() rather than living for the
@@ -821,10 +1694,144 @@ class OfflineMediaTransport(
     // [decoder] above; never touched by a 1:1 call. Video is no longer gated to a
     // single "active speaker" — every camera-on participant gets their own entry.
     private val groupDecoders = ConcurrentHashMap<Long, MediaCodec>()
+    // PART B / B1: MediaCodec is not thread-safe — feedGroupDecoder runs on
+    // that srcId's own MediaReadLoop-$idx thread at up to 30fps, while
+    // configureGroupDecoder/releaseGroupDecoder for the SAME srcId can fire
+    // from the main thread (setGroupTileSurface, retryDegradedGroupPeers,
+    // group-call teardown) or from a DIFFERENT read thread mid reconnect
+    // churn. One lock object per srcId — never one global lock, which would
+    // serialize every participant's decoder against every other's — held by
+    // every feed/configure/release for that srcId, NEVER across a socket
+    // write (see configureGroupDecoder's keyframe request, deliberately
+    // issued after the lock is released).
+    private val groupDecoderLocks = ConcurrentHashMap<Long, Any>()
+    private fun groupDecoderLock(srcId: Long): Any = groupDecoderLocks.getOrPut(srcId) { Any() }
     private val groupPendingCsd = ConcurrentHashMap<Long, MutableList<ByteArray>>()
     private val groupDecoderReady = ConcurrentHashMap<Long, Boolean>()
     private val groupTileSurfaces = ConcurrentHashMap<Long, Surface>()
     private val groupVideoFrameCountRecv = ConcurrentHashMap<Long, Int>()
+    // FIX 1 (3-device black-tile bug): the LAST csd seen for this srcId, kept
+    // for as long as they remain in the call — unlike groupPendingCsd (which
+    // is only ever populated up to the FIRST successful configure, then
+    // discarded, see the TYPE_FRAME dispatch branch below), this survives so
+    // a decoder can be REBUILT later (see FIX 2/setGroupTileSurface) without
+    // waiting for a fresh TYPE_CONFIG that a steady-state encoder never
+    // resends. Written on every TYPE_CONFIG; cleared only when the peer
+    // actually leaves the call (removeGroupCallParticipant /
+    // handleParticipantsFrame's departure diff) — deliberately NOT cleared by
+    // [releaseGroupDecoder], which also runs on an ordinary camera-off (the
+    // peer is still IN the call then, and their next camera-on doesn't always
+    // re-send csd either).
+    private val groupCsdCache = ConcurrentHashMap<Long, ByteArray>()
+    // FIX 3: srcIds whose decoder is known-broken (its Surface was destroyed
+    // out from under it — see feedGroupDecoder) until a rebuild replaces it.
+    // Checked BEFORE ever touching the MediaCodec again, so one real
+    // exception produces one log line instead of 32 identical ones at 30fps.
+    private val groupDecoderBroken = ConcurrentHashMap.newKeySet<Long>()
+    private val groupDecoderDropLogAtMs = ConcurrentHashMap<Long, Long>()
+
+    // PHASE 8 STEP 2: fault isolation — a peer's video decoder is entirely
+    // separate state from groupCall.participants, so a decoder failure here
+    // can NEVER end the call or touch any other peer; see
+    // markGroupPeerDegraded/markGroupPeerRecovered (called from
+    // configureGroupDecoder/feedGroupDecoder) and retryDegradedGroupPeers
+    // (the 10s/5-attempt automatic recovery). A degraded peer keeps sending
+    // and receiving audio/chat/control normally — only their tile decoder is
+    // affected.
+    private class PeerVideoHealth { @Volatile var attempts: Int = 0; @Volatile var lastRetryAtMs: Long = 0L }
+    private val groupPeerHealth = ConcurrentHashMap<Long, PeerVideoHealth>()
+    private val groupPeerDegraded = ConcurrentHashMap.newKeySet<Long>()
+    private var degradedRetryRunnable: Runnable? = null
+
+    /** Fired on the main thread whenever a group tile's VIDEO health flips —
+     *  true = "video unavailable" (show their name, keep audio), false =
+     *  recovered. Never fired for a peer leaving the call (that's
+     *  onGroupCallParticipants) — this is purely about a still-present
+     *  participant's decoder. */
+    var onGroupTileDegraded: ((nodeId: Long, degraded: Boolean) -> Unit)? = null
+
+    /** True while [nodeId]'s group tile video is degraded (decoder broken,
+     *  automatic recovery in progress or exhausted) — the Activity uses this
+     *  (alongside [onGroupTileDegraded]) to decide whether to show the
+     *  "video unavailable" overlay instead of a frozen/black surface. */
+    fun isGroupPeerDegraded(nodeId: Long): Boolean = nodeId in groupPeerDegraded
+
+    // PHASE 8 STEP 4: video tile decoder budget — runs on EVERY device
+    // (GO and client alike), since MediaCodec instance limits are a
+    // per-device hardware property, not a GO-specific concept like STEP 3's
+    // audio mixing. See probeMaxAvcDecoderInstances/evaluateTileBudget.
+    private var tileBudget = TILE_BUDGET_MIN
+    // OCP PHASE 0.1: cached from initTileBudget's one-time probe — the CAP
+    // line reuses these rather than re-querying MediaCodecList per call.
+    private var probedDecoderCount = DECODER_PROBE_FALLBACK
+    private var probedEncoderCount = DECODER_PROBE_FALLBACK
+    // OCP PHASE 4.3: REMOVED the flat MAX_LIVE_CAMERAS=4 const — derived
+    // from the same probe as tileBudget, see [initTileBudget].
+    private var maxLiveCameras = MIN_LIVE_CAMERAS
+    private val lastSpokeAtMs = ConcurrentHashMap<Long, Long>()
+    private val joinSequence = ConcurrentHashMap<Long, Int>()
+    // D1: was a plain Int — addGroupCallParticipant's getAndIncrement() runs
+    // inside a synchronized(gc.participants) block anyway (see that
+    // function's doc), so this AtomicInteger is redundant with that lock for
+    // THAT one call site, but keeps the counter itself safe against any
+    // future read/reset that doesn't happen to hold the same lock (e.g. the
+    // resetTileBudgetState() reset below, which runs on a different thread's
+    // call path and never touched this field's atomicity before).
+    private val joinSequenceCounter = AtomicInteger(0)
+    @Volatile private var pinnedTilePeer: Long? = null
+    private val tileSwapAtMs = ConcurrentHashMap<Long, Long>()
+    private var lastTileBudgetEvalMs = 0L
+    private val tileBudgetExcluded = ConcurrentHashMap.newKeySet<Long>()
+
+    /** Fired on the main thread whenever a peer's tile budget-exclusion
+     *  status flips — true means "not currently decoded, show their last
+     *  frame frozen with a dimmed overlay (or avatar if none ever
+     *  arrived)"; false means they now have a live decoder again. Distinct
+     *  from [onGroupTileDegraded] — this is a capacity decision, not a
+     *  failure. */
+    var onGroupTileBudgetChanged: ((nodeId: Long, excluded: Boolean) -> Unit)? = null
+
+    fun isGroupPeerBudgetExcluded(nodeId: Long): Boolean = nodeId in tileBudgetExcluded
+
+    /** Called by the Activity when the user taps a tile — a pinned peer is
+     *  always kept in the decode budget regardless of speaking history. Pass
+     *  null to clear (same tap-to-toggle UI convention as onTileTapped). */
+    fun setTileBudgetPin(nodeId: Long?) {
+        pinnedTilePeer = nodeId
+    }
+
+    // PHASE 8 STEP 6/STEP 2: peers whose OUTBOUND queue to them (see
+    // PeerLink's three priority lanes) has stayed over its high-water mark
+    // for 10s straight — a FORWARDING-side signal, deliberately kept separate
+    // from [groupPeerDegraded] (which is about decoding THEIR incoming
+    // video): retrying a decoder would do nothing for an outbound queue
+    // that's backed up. Shown in the roster as unreachable; clears
+    // automatically once their queue drains.
+    private val meshPeerUnreachable = ConcurrentHashMap.newKeySet<Long>()
+
+    /** Fired on the main thread whenever a peer's mesh reachability (NOT
+     *  their call-participant status — they remain a full roster/call member
+     *  throughout) flips due to sustained outbound queue backpressure. */
+    var onPeerReachabilityChanged: ((nodeId: Long, unreachable: Boolean) -> Unit)? = null
+
+    fun isPeerUnreachable(nodeId: Long): Boolean = nodeId in meshPeerUnreachable
+
+    private fun handleSustainedBackpressure(link: PeerLink) {
+        val srcId = link.nodeId
+        if (srcId == MeshFrame.PENDING_ID) return
+        if (meshPeerUnreachable.add(srcId)) {
+            Log.d("OFFTRACE", "SCALE: peer ${MeshFrame.hex(srcId)} DEGRADED reason=queue_backpressure attempt=1")
+            mainHandler.post { onPeerReachabilityChanged?.invoke(srcId, true) }
+        }
+    }
+
+    private fun handleBackpressureCleared(link: PeerLink) {
+        val srcId = link.nodeId
+        if (meshPeerUnreachable.remove(srcId)) {
+            Log.d("OFFTRACE", "SCALE: peer ${MeshFrame.hex(srcId)} recovered")
+            mainHandler.post { onPeerReachabilityChanged?.invoke(srcId, false) }
+        }
+    }
     // Set only while awaiting the GO's accept (TYPE_CAM broadcast) or deny
     // (TYPE_CAM_DENIED) for THIS device's own most recent camera-on request.
     @Volatile private var groupCallCameraPending = false
@@ -886,6 +1893,19 @@ class OfflineMediaTransport(
     // capture thread and the H.264 encoder drain thread were never joined at all.
     private var audioSendThread: Thread? = null
     private var encoderDrainThread: Thread? = null
+
+    // PART B / B2: set true by the worker thread itself immediately before a
+    // blocking NATIVE call (AudioRecord.read / MediaCodec.dequeue*) that
+    // Thread.interrupt() cannot unblock, false immediately after that call
+    // returns (in a finally, so an exception clears it too). A release
+    // function must never call stop()/release() on the underlying codec/
+    // AudioRecord while its owning thread's flag is still true — see
+    // [waitForCodecFree] and releaseEncoder/releaseLowEncoder/releaseAudio.
+    @Volatile private var audioSendInsideRecord = false
+    @Volatile private var encoderDrainInsideCodec = false
+    @Volatile private var lowEncoderDrainInsideCodec = false
+    @Volatile private var opusEncodeInsideCodec = false
+    @Volatile private var opusDecodeInsideCodec = false
 
     private var opusOutputSampleRate = 48000
     private var opusOutputChannelCount = OPUS_CHANNEL_COUNT
@@ -1049,13 +2069,50 @@ class OfflineMediaTransport(
      *  TYPE_FRAME branch, which now keeps it buffered on a failed configure instead
      *  of discarding it) before this Surface showed up, retry the configure right
      *  here now that it exists, rather than waiting on a TYPE_FRAME that will just
-     *  see decoderReady already stuck false with nothing left to configure from. */
+     *  see decoderReady already stuck false with nothing left to configure from.
+     *
+     *  FIX 2 (3-device black-tile bug): a SECOND case — [nodeId] already has a
+     *  live entry in [groupDecoders], meaning this is a Surface arriving for a
+     *  peer that was ALREADY being decoded (their old Surface was just
+     *  destroyed, e.g. by a grid reshape — see rebuildGroupCallGrid's FIX 4,
+     *  or by the Activity/window being recreated). A MediaCodec's output
+     *  Surface is fixed for that codec's lifetime — it can never be
+     *  redirected to a new Surface — so the old decoder is released and a
+     *  fresh one configured against the new Surface, using [groupCsdCache]
+     *  (FIX 1) since groupPendingCsd was already consumed at first configure
+     *  and a steady-state encoder never resends csd on its own. */
     fun setGroupTileSurface(nodeId: Long, surface: Surface?) {
         if (surface == null) {
             groupTileSurfaces.remove(nodeId)
             return
         }
+        // D2: a late surfaceCreated can arrive AFTER [nodeId] has already
+        // left the call (Surface creation is asynchronous view-layout work,
+        // racing an ordinary departure) — without this guard, that stale
+        // callback would go on to configure a fresh decoder for someone no
+        // longer in [groupCall.participants], leaking a MediaCodec that
+        // nothing will ever release (departure's own cleanup already ran and
+        // won't run again for them).
+        val gc = groupCall
+        if (gc == null || nodeId !in gc.participants) {
+            groupTileSurfaces.remove(nodeId)
+            return
+        }
         groupTileSurfaces[nodeId] = surface
+        if (groupDecoders.containsKey(nodeId)) {
+            val csd = groupCsdCache[nodeId]
+            if (csd == null) {
+                logW("OFFTRACE: MEDIA: surface changed for ${MeshFrame.hex(nodeId)} but no cached csd — cannot rebuild decoder")
+                return
+            }
+            releaseGroupDecoder(nodeId)
+            configureGroupDecoder(nodeId, csd, requestKeyframeAfter = true)
+            if (groupDecoders.containsKey(nodeId)) {
+                groupDecoderReady[nodeId] = true
+                Log.d("OFFTRACE", "MEDIA: decoder rebuilt for ${MeshFrame.hex(nodeId)} on new surface — keyframe requested")
+            }
+            return
+        }
         if (groupDecoderReady[nodeId] != true) {
             val csd = groupPendingCsd[nodeId]
             if (!csd.isNullOrEmpty()) {
@@ -1195,6 +2252,83 @@ class OfflineMediaTransport(
         }
     }
 
+    private var nextPhraseSeq = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** OFFLINE UI STEP 4: mesh-wide, always available (no active call needed)
+     *  — same live+carry dual delivery as [sendGroupChat] (see
+     *  enqueueChatSend's identical pattern), deliberately NOT reusing
+     *  TYPE_CHAT (see TYPE_PHRASE's wire doc: separate types, never merged).
+     *  Returns the msgId used for carrier tracking (heard-by/hop-count
+     *  lookups via MeshCarrier.deliveredCountFor/hopCountFor), or null if
+     *  nothing was sent. */
+    /** [targetNodeId] null (default) broadcasts mesh-wide — every current
+     *  member gets it live, and it's queued for carry to anyone who
+     *  reconnects later (see enqueueChatSend's identical pattern). A real
+     *  nodeId sends a genuine 1:1 unicast instead (dst=targetNodeId,
+     *  eligible for store-and-forward carry to exactly that recipient, never
+     *  broadcast to anyone else) — used by the long-press "send to that peer
+     *  only" gesture. */
+    fun sendPhrase(phrase: PhraseCode, targetNodeId: Long? = null): String? {
+        if (!running.get() || !alive.get()) {
+            logW("MEDIA: phrase send dropped — not connected")
+            return null
+        }
+        val handler = chatHandler ?: return null
+        val seq = nextPhraseSeq.getAndIncrement()
+        val payload = PhraseCode.encode(phrase.code, seq)
+        val msgId = MeshCarrier.newMsgId()
+        val dst = targetNodeId ?: MeshFrame.BROADCAST_ID
+        handler.post {
+            writeFrame(dst, TYPE_PHRASE, payload)
+            Log.d("OFFTRACE", "PHRASE: send code=${phrase.code} seq=$seq")
+            if (dst == MeshFrame.BROADCAST_ID) {
+                val alreadyPresent = routingTable.roster().map { it.nodeId }.toSet()
+                carrier.put(
+                    msgId, localNodeId, MeshFrame.BROADCAST_ID, TYPE_PHRASE, payload,
+                    expiryMins = 24 * 60,
+                    alreadyDeliveredTo = alreadyPresent
+                )
+            } else {
+                val alreadyDelivered = if (routingTable.get(dst) != null) setOf(dst) else emptySet()
+                carrier.put(
+                    msgId, localNodeId, dst, TYPE_PHRASE, payload,
+                    expiryMins = 24 * 60,
+                    alreadyDeliveredTo = alreadyDelivered
+                )
+            }
+        }
+        return msgId
+    }
+
+    /** OFFLINE UI STEP 4: [code] outside [PhraseCode]'s table (including the
+     *  reserved 7, or a genuinely malformed/future value) still fires
+     *  [onPhraseReceived] with a null PhraseCode — the UI renders "unknown
+     *  message" (never drops the notification) — and, critically, this
+     *  function never returns early or throws for an unrecognized code, so
+     *  routeFrame's forwarding (which already ran before dispatchLocal ever
+     *  reaches here — see routeFrame's broadcast branch) is completely
+     *  unaffected: an unknown phrase is relayed exactly like a known one. */
+    private fun handlePhraseFrame(header: MeshFrame.Header, payload: ByteArray, carrierInfo: Pair<Long, Int>?) {
+        val (code, seq) = PhraseCode.decode(payload) ?: run {
+            logW("MEDIA: malformed PHRASE len=${payload.size} — ignoring")
+            return
+        }
+        val (carrierId, hopCount) = carrierInfo ?: (null to null)
+        val ageS = 0L // live or just-delivered — see class doc, no separate receive-side age concept for phrases
+        Log.d(
+            "OFFTRACE",
+            "PHRASE: recv from=${MeshFrame.hex(header.srcId)} code=$code hops=${hopCount ?: 0} age=${ageS}s"
+        )
+        mainHandler.post { onPhraseReceived?.invoke(header.srcId, code, seq, carrierId, hopCount) }
+    }
+
+    /** [carrierId]/[hopCount] non-null only when this arrived via
+     *  store-and-forward (see dispatchCarriedInner) — null for a live
+     *  broadcast, where "carrier" isn't a meaningful concept (the sender IS
+     *  the carrier). [code] outside PhraseCode's table renders "unknown
+     *  message" — see handlePhraseFrame's doc. */
+    var onPhraseReceived: ((fromNodeId: Long, code: Int, seq: Long, carrierId: Long?, hopCount: Int?) -> Unit)? = null
+
     /** PHASE 3: initiator API — places a 1:1 call to a specific roster member (found
      *  via a TYPE_ROSTER broadcast, see [onRosterUpdated]). Transparent whether that
      *  member is directly connected or must be relayed through the GO; addressing
@@ -1260,7 +2394,44 @@ class OfflineMediaTransport(
      *  reasoning as [writeFrame]'s client branch, just made explicit here since these
      *  (unlike most frames) are never meant for BROADCAST or a third member. Null on
      *  the GO itself (never needed there) or before the uplink resolves. */
-    private fun uplinkNodeId(): Long? = if (isGroupOwner) null else routingTable.all().firstOrNull()?.nodeId
+    // PHASE 8 TRACK C3: was routingTable.all().firstOrNull()?.nodeId — correct
+    // ONLY while routingTable is guaranteed to hold at most one entry (the
+    // pre-tree flat topology). The instant a relay node also gains children,
+    // that map holds both the parent AND every child with no ordering
+    // guarantee, making firstOrNull() silently wrong. parentNodeId is
+    // maintained explicitly (see handleHelloFrame) specifically so this stays
+    // correct at any tree depth; on a plain client (today's only shape) it is
+    // set to exactly the same single link firstOrNull() used to find.
+    private fun uplinkNodeId(): Long? = if (isGroupOwner) null else parentNodeId
+
+    /** True once this node relays for anyone besides its own uplink — i.e. it
+     *  has at least one direct neighbor in routingTable that ISN'T
+     *  parentNodeId. On the GO, parentNodeId is always null, so this is just
+     *  "does the GO have any members at all" — identical in spirit to
+     *  routingTable.all().isNotEmpty(), matching today's always-true-once-
+     *  joined GO behavior exactly. On every non-relay node (the entire
+     *  <=3-device path, and any node the tree never assigned children to),
+     *  this is false, making every "isGroupOwner || hasChildren()" gate
+     *  below reduce to exactly "isGroupOwner" — today's exact condition. */
+    private fun hasChildren(): Boolean = routingTable.all().any { it.nodeId != parentNodeId }
+
+    /** OFFLINE UI STEP 2 (cut vertex): true when removing [nodeId] would
+     *  disconnect at least two OTHER members from each other — the existing
+     *  relay-tree data (see TRACK C3's treeParentOf, mirrored to every node
+     *  and populated by maybeRebuildTree/computeTree on EVERY join regardless
+     *  of mesh size — even a flat 2/3-device mesh gets a full
+     *  everyone-maps-to-the-GO entry) is exactly a topology graph already, so
+     *  this reads it rather than computing a fresh articulation-point search.
+     *  A relay node (assigned as someone's parent in treeParentOf) is always
+     *  a cut vertex for its own subtree. The GO is a cut vertex once there
+     *  are at least two OTHER members (treeParentOf.size counts exactly
+     *  that, mesh-wide, on every node) — any fewer and there's nothing left
+     *  for its removal to disconnect FROM each other. */
+    fun isArticulationPoint(nodeId: Long): Boolean {
+        val isGo = if (nodeId == localNodeId) isGroupOwner else (goNodeId == nodeId)
+        if (isGo) return treeParentOf.size >= 2
+        return treeParentOf.values.contains(nodeId)
+    }
 
     /** Atomically starts (or, if [callId] matches, idempotently rejoins) group-call
      *  state unless a DIFFERENT call — 1:1 or group — is already active. */
@@ -1297,7 +2468,6 @@ class OfflineMediaTransport(
             // for its own join (that was the other half of the self-destruct defect:
             // a client's own local join was triggering a bogus authoritative-looking
             // broadcast). See the else branch below.
-            startGroupCallMixer()
             addGroupCallParticipant(localNodeId, rejectDst = null)
         } else {
             // Not authoritative — just this device's own local view that it's "in"
@@ -1306,6 +2476,11 @@ class OfflineMediaTransport(
             // real source of truth and will overwrite this via handleParticipantsFrame.
             groupCall?.participants?.add(localNodeId)
         }
+        // PHASE 8 TRACK C4: unconditional — startGroupCallMixer() is its own
+        // isGroupOwner-or-hasChildren guard, so this single call site covers
+        // the GO, a relay node that already has children when the call
+        // starts, and (safely, as a no-op) every plain leaf.
+        startGroupCallMixer()
         startGroupCallAudio()
         // FIX D: TYPE_CALL_INVITE must go out BEFORE the cam-on request. For a
         // non-GO initiator, setGroupCallCameraOn(true) sends a unicast TYPE_CAM to
@@ -1366,12 +2541,12 @@ class OfflineMediaTransport(
         }
         log("MEDIA: accepted group call callId=${MeshFrame.hex(callId)}")
         if (isGroupOwner) {
-            startGroupCallMixer()
             addGroupCallParticipant(localNodeId, rejectDst = null)
         } else {
             val go = uplinkNodeId()
             if (go != null) writeFrame(go, TYPE_CALL_ACCEPT, encodeCallId(callId))
         }
+        startGroupCallMixer() // PHASE 8 TRACK C4: unconditional, see startGroupCall's identical comment
         startGroupCallAudio()
         // PHASE 3C: camera-ON by default for a VIDEO call, same as the founder path
         // in startGroupCall — arbitrated by the GO against MAX_LIVE_CAMERAS; a
@@ -1454,17 +2629,73 @@ class OfflineMediaTransport(
      *  MAX_GROUP_PARTICIPANTS — point 10), rebroadcasting TYPE_PARTICIPANTS on
      *  success. Past the cap, [rejectDst] (if given — null for this device's own
      *  join, which can never be over-cap) gets a TYPE_BUSY(reason=full) instead. */
+    // D1: outcome of the atomic admit decision below — ADMITTED/ALREADY_IN
+    // both return true from addGroupCallParticipant, but only ADMITTED needs
+    // evaluateGroupCallAfterChange(); FULL needs the reject path. Kept as a
+    // tiny local enum rather than reusing Boolean so the three cases can't
+    // be confused with each other at the call site.
+    private enum class ParticipantAdmitResult { ADMITTED, ALREADY_IN, FULL }
+
     private fun addGroupCallParticipant(nodeId: Long, rejectDst: Long?): Boolean {
         val gc = groupCall ?: return false
-        if (nodeId in gc.participants) return true
-        if (gc.participants.size >= MAX_GROUP_PARTICIPANTS) {
-            logW("MESH: group call full ($MAX_GROUP_PARTICIPANTS) — rejecting join from ${MeshFrame.hex(nodeId)}")
-            if (rejectDst != null) writeFrame(rejectDst, TYPE_BUSY, byteArrayOf(BUSY_REASON_CALL_FULL))
-            return false
+        // D1: contains-check, size-check, add, AND the join-ordinal
+        // assignment must all happen as ONE atomic operation — this runs on
+        // a per-peer read thread, and two peers joining at the SAME instant
+        // (size == MAX_GROUP_PARTICIPANTS - 1) could otherwise both pass the
+        // size check before either call's add() runs, overrunning the cap by
+        // however many joins raced. synchronized(gc.participants) uses the
+        // exact intrinsic lock Collections.synchronizedSet already
+        // serializes its own individual add()/size()/contains() calls on
+        // (see GroupCallState.participants) — this closes the gap BETWEEN
+        // those calls rather than adding a second, independent lock that
+        // could itself be acquired out of order against the set's own.
+        // joinSequenceCounter is an AtomicInteger for the same reason: a
+        // plain `Int++` read-modify-write race here could hand two
+        // concurrent joiners the identical ordinal.
+        val outcome = synchronized(gc.participants) {
+            when {
+                nodeId in gc.participants -> ParticipantAdmitResult.ALREADY_IN
+                gc.participants.size >= MAX_GROUP_PARTICIPANTS -> ParticipantAdmitResult.FULL
+                else -> {
+                    gc.participants.add(nodeId)
+                    // PHASE 8 STEP 4: stable join-order ordinal for the tile budget's
+                    // last tie-break — putIfAbsent so a re-join (e.g. after a transient
+                    // reconnect) doesn't reset someone to the back of the queue.
+                    joinSequence.putIfAbsent(nodeId, joinSequenceCounter.getAndIncrement())
+                    ParticipantAdmitResult.ADMITTED
+                }
+            }
         }
-        gc.participants.add(nodeId)
-        evaluateGroupCallAfterChange()
-        return true
+        return when (outcome) {
+            ParticipantAdmitResult.ALREADY_IN -> true
+            ParticipantAdmitResult.FULL -> {
+                // PHASE 8 STEP 7: current/max travel WITH the reason byte now — see
+                // handleBusyFrame's decode — so the rejected device can show
+                // "Group is full - N of M connected" instead of a bare notice.
+                // Platform-honesty note: Android's WifiP2pManager API exposes no
+                // official "max GO clients" query, so MAX_GROUP_PARTICIPANTS stays
+                // a configured ceiling (the same one this app enforces for mesh-
+                // level admission — see handleNewConnection) rather than something
+                // actually probed from the OS/driver.
+                val current = gc.participants.size
+                logW("MESH: group call full ($current/$MAX_GROUP_PARTICIPANTS) — rejecting join from ${MeshFrame.hex(nodeId)}")
+                Log.d("OFFTRACE", "ADMIT: rejected ${MeshFrame.hex(nodeId)} reason=full $current/$MAX_GROUP_PARTICIPANTS")
+                // B1-style discipline: never hold the participants lock across
+                // a socket write — this runs after the synchronized block above
+                // has already exited.
+                if (rejectDst != null) {
+                    writeFrame(
+                        rejectDst, TYPE_BUSY,
+                        byteArrayOf(BUSY_REASON_CALL_FULL, current.coerceIn(0, 255).toByte(), MAX_GROUP_PARTICIPANTS.toByte())
+                    )
+                }
+                false
+            }
+            ParticipantAdmitResult.ADMITTED -> {
+                evaluateGroupCallAfterChange()
+                true
+            }
+        }
     }
 
     /** GO-only: removes a participant; ends the call for everyone once fewer than 2
@@ -1479,6 +2710,10 @@ class OfflineMediaTransport(
         gc.camStates.remove(nodeId)
         releaseGroupDecoder(nodeId)
         releaseGroupAudioDecoder(nodeId)
+        // FIX 1: genuinely gone — the persistent csd cache is only worth
+        // keeping while they might still come back with the same encoder
+        // state; see the field's own doc.
+        groupCsdCache.remove(nodeId)
         if (gc.activeSpeakerId == nodeId) {
             // Route through applySpeakerChange (not a direct field mutation) so the
             // GO's OWN decoder/camera state and onGroupCallSpeaker UI callback reset
@@ -1501,6 +2736,11 @@ class OfflineMediaTransport(
         val gc = groupCall ?: return
         if (gc.participants.size >= 2) gc.established = true
         broadcastParticipants()
+        // PHASE 8 STEP 5: the GO's own encoder adapts to its OWN count the
+        // same way every client adapts to theirs (see handleParticipantsFrame)
+        // — both read the SAME gc.participants.size, so every device always
+        // agrees on the tier.
+        applyResolutionLadder(gc.participants.size)
         if (gc.established && gc.participants.size < 2) {
             log("MESH: group call ending — fewer than 2 participants remain")
             endGroupCallState("fewer than 2 participants remain")
@@ -1531,7 +2771,7 @@ class OfflineMediaTransport(
      *  slot is free under MAX_LIVE_CAMERAS. */
     private fun camSlotAvailable(nodeId: Long): Boolean {
         val gc = groupCall ?: return false
-        return gc.camStates[nodeId] == true || gc.camStates.count { it.value } < MAX_LIVE_CAMERAS
+        return gc.camStates[nodeId] == true || gc.camStates.count { it.value } < maxLiveCameras
     }
 
     /** GO-only: authoritative application of an accepted camera-state change — sets
@@ -1726,6 +2966,8 @@ class OfflineMediaTransport(
         audioSendersStartedForCallId = null
         groupCallMixer?.stop()
         groupCallMixer = null
+        stopGoMixTicker()
+        resetTileBudgetState()
         // FIX 1: same ordering as endLocalCallState — flip false and join every
         // call-scoped media thread before releasing the resources they touch.
         callActive.set(false)
@@ -1758,13 +3000,58 @@ class OfflineMediaTransport(
         members.forEach { knownNames[it.nodeId] = it.name }
     }
 
+    // ── PHASE 8 TRACK B5: crash guard for every media/mesh thread ──────────────
+
+    /** Applied to EVERY thread this transport creates (read loops, server
+     *  accept, encoder/decoder/camera/audio-send/audio-decode, GO-mix,
+     *  ladder-reconfig — every call site below). Logs the full stack trace
+     *  to OFFTRACE the moment anything on that thread throws uncaught, then
+     *  lets the thread die WITHOUT propagating further — no rethrow, no
+     *  System.exit(). Per-thread UncaughtExceptionHandlers pre-empt
+     *  whatever default handler Android would otherwise use (which
+     *  terminates the whole process even for a background thread), so a bug
+     *  on any ONE media thread can now only ever end that ONE thread. B1-B4's
+     *  per-peer state isolation (groupPeerHealth/groupDecoders/etc, already
+     *  keyed by srcId) is what keeps the CALL itself alive after that; this
+     *  is the last line of defense underneath all of it, for whatever
+     *  exception type isn't already caught by a more specific try/catch. */
+    private fun Thread.guarded(): Thread {
+        setUncaughtExceptionHandler { t, e ->
+            Log.e("OFFTRACE", "CRASH-GUARD: ${t.name} caught ${e.javaClass.simpleName}: ${e.message} - ${Log.getStackTraceString(e)}")
+        }
+        return this
+    }
+
+    /** D4: same crash-guard as [guarded], but for a per-peer MediaReadLoop-
+     *  $idx thread specifically. A bare [guarded] here would just log and
+     *  let the thread die — this peer's frames would simply stop arriving,
+     *  which looks EXACTLY like a genuinely quiet peer, not the broken link
+     *  it actually is; nothing marks them faulted, nothing tells the UI,
+     *  nothing tries to reconnect. Reuses [handlePeerDisconnected] — the
+     *  SAME cleanup+reconnect+UI-message path an ordinary IOException
+     *  already takes inside [runReadLoop]'s own try/catch — so a read loop
+     *  dying from whatever residual exception type isn't already caught
+     *  there (an Error, or anything escaping the try block itself) surfaces
+     *  exactly the same way a normal socket death does, instead of silently.
+     *  Safe to call from the dying thread itself: [handlePeerDisconnected]
+     *  is already called directly from [runReadLoop]'s own catch blocks on
+     *  this exact thread today, and is idempotent (guarded by
+     *  [disconnectedLinks]) if it somehow ran twice for the same link. */
+    private fun Thread.guardedReadLoop(link: PeerLink): Thread {
+        setUncaughtExceptionHandler { t, e ->
+            Log.e("OFFTRACE", "CRASH-GUARD: ${t.name} caught ${e.javaClass.simpleName}: ${e.message} - ${Log.getStackTraceString(e)}")
+            handlePeerDisconnected(link, "connection lost (${e.javaClass.simpleName})")
+        }
+        return this
+    }
+
     fun start() {
         if (!running.compareAndSet(false, true)) return
         // FIX 3: registers this as the process's current transport — see
         // stopOrphanedInstance(), which the caller (OfflineCallActivity) is expected
         // to invoke before ever constructing a new instance.
         activeInstance = this
-        val ht = HandlerThread("MediaChatWrite").also { it.start() }
+        val ht = HandlerThread("MediaChatWrite").also { it.guarded().start() }
         chatThread = ht
         chatHandler = Handler(ht.looper)
         // PHASE 5BC: warm start — the mesh session becoming active is what starts
@@ -1786,7 +3073,22 @@ class OfflineMediaTransport(
         // PHASE 7A: seed verified pubkeys persisted from a prior session — a
         // peer's key survives a restart the same way the ledger/carry queue do.
         routingTable.seedVerifiedPubkeys(meshSigner.loadPersistedPubkeys())
+        // PHASE 8 STEP 2: automatic decoder-recovery ticker — session-scoped,
+        // same start/stop pairing as every other periodic mechanism here.
+        scheduleGroupPeerRetries()
+        // PHASE 8 STEP 4: this device's own decoder-instance ceiling —
+        // probed once per session, not per call (a device's hardware limit
+        // doesn't change mid-session).
+        initTileBudget()
         if (isGroupOwner) startAsServer() else startAsClient()
+        // PHASE 8 TRACK C3: RTT/RSSI reporting — a no-op on the GO (see
+        // sendLinkReport/sendLinkProbe's own isGroupOwner guards); harmless
+        // to always start, session-scoped like every other ticker above.
+        startLinkTickers()
+        // OCP PHASE 5.4: session-scoped, same start/stop pairing as every
+        // other mechanism above — matched by unregisterThermalListener() in
+        // stop().
+        registerThermalListener()
     }
 
     /** Idempotent full teardown — the whole mesh session, not just the current call.
@@ -1794,6 +3096,12 @@ class OfflineMediaTransport(
      *  unblocks every read loop's blocked read) → decode consumer → AudioTrack. */
     fun stop() {
         running.set(false)
+        // PHASE 4 TEARDOWN: Activity-destroy path — see
+        // cancelAllPendingRelayDeferrals's doc. relayScheduler itself is
+        // also shut down here (not just its pending tasks cancelled) since
+        // this whole transport instance is going away.
+        cancelAllPendingRelayDeferrals()
+        relayScheduler.shutdownNow()
         // FIX 3: only clear the singleton pointer if it's still pointing at THIS
         // instance — an older instance's own stop() (e.g. via stopOrphanedInstance())
         // must never null out a newer instance's registration.
@@ -1801,7 +3109,11 @@ class OfflineMediaTransport(
         // FIX 1: flip false, then join every call-scoped media thread, BEFORE
         // releasing any of the resources they touch — see stopCallThreads().
         callActive.set(false)
+        stopGroupPeerRetries()
+        groupPeerDegraded.clear()
+        groupPeerHealth.clear()
         try { audioRecord?.stop() } catch (_: Exception) {}
+        unregisterThermalListener()
         stopCallThreads()
         closeSockets()
         releaseCamera()
@@ -1819,6 +3131,22 @@ class OfflineMediaTransport(
         restoreAudioRouting()
         groupCallMixer?.stop()
         groupCallMixer = null
+        stopGoMixTicker()
+        stopLinkTickers()
+        relayServerSocket?.let { try { it.close() } catch (_: Exception) {} }
+        relayServerSocket = null
+        parentNodeId = null
+        pendingParentLink = null
+        assignedParentId = TREE_ROOT_SENTINEL
+        treeParentOf.clear()
+        treeAssignedAddress.clear()
+        nodeDialAddress.clear()
+        rttToUplinkByNode.clear()
+        bleRssiByNodePair.clear()
+        lastLinkReportAtMs.clear()
+        goNodeId = null
+        rttToOwnUplinkMs = null
+        resetTileBudgetState()
         synchronized(callLock) {
             activeCallPeerId = null
             activeCallPeerName = ""
@@ -1894,6 +3222,19 @@ class OfflineMediaTransport(
         stop()
     }
 
+    /** PHASE 8 TRACK A5: GO-only — explicitly drops a peer the local user just
+     *  Declined (see OfflineCallActivity.maybeShowIncomingInviteDialogs). Not a
+     *  new teardown path: reuses [handlePeerDisconnected]'s exact cleanup
+     *  (routingTable removal, group-call participant removal, roster
+     *  rebroadcast) with retryable=false so the GO side never tries to
+     *  reconnect someone that was just deliberately removed. A no-op if
+     *  [nodeId] isn't currently a connected peer (already gone some other way). */
+    fun declineIncomingPeer(nodeId: Long) {
+        if (!isGroupOwner) return
+        val link = routingTable.get(nodeId) ?: return
+        handlePeerDisconnected(link, "declined by group owner", retryable = false)
+    }
+
     /** Fired once (idempotent — guarded by [disconnectedLinks]) when a link's writer
      *  or reader hits a fatal I/O error. Removes the peer from the roster (GO
      *  rebroadcasts), ends the current call if that peer was the partner, and — for a
@@ -1907,6 +3248,15 @@ class OfflineMediaTransport(
         val hadId = link.nodeId
         val removed = if (hadId != MeshFrame.PENDING_ID) routingTable.remove(hadId) else null
         link.close()
+        // PHASE 4 TEARDOWN: link-teardown path — see
+        // cancelAllPendingRelayDeferrals's doc for why this cancels every
+        // pending deferral, not just ones addressed to this link.
+        cancelAllPendingRelayDeferrals()
+        // PHASE 8 STEP 6: a genuine disconnect (not sustained backpressure)
+        // supersedes any "unreachable" marking — they're actually gone now,
+        // not just slow; stale state here would wrongly survive a reconnect
+        // under the same (persisted) nodeId.
+        meshPeerUnreachable.remove(hadId)
         if (removed != null) {
             log("MESH: peer ${MeshFrame.hex(hadId)} (${link.name}) disconnected, group size ${routingTable.size()}")
             if (activeCallPeerId == hadId) {
@@ -1917,8 +3267,24 @@ class OfflineMediaTransport(
             // dropped participant would linger in the authoritative set forever.
             if (isGroupOwner && groupCall != null) removeGroupCallParticipant(hadId)
             if (isGroupOwner) broadcastRoster()
+            if (isGroupOwner) maybeRebuildTree("leave")
         }
-        if (!isGroupOwner) {
+        // PHASE 8 TRACK C3: only losing THE PARENT means "my uplink to the
+        // mesh is gone" — on a plain client (today's only shape, and every
+        // 2/3-device call forever) hadId is always parentNodeId anyway, since
+        // routingTable holds exactly one entry, so this condition is a no-op
+        // there. It only starts to matter once a relay node also has
+        // children: losing a CHILD must never trigger reconnecting to the GO
+        // or tearing down this device's own session — the child (or the GO's
+        // next tree rebuild) is responsible for that side, not this node.
+        if (!isGroupOwner && hadId == parentNodeId) {
+            // Clear the now-dead id BEFORE reconnecting — attemptClientReconnect's
+            // success path re-resolves via handleHelloFrame, whose
+            // "parentNodeId == null" branch is what lets a plain (non-tree)
+            // reconnect claim the new link; leaving the stale id in place
+            // would silently block that and leave uplinkNodeId()/
+            // writeRawFrame pointing at a closed socket forever.
+            parentNodeId = null
             if (retryable) {
                 attemptClientReconnect(uiMessage)
             } else {
@@ -1967,7 +3333,7 @@ class OfflineMediaTransport(
                 try {
                     val s = Socket(addr, MEDIA_PORT)
                     log("MESH: reconnect succeeded on attempt $attempt")
-                    handleNewConnection(s)
+                    handleNewConnection(s, outbound = true)
                     return@Thread
                 } catch (e: Exception) {
                     logW("MESH: reconnect attempt $attempt failed: ${e.message}")
@@ -1976,15 +3342,18 @@ class OfflineMediaTransport(
             if (running.get() && alive.get()) {
                 handleMeshSessionLost("GO connection lost after $RECONNECT_RETRIES reconnect attempts", uiMessage)
             }
-        }, "MediaReconnect").start()
+        }, "MediaReconnect").guarded().start()
     }
 
     // ── Wire framing ──────────────────────────────────────────────────────────
 
-    /** Builds the v3 envelope and hands it to the right [PeerLink](s). A client has
-     *  exactly one physical link (the GO) — every outgoing frame goes out that one
-     *  link regardless of its final dst; the GO does the real per-member addressing,
-     *  since only it has more than one link. */
+    /** Builds the v3 envelope and hands it to the right [PeerLink](s). PHASE 8
+     *  TRACK C3: routing is now [nextHopFor] uniformly for GO and non-GO
+     *  alike — see that function's doc for why this is behavior-IDENTICAL to
+     *  the old GO-only-branches-differently code on both the GO and a plain
+     *  client (routingTable.get(dstId) is always tried first and is the only
+     *  branch either of those two shapes can ever actually take), and only
+     *  starts choosing a different path once an actual relay node exists. */
     private fun writeFrame(dst: Long, type: Byte, data: ByteArray) {
         writeRawFrame(localNodeId, dst, type, data)
     }
@@ -2006,26 +3375,51 @@ class OfflineMediaTransport(
         // here, in favour of MeshCarrier's envelope-level originId field), so
         // this is never asked to forge a signature for another device's id.
         val signedData = meshSigner.signIfNeeded(dst, type, data)
-        val frame = MeshFrame.encode(srcId, dst, ttl, type, signedData)
-        if (!isGroupOwner) {
-            val uplink = routingTable.all().firstOrNull()
-            if (uplink == null) {
-                logW("MEDIA: writeRawFrame — no uplink to GO yet, dropped type=$type")
-                return
+        // OCP PHASE 3.1/3.2: this device's OWN media origination — capture
+        // the timestamp exactly here, as close to "just produced" as this
+        // pipeline gets (mic-read/encode -> writeFrame with nothing queued
+        // in between on this path — queueing happens downstream, in
+        // PeerLink's own send queues, which is exactly the latency this
+        // timestamp exists to measure). "One encoder, one encode" — [data]
+        // is the SAME already-encoded bytes handed to every recipient
+        // either way; only the wrapper differs, chosen per-link below.
+        val captureMicros: Long? = when (type) {
+            TYPE_FRAME, TYPE_AUDIO -> System.nanoTime() / 1000L
+            else -> null
+        }
+        val tsType = when (type) { TYPE_FRAME -> TYPE_FRAME_TS; TYPE_AUDIO -> TYPE_AUDIO_TS; else -> type }
+        val legacyFrame = MeshFrame.encode(srcId, dst, ttl, type, signedData)
+        val tsFrame = captureMicros?.let {
+            val tsPayload = ByteBuffer.allocate(8 + signedData.size).putLong(it).put(signedData).array()
+            MeshFrame.encode(srcId, dst, ttl, tsType, tsPayload)
+        }
+        fun frameFor(link: PeerLink) = if (tsFrame != null && link.supportsFrameAge) tsFrame else legacyFrame
+        if (dst == MeshFrame.BROADCAST_ID) {
+            // PHASE 8 TRACK C3: flood every direct neighbor — parent AND
+            // children are both plain routingTable entries (see hasChildren()'s
+            // doc), so this needs no up/down distinction at all. On a plain
+            // client (routingTable = {my one uplink}) this sends to exactly
+            // that one link, identical to before this track.
+            //
+            // OCP PHASE 5.1/G6: TYPE_CONFIG_LOW/TYPE_FRAME_LOW are BRAND NEW
+            // types with no legacy fallback (unlike TYPE_FRAME_TS/TYPE_AUDIO_TS,
+            // which degrade to the always-understood legacy pair) — a link
+            // that never advertised CAP_SIMULCAST must receive NEITHER at
+            // all, never merely "a wrapper it doesn't understand." Every
+            // other type (including TYPE_CONFIG/TYPE_FRAME themselves) is
+            // completely unaffected by this gate.
+            routingTable.all().forEach { link ->
+                if ((type == TYPE_CONFIG_LOW || type == TYPE_FRAME_LOW) && !link.supportsSimulcast) return@forEach
+                link.enqueue(frameFor(link))
             }
-            uplink.enqueue(frame)
             return
         }
-        if (dst == MeshFrame.BROADCAST_ID) {
-            routingTable.all().forEach { it.enqueue(frame) }
-        } else {
-            val link = routingTable.get(dst)
-            if (link == null) {
-                logW("MEDIA: writeRawFrame dst=${MeshFrame.hex(dst)} unknown — dropped type=$type")
-                return
-            }
-            link.enqueue(frame)
+        val target = nextHopFor(dst)
+        if (target == null) {
+            logW("MEDIA: writeRawFrame dst=${MeshFrame.hex(dst)} unknown — dropped type=$type")
+            return
         }
+        target.enqueue(frameFor(target))
     }
 
     // ── Connection setup ───────────────────────────────────────────────────────
@@ -2044,16 +3438,7 @@ class OfflineMediaTransport(
             try {
                 val srv = ServerSocket(MEDIA_PORT)
                 serverSocket = srv
-                while (running.get()) {
-                    val client = try {
-                        srv.accept()
-                    } catch (e: IOException) {
-                        if (running.get()) logW("MEDIA: accept failed: ${e.message}")
-                        break
-                    }
-                    if (!running.get()) { client.close(); break }
-                    handleNewConnection(client)
-                }
+                runAcceptLoop(srv)
             } catch (e: BindException) {
                 // FIX 3c: this must never fail silently — it's the exact symptom of
                 // an orphaned transport instance (see stopOrphanedInstance()) still
@@ -2063,7 +3448,25 @@ class OfflineMediaTransport(
             } catch (e: Exception) {
                 if (running.get()) reportError("server socket: ${e.message}")
             }
-        }, "MediaServerAccept").start()
+        }, "MediaServerAccept").guarded().start()
+    }
+
+    /** PHASE 8 TRACK C3: factored out of startAsServer so a relay node's
+     *  lazily-bound child-accept socket (see ensureRelayServerStarted) runs
+     *  the exact same accept loop the GO always has — every accepted
+     *  connection is, by construction, someone's CHILD (an inbound/accepted
+     *  socket), see handleNewConnection's outbound=false. */
+    private fun runAcceptLoop(srv: ServerSocket) {
+        while (running.get()) {
+            val client = try {
+                srv.accept()
+            } catch (e: IOException) {
+                if (running.get()) logW("MEDIA: accept failed: ${e.message}")
+                break
+            }
+            if (!running.get()) { client.close(); break }
+            handleNewConnection(client, outbound = false)
+        }
     }
 
     private fun startAsClient() {
@@ -2074,7 +3477,7 @@ class OfflineMediaTransport(
                 try {
                     log("MEDIA: connecting to $addr:$MEDIA_PORT (attempt ${attempt + 1})")
                     val s = Socket(addr, MEDIA_PORT)
-                    handleNewConnection(s)
+                    handleNewConnection(s, outbound = true)
                     return@Thread
                 } catch (e: ConnectException) {
                     attempt++
@@ -2086,15 +3489,42 @@ class OfflineMediaTransport(
                 }
             }
             if (running.get()) reportError("could not connect to peer")
-        }, "MediaClientConnect").start()
+        }, "MediaClientConnect").guarded().start()
+    }
+
+    /** PART 2.4: the ONE new entry point local-wifi (or any future transport
+     *  that produces raw already-connected sockets instead of a single
+     *  group-owner address) needs — a thin public wrapper over the existing,
+     *  UNCHANGED [handleNewConnection]. This is deliberately the full extent
+     *  of the change: PeerLink, MeshFrame, the read loops and the writer
+     *  threads (see [handleNewConnection]'s own doc) are exactly as they
+     *  were before Part 2. A transport that already has a connected [socket]
+     *  (LocalWifiTransport.invite()'s dial, or its own accept loop) calls
+     *  this instead of duplicating any of [handleNewConnection]'s
+     *  PeerLink/HELLO/read-loop setup. Safe to call from any thread — same
+     *  contract [handleNewConnection] already has (its existing callers are
+     *  MediaServerAccept/MediaClientConnect, neither the main thread). */
+    fun adoptPeerSocket(socket: Socket, outbound: Boolean) {
+        handleNewConnection(socket, outbound)
     }
 
     /** Called once a socket is connected, on whichever thread did the connecting (GO
      *  accept loop, or client connect). Wraps it in a PeerLink (identity unresolved
      *  until its HELLO arrives), starts that link's writer + its own read-loop
      *  thread, and sends our own HELLO directly on it (bypassing the routing table —
-     *  we don't know the peer's node id yet, so there's nothing to look up). */
-    private fun handleNewConnection(s: Socket) {
+     *  we don't know the peer's node id yet, so there's nothing to look up).
+     *  PHASE 8 TRACK C3: [outbound] records which side initiated this socket —
+     *  true for every call site that dialed OUT (startAsClient,
+     *  attemptClientReconnect, reassignParentIfNeeded's make-before-break
+     *  dial), false for startAsServer's/ensureRelayServerStarted's accept()
+     *  loops — see handleHelloFrame for how this decides parentNodeId vs an
+     *  ordinary routingTable child entry once the link resolves.
+     *  [markAsPendingParent] is set ONLY by the make-before-break reassignment
+     *  dial (dialNewParent) — assigned synchronously, before the writer/
+     *  reader threads below ever start, so there is no window where the new
+     *  link's own read-loop thread could process its HELLO reply before
+     *  pendingParentLink is visible to handleHelloFrame's check. */
+    private fun handleNewConnection(s: Socket, outbound: Boolean, markAsPendingParent: Boolean = false) {
         try {
             s.tcpNoDelay = true
             s.keepAlive = true
@@ -2103,12 +3533,23 @@ class OfflineMediaTransport(
             logW("MEDIA: could not set socket options: ${e.message}")
         }
         val link = PeerLink(MeshFrame.PENDING_ID, "", DataOutputStream(s.getOutputStream()), DataInputStream(s.getInputStream()))
+        link.remoteAddress = s.inetAddress
+        link.isOutbound = outbound
+        if (markAsPendingParent) pendingParentLink = link
         link.onDead = { deadLink -> handlePeerDisconnected(deadLink) }
+        // PHASE 8 STEP 6/STEP 2: sustained outbound-queue backpressure is the
+        // practical equivalent of "this peer's socket write keeps failing" —
+        // marks them unreachable (roster-visible) without touching the
+        // proven onDead/reconnect path above, which stays reserved for an
+        // ACTUAL broken socket.
+        link.onSustainedBackpressure = { peerLink -> handleSustainedBackpressure(peerLink) }
+        link.onBackpressureCleared = { peerLink -> handleBackpressureCleared(peerLink) }
         pendingLinks.add(link)
         link.startWriter()
         val idx = linkCounter.incrementAndGet()
         log("MEDIA: socket connected — starting read loop #$idx")
-        Thread({ runReadLoop(link) }, "MediaReadLoop-$idx").start()
+        // D4: guardedReadLoop, not the generic guarded() — see its doc.
+        Thread({ runReadLoop(link) }, "MediaReadLoop-$idx").guardedReadLoop(link).start()
         link.enqueue(MeshFrame.encode(localNodeId, MeshFrame.BROADCAST_ID, TTL_BROADCAST, TYPE_HELLO, helloPayload()))
     }
 
@@ -2122,12 +3563,17 @@ class OfflineMediaTransport(
             if (it.size > MAX_NAME_BYTES) it.copyOf(MAX_NAME_BYTES) else it
         }
         val pubkey = OfflineIdentity.publicKeyBytes(context)
-        val buf = ByteBuffer.allocate(8 + 1 + pubkey.size + 1 + nameBytes.size)
+        // OCP PHASE 3/G6: one additive capability byte appended after the
+        // pre-existing name field — see MeshSigner.decodeHelloInner's doc
+        // for why an older peer parsing THIS payload safely ignores it.
+        val capabilities = CAP_FRAME_AGE or CAP_SIMULCAST
+        val buf = ByteBuffer.allocate(8 + 1 + pubkey.size + 1 + nameBytes.size + 1)
         buf.putLong(localNodeId)
         buf.put(MeshFrame.VERSION)
         buf.put(pubkey)
         buf.put(nameBytes.size.toByte())
         buf.put(nameBytes)
+        buf.put(capabilities.toByte())
         return meshSigner.signIfNeeded(MeshFrame.BROADCAST_ID, TYPE_HELLO, buf.array())
     }
 
@@ -2159,12 +3605,57 @@ class OfflineMediaTransport(
 
         if (link.nodeId != MeshFrame.PENDING_ID) return // already resolved — stray duplicate
 
+        // PART 2.6: never open two links to the same node id. Wi-Fi Direct's
+        // star topology made this structurally impossible before Part 2 —
+        // a client only ever dials the GO once, the GO only ever accepts —
+        // but local-wifi lets BOTH sides dial each other directly by IP, so
+        // a genuine race (A invites B while B independently invites A) can
+        // resolve the SAME peerId on two separate live sockets. Keep
+        // whichever link resolved FIRST; close this redundant second one via
+        // the exact same cleanup path (handlePeerDisconnected) an ordinary
+        // socket death already uses — hadId is still PENDING_ID here (this
+        // link's own nodeId assignment below hasn't run yet), so that
+        // cleanup path removes nothing from routingTable and skips the
+        // roster/tree side effects, touching only this one redundant link.
+        val existingLink = routingTable.get(peerId)
+        if (existingLink != null && existingLink !== link) {
+            Log.w("OFFTRACE", "MESH: duplicate link for ${MeshFrame.hex(peerId)} — closing the redundant one")
+            handlePeerDisconnected(link, retryable = false)
+            return
+        }
+
         link.nodeId = peerId
         link.name = name
+        // OCP PHASE 3/G6: capability negotiation — this link only ever
+        // receives TYPE_FRAME_TS/TYPE_AUDIO_TS once its OWN HELLO advertised
+        // support; see writeRawFrame/forwardBroadcast/forwardUnicast's
+        // per-link dual-wrap.
+        link.supportsFrameAge = (decoded.capabilities and CAP_FRAME_AGE) != 0
+        link.supportsSimulcast = (decoded.capabilities and CAP_SIMULCAST) != 0
         pendingLinks.remove(link)
         routingTable.put(peerId, link)
         knownNames[peerId] = name
         log("OFFTRACE: MESH: peer nodeId=${MeshFrame.hex(peerId)} name=$name resolved")
+        // PHASE 8 TRACK C3: this link is OUR OWN outbound connection resolving
+        // — either this device's very first uplink (parentNodeId still null:
+        // today's only case, and every 2/3-device call forever) or a
+        // make-before-break reassignment's new parent (pendingParentLink ===
+        // link, only ever set by reassignParentIfNeeded). An accepted
+        // (inbound, child) link never touches parentNodeId.
+        if (link.isOutbound) {
+            if (pendingParentLink === link) {
+                promotePendingParent(link)
+            } else if (parentNodeId == null) {
+                parentNodeId = peerId
+                // This is, by construction, this device's very first-ever
+                // connection (every node always dials the GO directly first —
+                // see startAsClient) — so the peer it just resolved to IS the
+                // GO. Captured once here rather than re-derived later, since
+                // once a tree exists this device's live parentNodeId may no
+                // longer be the GO at all.
+                if (goNodeId == null) goNodeId = peerId
+            }
+        }
         // PHASE 6 TRACK A: store-and-forward — offer every still-undelivered
         // carried message (SOS included, migrated off PHASE 5BC's hardcoded
         // replay — see MeshCarrier's class doc) to this newly resolved peer,
@@ -2180,7 +3671,406 @@ class OfflineMediaTransport(
             // PHASE 3B point 2: late join — a member connecting mid-call gets the full
             // current call state pushed to it immediately, no separate request needed.
             sendGroupCallStateTo(peerId)
+            // PHASE 8 TRACK C3: ground-truth dial address for this peer —
+            // needed only if the tree ever assigns someone else to dial THEM
+            // directly; harmless to always record. See computeTree/
+            // buildTreeAssignPayload for the only readers.
+            link.remoteAddress?.let { nodeDialAddress[peerId] = InetSocketAddress(it, MEDIA_PORT) }
+            maybeRebuildTree("join")
         }
+    }
+
+    /** PHASE 8 TRACK C3: make-before-break's atomic swap — see
+     *  reassignParentIfNeeded's doc for the full sequencing. By the time this
+     *  runs, [newLink] is already fully live (its own HELLO round-trip just
+     *  completed), so flipping parentNodeId here is the ONLY moment any
+     *  outbound traffic starts targeting it; every enqueue() before this line
+     *  went to the OLD link, which is still open until the explicit close()
+     *  below — no gap where neither link is usable. */
+    private fun promotePendingParent(newLink: PeerLink) {
+        val oldId = parentNodeId
+        val old = oldId?.let { routingTable.get(it) }
+        parentNodeId = newLink.nodeId
+        pendingParentLink = null
+        if (old != null && oldId != null && oldId != newLink.nodeId) {
+            // Deliberate, planned retirement — not a failure. Pre-marking it
+            // means the old link's OWN read-loop thread (which will see an
+            // IOException the instant close() below runs) finds
+            // handlePeerDisconnected's disconnectedLinks guard already
+            // tripped and does nothing further — no spurious reconnect
+            // attempt for a connection we are intentionally replacing.
+            disconnectedLinks.add(old)
+            routingTable.remove(oldId)
+            old.close()
+            Log.d("OFFTRACE", "TREE: retired old parent ${MeshFrame.hex(oldId)}, new parent ${MeshFrame.hex(newLink.nodeId)}")
+        }
+        writeFrame(MeshFrame.BROADCAST_ID, TYPE_UPLINK_STATUS, uplinkStatusPayload(newLink.nodeId, mode = 0))
+    }
+
+    // ── PHASE 8 TRACK C3: relay tree — computation, assignment, reassignment ───
+
+    private fun uplinkStatusPayload(actualParentId: Long, mode: Int): ByteArray {
+        val buf = ByteBuffer.allocate(9)
+        buf.putLong(actualParentId)
+        buf.put(mode.toByte())
+        return buf.array()
+    }
+
+    /** GO-consumed only — every other node ignores its own copy (this is a
+     *  BROADCAST type so it floods the same way everything else does, see
+     *  hasChildren()'s doc; only the GO needs to act on it). Deliberately
+     *  coarse: any report at all just re-triggers computeTree on its normal
+     *  debounce rather than trying to finely diff exactly what changed — the
+     *  cooldown in [maybeRebuildTree] is what keeps this cheap. */
+    private fun handleUplinkStatusFrame(header: MeshFrame.Header, payload: ByteArray) {
+        if (!isGroupOwner || payload.size < 9) return
+        Log.d("OFFTRACE", "TREE: uplink status from ${MeshFrame.hex(header.srcId)}")
+        maybeRebuildTree("uplink_status")
+    }
+
+    /** GO-only. Below TREE_MIN_SIZE_FOR_RELAY this returns everyone directly
+     *  under the GO UNCONDITIONALLY — no RSSI/RTT input is ever consulted —
+     *  which is both the "flat topology stays flat for small calls" behavior
+     *  and, combined with parentNodeId only ever changing via a real
+     *  TYPE_TREE_ASSIGN (see reassignParentIfNeeded), the concrete mechanism
+     *  behind the <=3-device-unchanged proof: this function never even runs
+     *  its relay-selection logic for a call that size. */
+    private fun computeTree(memberIds: List<Long>): Map<Long, Long> {
+        val others = memberIds.filter { it != localNodeId }
+        if (others.size < TREE_MIN_SIZE_FOR_RELAY) {
+            return others.associateWith { TREE_ROOT_SENTINEL }
+        }
+        val parentOf = mutableMapOf<Long, Long>()
+        val depthOf = mutableMapOf<Long, Int>()
+        val childCount = mutableMapOf<Long, Int>()
+        // Worst-link-to-uplink first — a node with no LINK_REPORT yet sorts
+        // last (rtt defaults to 0, i.e. "assume fine"), so it's never
+        // preferred as a demotion candidate ahead of one with real evidence
+        // it needs help. Ties broken by nodeId for a fully deterministic
+        // ordering (repeated computeTree calls on identical inputs always
+        // produce the identical tree).
+        val ordered = others.sortedWith(
+            compareByDescending<Long> { rttToUplinkByNode[it] ?: 0L }.thenBy { it }
+        )
+        for (id in ordered) {
+            var bestParent: Long? = null
+            var bestDepth = Int.MAX_VALUE
+            for (candidate in ordered) {
+                if (candidate == id) continue
+                val cParent = parentOf[candidate] ?: continue // not placed yet this pass
+                val cDepth = depthOf[candidate] ?: continue
+                if (cDepth + 1 > TREE_MAX_DEPTH) continue
+                if ((childCount[candidate] ?: 0) >= TREE_FANOUT_CAP) continue
+                if (!linkQualifies(id, candidate)) continue
+                if (cDepth < bestDepth) {
+                    bestDepth = cDepth
+                    bestParent = candidate
+                }
+            }
+            if (bestParent != null) {
+                parentOf[id] = bestParent
+                depthOf[id] = bestDepth + 1
+                childCount[bestParent] = (childCount[bestParent] ?: 0) + 1
+            } else {
+                parentOf[id] = TREE_ROOT_SENTINEL
+                depthOf[id] = 1
+            }
+        }
+        return parentOf
+    }
+
+    /** True only when [candidateParent] is MEASURABLY better positioned than
+     *  the GO itself for [candidateChild] to reach — RSSI (BLE overlap
+     *  between the two, whichever direction was reported) preferred when
+     *  available, RTT-to-uplink as the fallback. A pair with neither signal
+     *  never qualifies — computeTree's default (parent = the GO) is always
+     *  legal and is what a group with uniformly decent links simply never
+     *  moves away from. */
+    private fun linkQualifies(candidateChild: Long, candidateParent: Long): Boolean {
+        val rssiToCandidate = bleRssiByNodePair[candidateChild]?.get(candidateParent)
+            ?: bleRssiByNodePair[candidateParent]?.get(candidateChild)
+        if (rssiToCandidate != null) {
+            val rssiToGo = bleRssiByNodePair[candidateChild]?.get(localNodeId)
+                ?: bleRssiByNodePair[localNodeId]?.get(candidateChild)
+            return rssiToGo == null || rssiToCandidate > rssiToGo + RSSI_MARGIN_DBM
+        }
+        val rttCandidate = rttToUplinkByNode[candidateParent]
+        val rttChild = rttToUplinkByNode[candidateChild]
+        return rttCandidate != null && rttChild != null && rttCandidate < rttChild
+    }
+
+    /** GO-only, debounced by TREE_REBUILD_COOLDOWN_MS. Triggered by a join, a
+     *  leave, or an UPLINK_STATUS report — never by anything time-based, so a
+     *  quiet mesh never recomputes for no reason. */
+    private fun maybeRebuildTree(reason: String) {
+        if (!isGroupOwner) return
+        val now = System.currentTimeMillis()
+        if (now - lastTreeRebuildAtMs < TREE_REBUILD_COOLDOWN_MS) return
+        lastTreeRebuildAtMs = now
+        val memberIds = routingTable.roster().map { it.nodeId }
+        val newTree = computeTree(memberIds)
+        treeParentOf.clear()
+        treeParentOf.putAll(newTree)
+        treeGenId++
+        val maxDepth = newTree.keys.maxOfOrNull { depthOfInTree(it, newTree) } ?: 0
+        Log.d("OFFTRACE", "TREE: rebuilt reason=$reason nodes=${newTree.size} maxDepth=$maxDepth")
+        val myChildren = newTree.filterValues { it == TREE_ROOT_SENTINEL }.keys
+        Log.d("OFFTRACE", "TREE: parent=root children=[${myChildren.joinToString(",") { MeshFrame.hex(it) }}] depth=0")
+        broadcastTreeAssign()
+    }
+
+    private fun depthOfInTree(nodeId: Long, tree: Map<Long, Long>): Int {
+        var cur = tree[nodeId] ?: return 0
+        var depth = 1
+        var hops = 0
+        while (cur != TREE_ROOT_SENTINEL && hops < TREE_MAX_DEPTH + 2) {
+            cur = tree[cur] ?: break
+            depth++
+            hops++
+        }
+        return depth
+    }
+
+    private fun broadcastTreeAssign() {
+        writeFrame(MeshFrame.BROADCAST_ID, TYPE_TREE_ASSIGN, buildTreeAssignPayload())
+        // The GO applies its own authoritative copy directly rather than
+        // waiting to "receive" its own broadcast (which forwardBroadcast
+        // never loops back to the sender anyway).
+        applyTreeAssignment(treeGenId, treeParentOf.toMap())
+    }
+
+    /** [4B genId][1B nodeCount][nodeCount*(8B nodeId,8B parentNodeId,4B ipv4,2B port)] */
+    private fun buildTreeAssignPayload(): ByteArray {
+        val entries = treeParentOf.entries.toList().take(255)
+        val buf = ByteBuffer.allocate(4 + 1 + entries.size * 22)
+        buf.putInt(treeGenId)
+        buf.put(entries.size.toByte())
+        entries.forEach { (nodeId, parent) ->
+            buf.putLong(nodeId)
+            buf.putLong(parent)
+            val addrBytes = nodeDialAddress[nodeId]?.address?.address
+            buf.put(if (addrBytes != null && addrBytes.size == 4) addrBytes else ByteArray(4))
+            buf.putShort((nodeDialAddress[nodeId]?.port ?: MEDIA_PORT).toShort())
+        }
+        return buf.array()
+    }
+
+    /** Every node applies this (GO included, via broadcastTreeAssign's direct
+     *  call) — genId guards against a stale/out-of-order copy arriving after
+     *  a newer one already applied (possible across multi-hop delivery at
+     *  real tree depth; irrelevant, but harmless, at depth 0). */
+    private fun handleTreeAssignFrame(payload: ByteArray) {
+        try {
+            val din = DataInputStream(ByteArrayInputStream(payload))
+            val genId = din.readInt()
+            if (genId <= treeGenId && treeParentOf.isNotEmpty()) return
+            val count = din.readUnsignedByte()
+            val newTree = mutableMapOf<Long, Long>()
+            val addresses = mutableMapOf<Long, InetSocketAddress>()
+            repeat(count) {
+                val nodeId = din.readLong()
+                val parent = din.readLong()
+                val ipBytes = ByteArray(4)
+                din.readFully(ipBytes)
+                val port = din.readUnsignedShort()
+                newTree[nodeId] = parent
+                if (ipBytes.any { it != 0.toByte() }) {
+                    try {
+                        addresses[nodeId] = InetSocketAddress(InetAddress.getByAddress(ipBytes), port)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            treeAssignedAddress.clear()
+            treeAssignedAddress.putAll(addresses)
+            applyTreeAssignment(genId, newTree)
+        } catch (e: Exception) {
+            logW("OFFTRACE: MESH: malformed TREE_ASSIGN: ${e.message}")
+        }
+    }
+
+    private fun applyTreeAssignment(genId: Int, newTree: Map<Long, Long>) {
+        treeGenId = genId
+        if (treeParentOf !== newTree) {
+            treeParentOf.clear()
+            treeParentOf.putAll(newTree)
+        }
+        assignedParentId = newTree[localNodeId] ?: TREE_ROOT_SENTINEL
+        // A newly-acquired child (assigned to ME by this tree) means this
+        // node must be able to accept inbound connections now, even if it
+        // has never been a relay before — see ensureRelayServerStarted's doc
+        // for why this is always safe to call, including on the GO (already
+        // listening) or repeatedly (idempotent).
+        if (newTree.values.any { it == localNodeId }) ensureRelayServerStarted()
+        if (!isGroupOwner) reassignParentIfNeeded()
+    }
+
+    /** Resolves where to dial for [assignedParentId] — falls back to the
+     *  existing, completely unmodified groupOwnerAddress/MEDIA_PORT whenever
+     *  no assignment exists yet or its address wasn't received. This is the
+     *  literal fallback path: nothing new is written for it, only the
+     *  decision of which address to try first is new. */
+    private fun resolveUplinkTarget(): Pair<InetAddress, Int>? {
+        if (assignedParentId != TREE_ROOT_SENTINEL) {
+            treeAssignedAddress[assignedParentId]?.let { return it.address to it.port }
+        }
+        val addr = groupOwnerAddress ?: return null
+        return addr to MEDIA_PORT
+    }
+
+    /** Called whenever this node's assignedParentId might have just changed.
+     *  A no-op whenever the assignment already matches the live parent —
+     *  which is EVERY time for a plain client under TREE_MIN_SIZE_FOR_RELAY
+     *  (assignedParentId is always TREE_ROOT_SENTINEL there, resolving to
+     *  goNodeId, which is exactly what parentNodeId already is) — so this
+     *  function runs its dial logic exactly zero times for the entire life
+     *  of a 2/3-device call. */
+    private fun reassignParentIfNeeded() {
+        if (isGroupOwner) return
+        val target = if (assignedParentId == TREE_ROOT_SENTINEL) goNodeId else assignedParentId
+        if (target == null || target == parentNodeId) return
+        val (addr, port) = resolveUplinkTarget() ?: return
+        dialNewParent(target, addr, port)
+    }
+
+    /** Make-before-break: dials [addr]/[port] and, ONLY once its own HELLO
+     *  round-trip fully resolves (see handleHelloFrame's pendingParentLink
+     *  branch -> promotePendingParent), swaps parentNodeId to it and retires
+     *  the old link — every enqueue() in between still targets the OLD,
+     *  still-fully-live link, so audio/video is never interrupted by a tree
+     *  rebuild. A dial or resolve failure here is not retried in a loop
+     *  (unlike attemptClientReconnect's dedicated retry for an unexpected
+     *  drop) — it just reports fallback status and leaves the CURRENT parent
+     *  untouched; the next debounced rebuild gets another chance. */
+    private fun dialNewParent(targetId: Long, addr: InetAddress, port: Int) {
+        if (pendingParentLink != null) return // a reassignment is already in flight
+        Thread({
+            try {
+                val s = Socket(addr, port)
+                Log.d("OFFTRACE", "TREE: dialing new parent ${MeshFrame.hex(targetId)} at $addr:$port")
+                handleNewConnection(s, outbound = true, markAsPendingParent = true)
+                val dialed = pendingParentLink
+                mainHandler.postDelayed({
+                    if (dialed != null && pendingParentLink === dialed && dialed.nodeId == MeshFrame.PENDING_ID) {
+                        Log.d("OFFTRACE", "TREE: new parent ${MeshFrame.hex(targetId)} never resolved — abandoning")
+                        pendingParentLink = null
+                        disconnectedLinks.add(dialed)
+                        dialed.close()
+                        parentNodeId?.let { writeFrame(MeshFrame.BROADCAST_ID, TYPE_UPLINK_STATUS, uplinkStatusPayload(it, mode = 1)) }
+                    }
+                }, SOCKET_READ_TIMEOUT_MS * 2L)
+            } catch (e: Exception) {
+                logW("OFFTRACE: MESH: TREE reassignment dial to ${MeshFrame.hex(targetId)} failed: ${e.message}")
+                parentNodeId?.let { writeFrame(MeshFrame.BROADCAST_ID, TYPE_UPLINK_STATUS, uplinkStatusPayload(it, mode = 1)) }
+            }
+        }, "MediaTreeReassign").guarded().start()
+    }
+
+    // ── PHASE 8 TRACK C3: link quality reporting (RTT probe + RSSI report) ─────
+
+    private fun buildLinkReportPayload(): ByteArray {
+        val rtt = rttToOwnUplinkMs ?: -1L
+        val neighbors = ledger.knownNodeIds()
+            .mapNotNull { id ->
+                ledger.blePresenceFor(id)?.let { p ->
+                    if (System.currentTimeMillis() - p.seenAtMs < RSSI_STALE_MS) id to p.rssiDbm else null
+                }
+            }.take(255)
+        val buf = ByteBuffer.allocate(8 + 1 + neighbors.size * 9)
+        buf.putLong(rtt)
+        buf.put(neighbors.size.toByte())
+        neighbors.forEach { (id, rssi) -> buf.putLong(id); buf.put(rssi.coerceIn(-128, 127).toByte()) }
+        return buf.array()
+    }
+
+    private fun sendLinkReport() {
+        if (isGroupOwner) return // nothing to report — the GO has no uplink
+        writeFrame(MeshFrame.BROADCAST_ID, TYPE_LINK_REPORT, buildLinkReportPayload())
+    }
+
+    private fun handleLinkReportFrame(header: MeshFrame.Header, payload: ByteArray) {
+        if (!isGroupOwner) return
+        try {
+            val din = DataInputStream(ByteArrayInputStream(payload))
+            val rtt = din.readLong()
+            if (rtt >= 0) rttToUplinkByNode[header.srcId] = rtt
+            val count = din.readUnsignedByte()
+            val map = bleRssiByNodePair.getOrPut(header.srcId) { ConcurrentHashMap() }
+            repeat(count) {
+                val id = din.readLong()
+                val rssi = din.readByte().toInt()
+                map[id] = rssi
+            }
+            lastLinkReportAtMs[header.srcId] = System.currentTimeMillis()
+        } catch (e: Exception) {
+            logW("OFFTRACE: MESH: malformed LINK_REPORT from ${MeshFrame.hex(header.srcId)}: ${e.message}")
+        }
+    }
+
+    private fun sendLinkProbe() {
+        if (isGroupOwner) return
+        val dst = uplinkNodeId() ?: return
+        pendingProbeToken = System.nanoTime()
+        pendingProbeSentAtMs = System.currentTimeMillis()
+        val buf = ByteBuffer.allocate(8)
+        buf.putLong(pendingProbeToken)
+        writeFrame(dst, TYPE_LINK_PROBE, buf.array())
+    }
+
+    /** Replies directly to whoever asked — nextHopFor(header.srcId) resolves
+     *  straight to them since a PROBE's sender is always a direct neighbor
+     *  (dst=current uplink, one hop only, by construction — see TYPE_LINK_PROBE's
+     *  wire doc). Works correctly on a relay node replying to a CHILD's probe
+     *  too, not just the GO — writeFrame's nextHopFor-based routing tries the
+     *  direct-neighbor lookup before ever falling back to "send up." */
+    private fun handleLinkProbeFrame(header: MeshFrame.Header, payload: ByteArray) {
+        if (payload.size < 8) return
+        writeFrame(header.srcId, TYPE_LINK_PROBE_ACK, payload)
+    }
+
+    private fun handleLinkProbeAckFrame(header: MeshFrame.Header, payload: ByteArray) {
+        if (payload.size < 8) return
+        val token = ByteBuffer.wrap(payload).long
+        if (token != pendingProbeToken) return // stale/duplicate ack — ignore
+        rttToOwnUplinkMs = (System.currentTimeMillis() - pendingProbeSentAtMs).coerceAtLeast(0L)
+    }
+
+    private fun startLinkTickers() {
+        if (linkTickerRunnable != null) return
+        val r = object : Runnable {
+            override fun run() {
+                sendLinkReport()
+                sendLinkProbe()
+                mainHandler.postDelayed(this, LINK_REPORT_INTERVAL_MS)
+            }
+        }
+        linkTickerRunnable = r
+        mainHandler.postDelayed(r, LINK_REPORT_INTERVAL_MS)
+    }
+
+    private fun stopLinkTickers() {
+        linkTickerRunnable?.let { mainHandler.removeCallbacks(it) }
+        linkTickerRunnable = null
+    }
+
+    /** Any node — not just the GO — can accept CHILD connections once
+     *  assigned some (see applyTreeAssignment). Idempotent (a second call is
+     *  a no-op) and safe to call on the GO, which is already listening via
+     *  startAsServer — this never binds a second socket there. Reuses
+     *  [runAcceptLoop], the exact same accept-loop body startAsServer already
+     *  runs, just bound lazily instead of unconditionally at session start. */
+    private fun ensureRelayServerStarted() {
+        if (isGroupOwner || relayServerSocket != null) return
+        Thread({
+            try {
+                val srv = ServerSocket(MEDIA_PORT)
+                relayServerSocket = srv
+                log("MEDIA: relay node listening for children on port $MEDIA_PORT")
+                runAcceptLoop(srv)
+            } catch (e: Exception) {
+                logW("OFFTRACE: MESH: relay server bind failed: ${e.message}")
+            }
+        }, "MediaRelayAccept").guarded().start()
     }
 
     // ── PHASE 3: roster ────────────────────────────────────────────────────────
@@ -2202,13 +4092,25 @@ class OfflineMediaTransport(
     // way MeshLedger finds out a peer is gone, on both the GO (broadcastRoster)
     // and a client (handleRosterFrame) — either can observe a membership drop
     // first depending on who's authoritative.
-    private var previousRosterIds: Set<Long> = emptySet()
+    // D1: @Volatile so a read outside the lock below always sees the latest
+    // published value, PLUS the read-modify-write in
+    // applyRosterDiffForLostContact synchronized — broadcastRoster (GO) can
+    // fire from more than one triggering read thread (a join on one peer's
+    // link racing a leave on another's), and a plain `var` read-then-write
+    // here would let two concurrent callers both read the SAME stale
+    // previousRosterIds, each compute "lost" against it, and then clobber
+    // each other's write — either missing a genuine lost-contact event or
+    // firing a spurious one.
+    @Volatile private var previousRosterIds: Set<Long> = emptySet()
+    private val previousRosterIdsLock = Any()
 
     private fun applyRosterDiffForLostContact(members: List<RoutingTable.Member>) {
-        val newIds = members.map { it.nodeId }.toSet()
-        val lost = previousRosterIds - newIds
-        lost.forEach { id -> if (id != localNodeId) ledger.markLostContact(id, localNodeId) }
-        previousRosterIds = newIds
+        synchronized(previousRosterIdsLock) {
+            val newIds = members.map { it.nodeId }.toSet()
+            val lost = previousRosterIds - newIds
+            previousRosterIds = newIds
+            lost
+        }.forEach { id -> if (id != localNodeId) ledger.markLostContact(id, localNodeId) }
     }
 
     /** PHASE 7A: now also carries each member's 32-byte pubkey — without this,
@@ -2344,11 +4246,138 @@ class OfflineMediaTransport(
         }
     }
 
+    // ── PHASE 4: relay suppression — battery-weighted delay + duplicate
+    // suppression, ALLOWLISTed types only (see RELAY_SUPPRESSION_ALLOWLIST's
+    // doc). Called from routeFrame's broadcast/unicast branches INSTEAD OF
+    // forwardBroadcast/forwardUnicast for those types; every other type
+    // (1-19, incl. all media/group-call types) keeps calling forwardBroadcast/
+    // forwardUnicast directly, completely unchanged by this phase.
+
+    /** Same sticky-broadcast read OfflineCallActivity.readBatteryPercent()
+     *  already uses (registerReceiver(null, ...) synchronously returns the
+     *  last sticky ACTION_BATTERY_CHANGED, no persistent receiver
+     *  registered) — safe to call from any thread. Missing battery data
+     *  (level/scale unavailable) assumes 100%/not-charging rather than
+     *  blocking relay on absent data — the three explicit gates (disabled/
+     *  charging-only/minimum-battery) are the only things allowed to say
+     *  NEVER. */
+    private fun currentBatteryPercentAndCharging(): Pair<Int, Boolean> {
+        val status = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = status?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = status?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val pct = if (level >= 0 && scale > 0) level * 100 / scale else 100
+        val plugged = status?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+        return pct to (plugged != 0)
+    }
+
+    /** GO-only (report D5/4.4) — bleRssiByNodePair is populated only on the
+     *  GO (handleLinkReportFrame early-returns if !isGroupOwner), so a
+     *  client always returns false here: it has no data to confirm coverage
+     *  with, and this deliberately never infers/fabricates it from RSSI or
+     *  anything else. An empty local neighbour set ALSO returns false
+     *  (never "trivially covered" from an absence of data) — only a real,
+     *  non-empty local BLE neighbour set that is a genuine subset of
+     *  [srcId]'s reported set counts as covered. */
+    private fun neighborsCoveredBy(srcId: Long): Boolean {
+        if (!isGroupOwner) return false
+        val mine = ledger.knownNodeIds().filter { id ->
+            val p = ledger.blePresenceFor(id)
+            p != null && System.currentTimeMillis() - p.seenAtMs < RSSI_STALE_MS
+        }.toSet()
+        if (mine.isEmpty()) return false
+        val theirs = bleRssiByNodePair[srcId]?.keys ?: return false
+        return mine.all { it in theirs }
+    }
+
+    /** routeFrame's entry point for any RELAY_SUPPRESSION_ALLOWLIST type,
+     *  replacing a direct forwardBroadcast/forwardUnicast call for those
+     *  types only. THREADING: runs on the calling reader thread only up to
+     *  the point where it schedules onto [relayScheduler] (a single
+     *  dedicated background thread, never a reader thread, never
+     *  mainHandler); the actual forward — forwardBroadcast/forwardUnicast,
+     *  via [forwardNowAllowlisted] — always executes on relayScheduler's
+     *  thread, both for the immediate (urgent/covered) and deferred cases,
+     *  so there is exactly one thread ever calling into them from this
+     *  path, never the reader thread racing the scheduler thread. The seen/
+     *  dupCount caches are only ever touched inside [relayCacheLock] here —
+     *  routeFrame's EXISTING dedupe hooks (MeshSosManager/MeshCarrier) use
+     *  their own separate locks/state and are never touched by this
+     *  function. forwardBroadcast/forwardUnicast's own shared state
+     *  (routingTable, PeerLink.enqueue) is already safe for concurrent
+     *  callers — routeFrame already calls them from N concurrent reader
+     *  threads today (one per PeerLink), so relayScheduler's thread is
+     *  simply one more already-supported concurrent caller, not a new kind
+     *  of access. */
+    private fun scheduleAllowlistedForward(header: MeshFrame.Header, payload: ByteArray, fromLink: PeerLink, broadcast: Boolean) {
+        val id = relayFrameId(header.srcId, header.type, payload)
+        val now = System.currentTimeMillis()
+        val alreadySeen = relayDedupeCache.observe(id, now)
+        if (alreadySeen) {
+            Log.d("OFFTRACE", "RELAY: suppressed id=$id dups=${relayDedupeCache.dupCountFor(id)}")
+            return
+        }
+        if (header.ttl <= 0) return
+        if (isUrgentRelayFrame(header.type, payload)) {
+            Log.d("OFFTRACE", "RELAY: urgent bypass type=${header.type}")
+            relayScheduler.execute { forwardNowAllowlisted(header, payload, fromLink, broadcast, id) }
+            return
+        }
+        // GO-only, see neighborsCoveredBy's doc — always false on a client.
+        if (isGroupOwner && neighborsCoveredBy(header.srcId)) {
+            return
+        }
+        val prefs = context.getSharedPreferences("opencall", Context.MODE_PRIVATE)
+        val relayEnabled = prefs.getBoolean("relay_enabled", true)
+        val relayOnlyWhenCharging = prefs.getBoolean("relay_only_charging", false)
+        val relayMinBattery = prefs.getInt("relay_min_battery", 20)
+        val (pct, charging) = currentBatteryPercentAndCharging()
+        val delay = relayDelayMs(relayEnabled, relayOnlyWhenCharging, charging, pct, relayMinBattery)
+        if (delay == null) return // one of the three gates said NEVER
+        Log.d("OFFTRACE", "RELAY: defer id=$id delay=${delay}ms batt=$pct% chg=$charging")
+        val future = relayScheduler.schedule({
+            relayDeferrals.remove(id)
+            if (relayDedupeCache.dupCountFor(id) < RELAY_K_SUPPRESS) {
+                forwardNowAllowlisted(header, payload, fromLink, broadcast, id)
+            }
+        }, delay, TimeUnit.MILLISECONDS)
+        relayDeferrals[id] = future
+    }
+
+    private fun forwardNowAllowlisted(header: MeshFrame.Header, payload: ByteArray, fromLink: PeerLink, broadcast: Boolean, id: Long) {
+        Log.d("OFFTRACE", "RELAY: sent id=$id ttl=${header.ttl}")
+        if (broadcast) forwardBroadcast(header, payload, fromLink) else forwardUnicast(header, payload)
+    }
+
+    /** TEARDOWN: cancels every still-pending deferral — called from both
+     *  handlePeerDisconnected (per-link teardown) and stop() (whole-transport/
+     *  Activity-destroy teardown). Deliberately cancels ALL pending
+     *  deferrals on ANY link loss, not just ones targeting that link — a
+     *  broadcast deferral has no single target link (forwardBroadcast fans
+     *  out to routingTable.allExcept(...) freshly AT FIRE TIME), so "this
+     *  link is gone" can invalidate one even if it wasn't the original
+     *  sender. This is a safe, conservative over-cancellation, not a
+     *  correctness requirement by itself — PeerLink.enqueue() already
+     *  no-ops on a closed link (`if (closed) return`, RoutingTable.kt) and
+     *  forwardUnicast/forwardBroadcast both resolve their targets FRESH at
+     *  execution time (nextHopFor / routingTable.allExcept), never a stale
+     *  reference — so a deferral firing against an already-torn-down link
+     *  was already safe before this function existed. This exists to
+     *  satisfy the letter of the requirement AND to stop doing pointless
+     *  scheduled work once there is nothing left to relay to. */
+    private fun cancelAllPendingRelayDeferrals() {
+        relayDeferrals.values.forEach { it.cancel(false) }
+        relayDeferrals.clear()
+    }
+
     /** PHASE 3 core dispatch: dst==self or BROADCAST is ours to handle (and, on the
      *  GO, BROADCAST also fans out to everyone else); anything else is forwarded —
      *  pure demux, no codec/media work, so the GO never decodes a call it isn't
      *  party to. */
     private fun routeFrame(header: MeshFrame.Header, payload: ByteArray, fromLink: PeerLink) {
+        // OCP PHASE 0.2: piggybacks on read-thread traffic already happening
+        // every frame (same pattern as maybeEvaluateTileBudget) — internally
+        // throttled to 1/sec per peer, see maybeLogPeerLatency.
+        maybeLogPeerLatency(fromLink)
         // PHASE 7A: verification runs FIRST — before dedupe, before
         // cacheForCarry, before dispatchLocal, before any forwarding. See
         // MeshSigner's class doc for the exact bytes covered. Types 1/2/3
@@ -2367,24 +4396,45 @@ class OfflineMediaTransport(
             MeshSigner.VerifyResult.Queued -> return
         }
 
+        // OCP PHASE 3.4: age-based drop — BOTH at this device as a receiver
+        // (about to dispatchLocal below) AND, on the GO/a relay, before this
+        // same frame would otherwise be forwarded (both branches below reuse
+        // [resolved]) — a single check upstream of both satisfies "drop at
+        // the receiver, and also at the GO before forwarding" in one place.
+        // A null result means "over budget, no IDR exception applies" —
+        // return immediately, never dispatched, never forwarded, never
+        // consumes relay uplink. For every type OTHER than
+        // TYPE_FRAME_TS/TYPE_AUDIO_TS, [resolveFrameAge] is a pure
+        // passthrough (see its doc) — routing for every other type below is
+        // byte-for-byte unchanged from before this phase.
+        val resolved = resolveFrameAge(header, innerPayload) ?: run {
+            staleAgedFrameDropCount++
+            if (staleAgedFrameDropCount % DROP_LOG_INTERVAL == 0) {
+                logW("OFFTRACE: MESH: dropped aged frame src=${MeshFrame.hex(header.srcId)} type=${header.type} count=$staleAgedFrameDropCount")
+            }
+            return
+        }
+        val rHeader = resolved.header
+        val rPayload = resolved.payload
+
         // PHASE 5A/5BC dedupe hook — meshSosManager.isSosFindType is the single
         // source of truth for this scope: TYPE_SOS (20) / TYPE_FIND_REQ (21) /
         // TYPE_FIND_RESP (22) / TYPE_POSITION (23). Deliberately excludes
         // TYPE_SOS_ACK (24) — see MeshSosManager.isSosFindType's doc. For every
         // other type (1-19, including every media/group-call type) this whole
         // block is skipped and routing below runs exactly as it always has.
-        if (meshSosManager.isSosFindType(header.type) &&
-            meshSosManager.checkAndRecordDuplicate(header.srcId, header.type, innerPayload)
+        if (meshSosManager.isSosFindType(rHeader.type) &&
+            meshSosManager.checkAndRecordDuplicate(rHeader.srcId, rHeader.type, rPayload)
         ) {
-            val seq = MeshLocation.decode(innerPayload)?.msgSeq
-            log("MESH: dropped duplicate type=${header.type} from=${MeshFrame.hex(header.srcId)} seq=$seq")
+            val seq = MeshLocation.decode(rPayload)?.msgSeq
+            logPerSrcThrottled(rHeader.srcId) { "MESH: dropped duplicate type=${rHeader.type} from=${MeshFrame.hex(rHeader.srcId)} seq=$seq" }
             return
         }
         // PHASE 6 TRACK A: MeshCarrier owns a SEPARATE dedupe cache keyed on
         // msgId, not (srcId,type,seq) — see MeshCarrier's class doc for why this
         // must not share meshSosManager's cache/scope.
-        if (carrier.isCarrierType(header.type) && carrier.checkAndRecordDuplicate(innerPayload)) {
-            log("MESH: dropped duplicate carried msgId from=${MeshFrame.hex(header.srcId)}")
+        if (carrier.isCarrierType(rHeader.type) && carrier.checkAndRecordDuplicate(rPayload)) {
+            logPerSrcThrottled(rHeader.srcId) { "MESH: dropped duplicate carried msgId from=${MeshFrame.hex(rHeader.srcId)}" }
             return
         }
         // PHASE 6 TRACK A: this is a genuinely LIVE (not carrier-delivered) TYPE_SOS
@@ -2394,8 +4444,26 @@ class OfflineMediaTransport(
         // via dispatchCarriedInner, which calls dispatchLocal directly and never
         // routeFrame) doesn't re-queue itself — MeshCarrier.handleStoreFwdFrame
         // already becomes a mule for that case. See MeshSosManager.cacheForCarry.
-        if (header.type == TYPE_SOS) {
-            meshSosManager.cacheForCarry(header.srcId, innerPayload)
+        // PART A / A1: cache [payload] — the UNTOUCHED wire bytes for this
+        // frame, trailer (timestamp+signature) still attached — NOT [rPayload],
+        // which verifyIncoming already stripped down to the inner payload
+        // above. No wire change: that trailer already crossed the wire right
+        // here, on this exact live receipt; this only changes what gets
+        // cached for later replay. See MeshSigner.verifyCarried, which needs
+        // that trailer to authenticate a carried SOS before it can alarm.
+        if (rHeader.type == TYPE_SOS) {
+            meshSosManager.cacheForCarry(rHeader.srcId, payload)
+        }
+        // PHASE 8 TRACK C2: one-hop only (dst=this device's immediate
+        // uplink, see maybeSendVideoSubscription) — handled directly against
+        // [fromLink] rather than threaded through dispatchLocal (which is
+        // deliberately transport-agnostic and has ~15 call sites, including
+        // carrier-replay, that never carry a live PeerLink). Never forwarded
+        // further; a subscription only ever describes what its IMMEDIATE
+        // sender wants from THIS device.
+        if (rHeader.type == TYPE_SUBSCRIBE) {
+            handleSubscribeFrame(fromLink, rPayload)
+            return
         }
         // PHASE 6 TRACK B1: someone is trying to reach us — beacon mode (if
         // active on THIS device) keeps its radio in the low-latency window a
@@ -2403,49 +4471,324 @@ class OfflineMediaTransport(
         // mode was never entered.
         sosBeaconMode.onInboundFrame()
         when {
-            header.dstId == localNodeId -> {
-                logIfRelayed(header, fromLink)
-                dispatchLocal(header, innerPayload)
+            rHeader.dstId == localNodeId -> {
+                logIfRelayed(rHeader, fromLink)
+                dispatchLocal(rHeader, rPayload)
             }
-            header.dstId == MeshFrame.BROADCAST_ID -> {
-                logIfRelayed(header, fromLink)
-                dispatchLocal(header, innerPayload)
-                if (isGroupOwner) forwardBroadcast(header, payload, fromLink)
+            rHeader.dstId == MeshFrame.BROADCAST_ID -> {
+                logIfRelayed(rHeader, fromLink)
+                dispatchLocal(rHeader, rPayload)
+                // PHASE 8 STEP 3: TYPE_AUDIO stops being relayed raw once
+                // GO-mixing has taken over for this call — tickGoMix's own
+                // unicast distribution replaces it entirely. Every other
+                // type, and TYPE_AUDIO itself below the threshold, forwards
+                // exactly as before this phase.
+                // PHASE 8 TRACK C3: was isGroupOwner alone — a relay node
+                // (hasChildren()) now also floods a broadcast onward to its
+                // own neighbors (see forwardBroadcast's doc: byte-identical
+                // to today's GO-only behavior when hasChildren() is false,
+                // which is every node for the entire life of any call that
+                // never crosses TREE_MIN_SIZE_FOR_RELAY). PHASE 8 TRACK C4:
+                // the isGoMixReplacingBroadcastAudio check used to gate this
+                // WHOLE call; it now lives inside forwardBroadcast itself,
+                // applied PER RECIPIENT — see that function's doc for why
+                // that's what lets raw audio keep reaching the GO at any
+                // tree depth while still cutting the redundant sideways/
+                // downward relay a mixing node's own tick already replaces.
+                if (isGroupOwner || hasChildren()) {
+                    // PHASE 4: allowlisted types (report 4.0's explicit set —
+                    // never types 1-19, which carry audio/video and have no
+                    // dedup today) route through the battery-weighted
+                    // delay/suppression path instead of forwarding
+                    // immediately; every other type is completely untouched.
+                    if (isRelaySuppressionAllowlisted(rHeader.type)) {
+                        scheduleAllowlistedForward(rHeader, rPayload, fromLink, broadcast = true)
+                    } else {
+                        forwardBroadcast(rHeader, rPayload, fromLink, resolved.captureMicros, resolved.isLowLayer)
+                    }
+                }
             }
             else -> {
-                if (isGroupOwner) {
-                    forwardUnicast(header, payload)
+                // PHASE 8 TRACK C3: was isGroupOwner alone — see forwardBroadcast's
+                // gate above for the identical reasoning; hasChildren() is
+                // false for every non-relay node, so this reduces to exactly
+                // today's condition there.
+                if (isGroupOwner || hasChildren()) {
+                    // PHASE 4: same allowlist gate as the broadcast branch above.
+                    if (isRelaySuppressionAllowlisted(rHeader.type)) {
+                        scheduleAllowlistedForward(rHeader, rPayload, fromLink, broadcast = false)
+                    } else {
+                        forwardUnicast(rHeader, rPayload, resolved.captureMicros)
+                    }
                 } else {
                     wrongDstDropCount++
                     if (wrongDstDropCount % DROP_LOG_INTERVAL == 0) {
-                        logW("OFFTRACE: MESH: dropped frame not addressed to us dst=${MeshFrame.hex(header.dstId)} count=$wrongDstDropCount")
+                        logW("OFFTRACE: MESH: dropped frame not addressed to us dst=${MeshFrame.hex(rHeader.dstId)} count=$wrongDstDropCount")
                     }
                 }
             }
         }
     }
 
+    /** OCP PHASE 3.1-3.4: resolves a possibly-timestamped incoming frame.
+     *  For any type other than TYPE_FRAME_TS/TYPE_AUDIO_TS this is a pure
+     *  passthrough — [ResolvedFrame.captureMicros] is null and [header]/
+     *  [payload] are returned completely unchanged, so every other type's
+     *  routing is byte-for-byte identical to before this phase. For the two
+     *  timestamped types: strips the 8B BE capture-micros prefix, computes
+     *  age via [frameAgeTracker] (a DELTA against a per-source baseline —
+     *  see that class's doc — never a raw wall-clock comparison), and
+     *  returns null (drop) if the frame is over its budget UNLESS it is a
+     *  video IDR at least as new as the last IDR this device accepted (see
+     *  [shouldKeepAgedFrame]). The returned header always carries the
+     *  LEGACY type (2/3) — every downstream consumer (dispatchLocal,
+     *  forwardBroadcast/forwardUnicast's non-timestamped fallback) is
+     *  completely unaware timestamped framing exists at all. */
+    private fun resolveFrameAge(header: MeshFrame.Header, payload: ByteArray): ResolvedFrame? {
+        // OCP PHASE 5.1: TYPE_CONFIG_LOW/TYPE_FRAME_LOW carry no timestamp
+        // prefix (the low layer isn't age-tracked — see this phase's report)
+        // and no age budget — just a type normalization, mirroring the
+        // TS types' "downstream never sees the wire-level distinction"
+        // shape, marked via [ResolvedFrame.isLowLayer] instead.
+        when (header.type) {
+            TYPE_CONFIG_LOW -> return ResolvedFrame(header.copy(type = TYPE_CONFIG), payload, null, isLowLayer = true)
+            TYPE_FRAME_LOW -> return ResolvedFrame(header.copy(type = TYPE_FRAME), payload, null, isLowLayer = true)
+            else -> {}
+        }
+        val legacyType = when (header.type) {
+            TYPE_FRAME_TS -> TYPE_FRAME
+            TYPE_AUDIO_TS -> TYPE_AUDIO
+            else -> return ResolvedFrame(header, payload, null)
+        }
+        if (payload.size < 8) return ResolvedFrame(header.copy(type = legacyType), payload, null)
+        val captureMicros = ByteBuffer.wrap(payload, 0, 8).long
+        val stripped = payload.copyOfRange(8, payload.size)
+        val nowMicros = System.nanoTime() / 1000L
+        val ageMs = frameAgeTracker.ageMs(header.srcId, captureMicros, nowMicros)
+        lastKnownAgeMs[header.srcId] = ageMs
+        val isVideo = legacyType == TYPE_FRAME
+        val budgetMs = if (isVideo) VIDEO_AGE_BUDGET_MS else AUDIO_AGE_BUDGET_MS
+        val isIdr = isVideo && PeerLink.payloadCarriesIdr(stripped)
+        val lastIdrMicros = lastAcceptedIdrCaptureMicros[header.srcId] ?: -1L
+        if (!shouldKeepAgedFrame(ageMs, budgetMs, isIdr, captureMicros >= lastIdrMicros)) return null
+        if (isIdr) lastAcceptedIdrCaptureMicros[header.srcId] = captureMicros
+        return ResolvedFrame(header.copy(type = legacyType), stripped, captureMicros)
+    }
+
+    private data class ResolvedFrame(
+        val header: MeshFrame.Header,
+        val payload: ByteArray,
+        val captureMicros: Long?,
+        val isLowLayer: Boolean = false
+    )
+
     /** A client has exactly one link (the GO) — if a frame's immediate sender isn't
-     *  who its src claims, it was relayed through the GO from a third member. */
+     *  who its src claims, it was relayed through the GO from a third member.
+     *  Throttled to at most one line per srcId per second (same pattern as
+     *  [logDroppedGroupFrame]) — relay behaviour itself is unchanged, only how
+     *  often it's logged; [n] carries how many relayed frames were coalesced
+     *  into this one line. */
     private fun logIfRelayed(header: MeshFrame.Header, fromLink: PeerLink) {
-        if (!isGroupOwner && header.srcId != fromLink.nodeId) {
-            log("MESH: relayed frame recv from ${MeshFrame.hex(header.srcId)}")
+        if (isGroupOwner || header.srcId == fromLink.nodeId) return
+        val srcId = header.srcId
+        val n = (relayedFrameCount[srcId] ?: 0) + 1
+        relayedFrameCount[srcId] = n
+        val now = System.currentTimeMillis()
+        val last = relayedLogAtMs[srcId] ?: 0L
+        if (now - last < 1_000L) return
+        relayedLogAtMs[srcId] = now
+        relayedFrameCount[srcId] = 0
+        Log.d("OFFTRACE", "MESH: relayed $n frames from ${MeshFrame.hex(srcId)}")
+    }
+
+    /** PHASE 8 TRACK C2: [payload] starts with [1B count][count*8B srcId] —
+     *  the exact set of srcIds [fromLink] currently wants TYPE_FRAME (high)
+     *  from. Malformed input (truncated count, wrong length) is dropped,
+     *  never crashes the read loop — same defensive posture as every other
+     *  frame parser here. count==0 is a real, valid value (see
+     *  PeerLink.videoSubscription's doc on why null and emptySet() are
+     *  never coalesced).
+     *
+     *  OCP PHASE 5.1/G6: additively extended with a SECOND, identically-
+     *  shaped [1B count][count*8B srcId] block for the LOW layer — read
+     *  only if bytes remain after the high list (an older peer's SUBSCRIBE
+     *  simply has none, which reads as "no low subscriptions," never a
+     *  parse failure; mirrors MeshSigner.decodeHelloInner's exact pattern
+     *  for the identical reason). A NEWER peer's SUBSCRIBE talking to an
+     *  OLD build of this function is the mirror case — this exact code
+     *  already stops reading right after the high list's ids and never
+     *  looks at what follows, so the low block is silently ignored by an
+     *  old peer, satisfying G6 without that peer needing any awareness the
+     *  low layer exists. */
+    private fun handleSubscribeFrame(fromLink: PeerLink, payload: ByteArray) {
+        try {
+            val din = DataInputStream(ByteArrayInputStream(payload))
+            val count = din.readUnsignedByte()
+            val ids = (0 until count).map { din.readLong() }.toSet()
+            fromLink.videoSubscription = ids
+            var lowIds: Set<Long>? = null
+            if (din.available() >= 1) {
+                val lowCount = din.readUnsignedByte()
+                lowIds = (0 until lowCount).map { din.readLong() }.toSet()
+                fromLink.videoSubscriptionLow = lowIds
+            }
+            Log.d(
+                "OFFTRACE",
+                "SUB: ${MeshFrame.hex(fromLink.nodeId)} subscribed to [${ids.joinToString(",") { MeshFrame.hex(it) }}] " +
+                    "(${ids.size} streams) low=[${lowIds?.joinToString(",") { MeshFrame.hex(it) } ?: ""}] (${lowIds?.size ?: 0} streams)"
+            )
+        } catch (e: Exception) {
+            logW("OFFTRACE: MESH: malformed SUBSCRIBE from ${MeshFrame.hex(fromLink.nodeId)}: ${e.message}")
         }
     }
 
-    private fun forwardBroadcast(header: MeshFrame.Header, payload: ByteArray, fromLink: PeerLink) {
+    /** PHASE 8 TRACK C4: [isGoMixReplacingBroadcastAudio] suppression is
+     *  applied PER RECIPIENT here, not as an all-or-nothing gate at the call
+     *  site — every recipient gets it EXCEPT [parentNodeId] (null on the GO,
+     *  so this exception is a pure no-op there, matching today's GO
+     *  behavior exactly: the GO has no parent, so it suppresses to
+     *  everyone, exactly as before this track). A relay therefore ALWAYS
+     *  still relays raw TYPE_AUDIO upward toward the GO even once it stops
+     *  relaying it sideways/downward (replaced by its own tickGoMix variants
+     *  instead) — which is what lets the GO's own, completely unmodified
+     *  mixing continue to see every participant's real audio at any tree
+     *  depth, without a relay ever needing to synthesize a second, separately
+     *  wire-typed "here's my subtree's mix" contribution upward. */
+    /** [captureMicros] is non-null only when this frame arrived as
+     *  TYPE_FRAME_TS/TYPE_AUDIO_TS and already survived resolveFrameAge's
+     *  age check (see routeFrame) — [header.type] itself is ALWAYS the
+     *  legacy TYPE_FRAME/TYPE_AUDIO by the time it reaches here (resolveFrameAge
+     *  rewrites it), so every existing check below (isGoMixReplacingBroadcastAudio,
+     *  the TYPE_FRAME subscription filter) is untouched by OCP PHASE 3 — this
+     *  function only additionally re-wraps [payload] with the ORIGINAL
+     *  capture timestamp for whichever downstream links advertised support,
+     *  same "one encode, two possible wrappers, chosen per-link" shape as
+     *  writeRawFrame's origination path. */
+    /** [isLowLayer] is true only when this frame arrived as
+     *  TYPE_CONFIG_LOW/TYPE_FRAME_LOW and [resolveFrameAge] already
+     *  normalized [header.type] down to TYPE_CONFIG/TYPE_FRAME for this
+     *  call — mirrors [captureMicros]'s "always the legacy type by the time
+     *  it reaches here" shape (see that param's doc on the function above). */
+    private fun forwardBroadcast(
+        header: MeshFrame.Header, payload: ByteArray, fromLink: PeerLink,
+        captureMicros: Long? = null, isLowLayer: Boolean = false
+    ) {
         val newTtl = header.ttl - 1
         if (newTtl <= 0) {
             ttlZeroDropCount++
             return
         }
         logForward(header, newTtl.toByte())
-        val frame = MeshFrame.encode(header.srcId, header.dstId, newTtl.toByte(), header.type, payload)
-        routingTable.allExcept(fromLink.nodeId).forEach { it.enqueue(frame) }
+        val suppressDownward = isGoMixReplacingBroadcastAudio(header.type)
+        // OCP PHASE 2.4/0.3: liveness signal consumed only by tickGoMix's
+        // gapMs computation — a raw TYPE_AUDIO frame that actually went out
+        // (not suppressed) counts as "audio was just delivered," same as a
+        // GO-mixed frame going out (see tickGoMix) or the GO's own local
+        // raw-mix playback (see dispatchLocal). Harmless outside an active
+        // >=4-participant call — just an extra timestamp write.
+        if (header.type == TYPE_AUDIO && !suppressDownward) lastAudioDeliveredAtMs = System.currentTimeMillis()
+
+        // OCP PHASE 5.1: the low-layer branch — re-wrap as TYPE_CONFIG_LOW/
+        // TYPE_FRAME_LOW ONLY toward a link that both advertised
+        // CAP_SIMULCAST and (for TYPE_FRAME specifically) subscribed to
+        // this srcId's LOW layer. TYPE_CONFIG_LOW mirrors TYPE_CONFIG's own
+        // pre-existing "broadcast to everyone, no subscription filter"
+        // shape — only the capability gate applies. A link that never
+        // advertised simulcast support gets NEITHER type at all (no legacy
+        // fallback exists for a brand-new type — see writeRawFrame's
+        // identical gate for why).
+        if (isLowLayer) {
+            val lowType = if (header.type == TYPE_FRAME) TYPE_FRAME_LOW else TYPE_CONFIG_LOW
+            val lowFrame = MeshFrame.encode(header.srcId, header.dstId, newTtl.toByte(), lowType, payload)
+            routingTable.allExcept(fromLink.nodeId).forEach { link ->
+                if (!link.supportsSimulcast) return@forEach
+                if (lowType == TYPE_FRAME_LOW) {
+                    // OCP PHASE 5.1: null means "never subscribed to any low
+                    // stream" — unlike the HIGH list, null here is NOT
+                    // "everyone" (see PeerLink.videoSubscriptionLow's doc);
+                    // this is an opt-in-only stream with no legacy default
+                    // to preserve, so the safe default is "send nothing."
+                    val subLow = link.videoSubscriptionLow
+                    if (subLow == null || header.srcId !in subLow) return@forEach
+                }
+                link.enqueue(lowFrame)
+            }
+            return
+        }
+
+        val legacyFrame = MeshFrame.encode(header.srcId, header.dstId, newTtl.toByte(), header.type, payload)
+        val tsType = when (header.type) { TYPE_FRAME -> TYPE_FRAME_TS; TYPE_AUDIO -> TYPE_AUDIO_TS; else -> null }
+        val tsFrame = if (captureMicros != null && tsType != null) {
+            val tsPayload = ByteBuffer.allocate(8 + payload.size).putLong(captureMicros).put(payload).array()
+            MeshFrame.encode(header.srcId, header.dstId, newTtl.toByte(), tsType, tsPayload)
+        } else null
+        // PHASE 8 TRACK C2: only TYPE_FRAME (video) is ever filtered by a
+        // destination's subscription — TYPE_AUDIO and every control type,
+        // including TYPE_SUBSCRIBE itself, always fan out to everyone,
+        // exactly as before this track. null (never subscribed) means
+        // "everyone" — see PeerLink.videoSubscription's doc.
+        routingTable.allExcept(fromLink.nodeId).forEach { link ->
+            if (suppressDownward && link.nodeId != parentNodeId) return@forEach
+            if (header.type == TYPE_FRAME) {
+                val sub = link.videoSubscription
+                if (sub != null && header.srcId !in sub) return@forEach
+            }
+            link.enqueue(if (tsFrame != null && link.supportsFrameAge) tsFrame else legacyFrame)
+        }
     }
 
-    private fun forwardUnicast(header: MeshFrame.Header, payload: ByteArray) {
-        val target = routingTable.get(header.dstId)
+    /** OCP PHASE 2.1: true only for TYPE_AUDIO once the GO mix is actually
+     *  LIVE — [goMixLive], not the raw participant-count threshold this used
+     *  to read directly. That one-line change is the entire crossfade: raw
+     *  relay keeps flowing through every participant-count crossing until
+     *  tickGoMix has actually produced and sent this session's first mixed
+     *  frame (see tickGoMix's goMixLive.compareAndSet(false, true) call
+     *  site), and resumes the INSTANT eligibility is lost (tickGoMix flips
+     *  goMixLive back to false before returning) — see routeFrame's
+     *  broadcast branch (the only call site) and tickGoMix (what replaces
+     *  the relay this suppresses). False for every other type
+     *  unconditionally. */
+    private fun isGoMixReplacingBroadcastAudio(type: Byte): Boolean {
+        if (type != TYPE_AUDIO) return false
+        return goMixLive.get()
+    }
+
+    /** PHASE 8 TRACK C3: the one routing decision every dst-addressed send
+     *  (both locally-originated, via writeRawFrame, and forwarded, via
+     *  forwardUnicast) now shares. Direct neighbor (parent OR child) is
+     *  always tried first — on the GO or a plain client with a flat tree,
+     *  this is the ONLY branch that can ever match (routingTable holds every
+     *  neighbor there is), making this function's observable behavior
+     *  IDENTICAL to today's plain routingTable.get(dstId) for both of those
+     *  cases; it only starts choosing between "down to a child's subtree" and
+     *  "up to my parent" once an actual relay node with tree depth exists. */
+    private fun nextHopFor(dstId: Long): PeerLink? {
+        routingTable.get(dstId)?.let { return it }
+        childOwning(dstId)?.let { return routingTable.get(it) }
+        return parentNodeId?.let { routingTable.get(it) } // null on the GO — nowhere further up
+    }
+
+    /** Walks [treeParentOf] up from [dstId] looking for MY direct child whose
+     *  subtree contains it — bounded by TREE_MAX_DEPTH+2 so a malformed/stale
+     *  map can never spin. Returns null (never my descendant, or the map has
+     *  no entry at all — true for the entire life of any call that never
+     *  crosses TREE_MIN_SIZE_FOR_RELAY) rather than throwing. */
+    private fun childOwning(dstId: Long): Long? {
+        var cur = dstId
+        var hops = 0
+        while (hops < TREE_MAX_DEPTH + 2) {
+            val parent = treeParentOf[cur] ?: return null
+            if (parent == localNodeId) return cur
+            cur = parent
+            hops++
+        }
+        return null
+    }
+
+    /** See [forwardBroadcast]'s doc for [captureMicros]'s meaning — identical
+     *  per-link dual-wrap, just against a single target instead of a fan-out. */
+    private fun forwardUnicast(header: MeshFrame.Header, payload: ByteArray, captureMicros: Long? = null) {
+        val target = nextHopFor(header.dstId)
         if (target == null) {
             unknownDstDropCount++
             if (unknownDstDropCount % UNKNOWN_DST_LOG_INTERVAL == 0) {
@@ -2459,6 +4802,12 @@ class OfflineMediaTransport(
             return
         }
         logForward(header, newTtl.toByte())
+        val tsType = when (header.type) { TYPE_FRAME -> TYPE_FRAME_TS; TYPE_AUDIO -> TYPE_AUDIO_TS; else -> null }
+        if (captureMicros != null && tsType != null && target.supportsFrameAge) {
+            val tsPayload = ByteBuffer.allocate(8 + payload.size).putLong(captureMicros).put(payload).array()
+            target.enqueue(MeshFrame.encode(header.srcId, header.dstId, newTtl.toByte(), tsType, tsPayload))
+            return
+        }
         val frame = MeshFrame.encode(header.srcId, header.dstId, newTtl.toByte(), header.type, payload)
         target.enqueue(frame)
     }
@@ -2482,7 +4831,17 @@ class OfflineMediaTransport(
      *  store-and-forward replay. Consulted ONLY by the TYPE_SOS branch below
      *  (see MeshSosManager.handleSosFrame's isLive param / BUG 1 FIX 3); every
      *  other type, including 1/2/3 media, ignores it entirely. */
-    private fun dispatchLocal(header: MeshFrame.Header, payload: ByteArray, isLive: Boolean = true) {
+    private fun dispatchLocal(
+        header: MeshFrame.Header,
+        payload: ByteArray,
+        isLive: Boolean = true,
+        carrierInfo: Pair<Long, Int>? = null,
+        // PART A: set only by dispatchCarriedInner's verified-carried-SOS
+        // branch — the signed wire timestamp's age, threaded through to
+        // MeshSosManager.handleSosFrame's carriedVerifiedAgeSec. Every other
+        // call site (and every other type) leaves this null, unchanged.
+        carriedAgeSecOverride: Long? = null
+    ) {
         when (header.type) {
             TYPE_CONFIG -> {
                 val gc = groupCall
@@ -2493,7 +4852,35 @@ class OfflineMediaTransport(
                     // applySpeakerChange). Buffered per-sender until their TYPE_FRAME
                     // configures that sender's own tile decoder.
                     if (header.srcId !in gc.participants) return
-                    groupPendingCsd.getOrPut(header.srcId) { mutableListOf() }.add(payload)
+                    // PHASE 8 STEP 5: a csd arriving for a srcId that ALREADY
+                    // has an active decoder means their encoder was just
+                    // reconfigured — steady-state operation never resends
+                    // csd on its own (drainEncoderLoop's csdSent is a
+                    // one-shot-per-encoder-lifetime flag) — almost certainly
+                    // a resolution-ladder tier change. The OLD decoder can
+                    // never decode the NEW resolution's bitstream, so rebuild
+                    // immediately via the exact same FIX 2 path setGroupTileSurface
+                    // uses for a surface change, rather than buffering this
+                    // into groupPendingCsd where nothing would ever consume it.
+                    if (groupDecoders.containsKey(header.srcId)) {
+                        groupCsdCache[header.srcId] = payload
+                        if (groupTileSurfaces[header.srcId] != null) {
+                            releaseGroupDecoder(header.srcId)
+                            configureGroupDecoder(header.srcId, payload, requestKeyframeAfter = true)
+                            if (groupDecoders.containsKey(header.srcId)) {
+                                groupDecoderReady[header.srcId] = true
+                                Log.d(
+                                    "OFFTRACE",
+                                    "MEDIA: decoder rebuilt for ${MeshFrame.hex(header.srcId)} on resolution change — keyframe requested"
+                                )
+                            }
+                        }
+                        return
+                    }
+                    val pending = groupPendingCsd.getOrPut(header.srcId) { mutableListOf() }.apply { add(payload) }
+                    // FIX 1: persistent cache, independent of groupPendingCsd's
+                    // consume-once lifecycle — see the field's own doc.
+                    groupCsdCache[header.srcId] = combineByteArrays(pending)
                     return
                 }
                 if (!acceptMediaFrame(header.srcId)) return
@@ -2503,6 +4890,11 @@ class OfflineMediaTransport(
                 val gc = groupCall
                 if (gc != null) {
                     if (header.srcId !in gc.participants) return
+                    // PHASE 8 STEP 4: rate-limited internally to 1/sec — cheap
+                    // enough to piggyback on read-thread traffic that's
+                    // already happening every video frame. May swap at most
+                    // one peer's decoder per call (see evaluateTileBudget).
+                    maybeEvaluateTileBudget()
                     if (groupDecoderReady[header.srcId] != true) {
                         val csd = groupPendingCsd[header.srcId]
                         if (csd.isNullOrEmpty()) return
@@ -2542,6 +4934,15 @@ class OfflineMediaTransport(
             TYPE_AUDIO -> {
                 val gc = groupCall
                 if (gc != null) {
+                    // PHASE 8 STEP 3: a GO-mixed frame — UNICAST (dst=me)
+                    // from my own uplink. Only tickGoMix ever sends TYPE_AUDIO
+                    // unicast (every ordinary per-sender frame is BROADCAST,
+                    // see audioDst), so this is a zero-ambiguity signal, not a
+                    // heuristic — see buildGoMixPayload's doc.
+                    if (!isGroupOwner && header.srcId == uplinkNodeId() && header.dstId == localNodeId) {
+                        decodeAndPlayGoMixedAudio(payload)
+                        return
+                    }
                     // PHASE 3D: broadcast fan-in, same shape as group video — decode
                     // THIS sender's own stream (per-sender decoder, never shared with
                     // any other sender's) and fold the result into the local mix. GO
@@ -2549,13 +4950,39 @@ class OfflineMediaTransport(
                     // ELSE happens separately, upstream, in forwardBroadcast, without
                     // ever touching this function.
                     if (header.srcId !in gc.participants) return
+                    // PHASE 8 STEP 3: once GO-mixing has taken over (>= 4
+                    // participants), the GO only needs PCM for the current
+                    // top-3 VAD speakers — decoding every sender here would
+                    // reintroduce the exact O(N) decode cost this step
+                    // exists to eliminate. Below the threshold (or ever, on
+                    // a client — this transport's own tickGoMix never runs
+                    // there) this is always false, unchanged from before.
+                    // OCP PHASE 2.1: gated on goMixLive (actually live), not
+                    // the raw threshold — see isGoMixReplacingBroadcastAudio's
+                    // doc. While the mix is still spinning up post-crossing
+                    // (or spinning down), the GO keeps decoding EVERY sender
+                    // so its own local raw-mix playback below stays correct.
+                    if (isGroupOwner && goMixLive.get() && header.srcId !in committedMixSpeakers) {
+                        audioFrameCountRecv++
+                        return
+                    }
                     trackAudioRecvBytes(payload.size)
                     val codec = groupRemoteAudioCodec[header.srcId] ?: AudioCodec.PCM
                     val pcm = if (codec == AudioCodec.PCM) payload else decodeGroupAudio(header.srcId, payload)
                     if (pcm != null) {
                         groupLatestPcm[header.srcId] = pcm
                         groupLatestPcmMs[header.srcId] = System.currentTimeMillis()
-                        mixAndPlayGroupAudio()
+                        // PHASE 8 STEP 3 / OCP PHASE 2.1: local mix-and-play
+                        // runs whenever the GO mix ISN'T actually live yet —
+                        // below the threshold, on a client always, or on the
+                        // GO during the crossfade gap right after/before a
+                        // crossing. Once goMixLive is true, tickGoMix (its
+                        // own dedicated thread) owns playback — calling this
+                        // here too would double-play the GO's own audio.
+                        if (!isGroupOwner || !goMixLive.get()) {
+                            mixAndPlayGroupAudio()
+                            lastAudioDeliveredAtMs = System.currentTimeMillis()
+                        }
                     }
                     audioFrameCountRecv++
                     if (audioFrameCountRecv % 50 == 0) log("MEDIA: recv audio $audioFrameCountRecv")
@@ -2572,6 +4999,7 @@ class OfflineMediaTransport(
                 if (audioFrameCountRecv % 50 == 0) log("MEDIA: recv audio $audioFrameCountRecv")
             }
             TYPE_CHAT -> handleChatFrame(header, payload)
+            TYPE_PHRASE -> handlePhraseFrame(header, payload, carrierInfo)
             TYPE_MODE -> handleModeFrame(header, payload)
             TYPE_AUDIO_CODEC -> {
                 val gc = groupCall
@@ -2609,7 +5037,7 @@ class OfflineMediaTransport(
             TYPE_PARTICIPANTS -> handleParticipantsFrame(payload)
             TYPE_CAM -> if (isGroupOwner) handleCamRequestFrame(header, payload) else handleCamBroadcastFrame(payload)
             TYPE_CAM_DENIED -> handleCamDeniedFrame()
-            TYPE_SOS -> meshSosManager.handleSosFrame(header, payload, isLive)
+            TYPE_SOS -> meshSosManager.handleSosFrame(header, payload, isLive, carriedAgeSecOverride)
             TYPE_FIND_REQ -> meshSosManager.handleFindRequestFrame(header)
             TYPE_FIND_RESP -> meshSosManager.handleFindResponseFrame(header, payload)
             TYPE_POSITION -> meshSosManager.handlePositionFrame(header, payload)
@@ -2619,6 +5047,11 @@ class OfflineMediaTransport(
             TYPE_GO_HEARTBEAT -> meshElection.handleGoHeartbeat(header)
             TYPE_ELECTION_STATUS -> meshElection.handleElectionStatus(header, payload)
             TYPE_KEYFRAME_REQUEST -> requestKeyFrame()
+            TYPE_LINK_REPORT -> handleLinkReportFrame(header, payload)
+            TYPE_LINK_PROBE -> handleLinkProbeFrame(header, payload)
+            TYPE_LINK_PROBE_ACK -> handleLinkProbeAckFrame(header, payload)
+            TYPE_TREE_ASSIGN -> handleTreeAssignFrame(payload)
+            TYPE_UPLINK_STATUS -> handleUplinkStatusFrame(header, payload)
             else -> {
                 if (unknownTypesLogged.add(header.type)) {
                     logW("MEDIA: unknown frame type=${header.type} len=${payload.size} — skipping")
@@ -2679,12 +5112,28 @@ class OfflineMediaTransport(
     }
 
     private fun handleBusyFrame(header: MeshFrame.Header, payload: ByteArray) {
-        // PHASE 3B point 10: a 1-byte payload is the group-call-full rejection; the
-        // existing 0-byte payload keeps meaning "busy with a different 1:1 call".
-        if (payload.size == 1 && payload[0] == BUSY_REASON_CALL_FULL) {
-            log("MESH: group call join rejected by ${MeshFrame.hex(header.srcId)} — call is full")
+        // PHASE 3B point 10 / PHASE 8 STEP 7: a non-empty payload starting with
+        // BUSY_REASON_CALL_FULL is the group-call-full rejection — originally a
+        // bare 1-byte reason, now optionally followed by [current][max] (see
+        // addGroupCallParticipant); the existing 0-byte payload keeps meaning
+        // "busy with a different 1:1 call". `>= 1` (not `== 1`/`== 3`) so an
+        // older peer's 1-byte-only rejection still decodes correctly.
+        if (payload.isNotEmpty() && payload[0] == BUSY_REASON_CALL_FULL) {
+            val message = if (payload.size >= 3) {
+                val current = payload[1].toInt() and 0xFF
+                val max = payload[2].toInt() and 0xFF
+                "Group is full - $current of $max connected"
+            } else {
+                "Group call is full"
+            }
+            log("MESH: group call join rejected by ${MeshFrame.hex(header.srcId)} — $message")
             endGroupCallState("rejected — call full")
-            mainHandler.post { onGroupCallRejected?.invoke("Group call is full") }
+            // PHASE 8 STEP 7: rejection ends only the CALL attempt — this
+            // device's mesh socket to the GO is untouched, so MeshCarrier
+            // store-and-forward messaging keeps working exactly as it does
+            // for any other mesh member (see MeshCarrier's class doc — its
+            // queue/offer path never reads groupCall state at all).
+            mainHandler.post { onGroupCallRejected?.invoke(message) }
             return
         }
         if (pendingOutgoingCallPeerId != header.srcId) return
@@ -2708,7 +5157,7 @@ class OfflineMediaTransport(
         val isGroup = header.dstId == MeshFrame.BROADCAST_ID
         val fromName = nameFor(header.srcId)
         val text = String(payload, Charsets.UTF_8)
-        log("MEDIA: chat recv len=${payload.size} from=${MeshFrame.hex(header.srcId)} group=$isGroup")
+        logPerSrcThrottled(header.srcId) { "MEDIA: chat recv len=${payload.size} from=${MeshFrame.hex(header.srcId)} group=$isGroup" }
         mainHandler.post { onChatMessage?.invoke(header.srcId, fromName, text, isGroup) }
     }
 
@@ -2779,8 +5228,18 @@ class OfflineMediaTransport(
     }
 
     private fun handleVadFrame(header: MeshFrame.Header, payload: ByteArray) {
-        if (!isGroupOwner) return // VAD is client -> GO only
-        if (payload.size != 3) {
+        // PHASE 8 TRACK C4: was isGroupOwner alone — VAD's dst is (and
+        // always was) uplinkNodeId(), i.e. "my current parent" (see
+        // sendVad), which is the GO in today's flat topology and unchanged
+        // wire bytes either way; the only thing that generalizes is WHO is
+        // allowed to receive/act on one, since a relay node is now also a
+        // legitimate "someone's uplink."
+        if (!hasChildren()) return
+        // FIX 5: 4th byte is a free-running send counter (see sendVad's doc) —
+        // read only to accept the new length; never consulted for any logic,
+        // it exists purely so consecutive identical (speaking, energy)
+        // heartbeats never produce byte-identical signed material.
+        if (payload.size != 4) {
             logW("MESH: malformed VAD len=${payload.size} — ignoring")
             return
         }
@@ -2828,14 +5287,30 @@ class OfflineMediaTransport(
             }
             gc.participants.clear()
             gc.participants.addAll(ids)
+            // PHASE 8 STEP 4: mirrors the GO's own ordinal assignment (see
+            // addGroupCallParticipant) — ids arrives in the GO's stable
+            // insertion order (broadcastParticipants' toList() on a
+            // LinkedHashSet), and putIfAbsent means an id already known
+            // keeps its original ordinal across later snapshots.
+            ids.forEachIndexed { idx, id -> joinSequence.putIfAbsent(id, idx) }
             // PHASE 3C: anyone dropped off the roster (e.g. disconnected without an
             // explicit TYPE_CAM off) shouldn't keep a stale tile decoder or camState
             // entry around — mirrors removeGroupCallParticipant's GO-side cleanup.
             val idSet = ids.toSet()
             gc.camStates.keys.toList().forEach { id ->
-                if (id !in idSet) { gc.camStates.remove(id); releaseGroupDecoder(id); releaseGroupAudioDecoder(id) }
+                if (id !in idSet) {
+                    gc.camStates.remove(id)
+                    releaseGroupDecoder(id)
+                    releaseGroupAudioDecoder(id)
+                    // FIX 1: mirrors removeGroupCallParticipant's GO-side cleanup.
+                    groupCsdCache.remove(id)
+                }
             }
             log("MESH: group call participants updated, ${ids.size} member(s)")
+            // PHASE 8 STEP 5: this client's own encoder adapts to the SAME
+            // count the GO just used for its own — see
+            // evaluateGroupCallAfterChange's identical call.
+            applyResolutionLadder(ids.size)
             mainHandler.post { onGroupCallParticipants?.invoke(ids) }
         } catch (e: Exception) {
             logW("MESH: malformed PARTICIPANTS frame: ${e.message}")
@@ -2854,6 +5329,19 @@ class OfflineMediaTransport(
             TYPE_CHAT -> MAX_CHAT_PAYLOAD_BYTES
             TYPE_FRAME -> MAX_VIDEO_PAYLOAD_BYTES
             TYPE_AUDIO -> MAX_AUDIO_PAYLOAD_BYTES
+            // OCP PHASE 3.1: same cap as their legacy counterpart, +8 for the
+            // capture-micros prefix — without this, the read loop's own
+            // bounds check (below) would reject every timestamped video
+            // frame as "oversized" the moment it exceeds MAX_CONTROL_PAYLOAD_BYTES(1024).
+            TYPE_FRAME_TS -> MAX_VIDEO_PAYLOAD_BYTES + 8
+            TYPE_AUDIO_TS -> MAX_AUDIO_PAYLOAD_BYTES + 8
+            // OCP PHASE 5.1: the low layer is a SMALLER stream (320x240 vs
+            // up to 720p+) but reuses the same caps as its high counterpart
+            // rather than a tighter one — simplest correct bound, and this
+            // is a diagnostic ceiling (dropping oversized frames), not a
+            // real per-call budget.
+            TYPE_CONFIG_LOW -> MAX_CONFIG_PAYLOAD_BYTES
+            TYPE_FRAME_LOW -> MAX_VIDEO_PAYLOAD_BYTES
             TYPE_CONFIG -> MAX_CONFIG_PAYLOAD_BYTES
             TYPE_MODE, TYPE_AUDIO_CODEC, TYPE_HELLO, TYPE_BUSY, TYPE_HANGUP, TYPE_ROSTER,
             TYPE_CALL_INVITE, TYPE_CALL_ACCEPT, TYPE_CALL_LEAVE, TYPE_VAD, TYPE_SPEAKER, TYPE_PARTICIPANTS,
@@ -2890,6 +5378,7 @@ class OfflineMediaTransport(
         // AudioRecord/encoder/decoder/camera teardown) in endLocalCallState.
         callActive.set(true)
         log("MEDIA: mode resolved -> $mode — starting matching sender halves")
+        logCapabilityLine()
         startOpusDecodeThread() // ready for inbound audio regardless of our own mode
         if (mode == CallMode.VIDEO || mode == CallMode.AUDIO) {
             setupAudioRouting()
@@ -2922,6 +5411,7 @@ class OfflineMediaTransport(
             return
         }
         audioSendersStartedForCallId = callId
+        logCapabilityLine()
         // FIX 1: see the matching comment in startSendersForMode.
         callActive.set(true)
         // PHASE 3D: no more 1:1-shaped opusDecodeQueue/MediaOpusDecode thread here —
@@ -2931,13 +5421,18 @@ class OfflineMediaTransport(
         startAudioSender()
     }
 
-    /** GO-only, idempotent: creates and starts the VAD-ranking-only
-     *  [GroupCallMixer] — its ONLY remaining job is feeding this class's own
-     *  2-second speaker-highlight debounce (see [onRawActiveSpeakersChanged]); it no
+    /** PHASE 8 TRACK C4: was GO-only — now also runs on any relay node (a
+     *  no-op, safe to call unconditionally, on a plain leaf: hasChildren() is
+     *  false there for the entire life of any call that never crosses
+     *  TREE_MIN_SIZE_FOR_RELAY, which is every 2/3-device call forever).
+     *  Idempotent: creates and starts the VAD-ranking-only [GroupCallMixer]
+     *  — its ONLY remaining job is feeding this class's own 2-second
+     *  speaker-highlight debounce (see [onRawActiveSpeakersChanged]); it no
      *  longer decodes, mixes, or distributes audio (see that class's doc for why —
      *  the per-tick decode-all loop this used to run was the actual source of the
      *  GO's overrun/degradation problem). */
     private fun startGroupCallMixer() {
+        if (!isGroupOwner && !hasChildren()) return
         if (groupCallMixer != null) return
         val mixer = GroupCallMixer(
             localNodeId = localNodeId,
@@ -2945,6 +5440,7 @@ class OfflineMediaTransport(
         )
         mixer.start()
         groupCallMixer = mixer
+        startGoMixTicker()
     }
 
     /** GO-only, point 6: implements the 2-second continuous-lead debounce on top of
@@ -2952,6 +5448,11 @@ class OfflineMediaTransport(
      *  blip doesn't flap the one video stream back and forth. A host pin (see
      *  [requestPin]) overrides this entirely until cleared. */
     private fun onRawActiveSpeakersChanged(rankedActive: List<Long>) {
+        // PHASE 8 STEP 3: same raw top-3 signal also feeds the GO-mix speaker
+        // hysteresis (evaluateMixSpeakerHysteresis) — read on the dedicated
+        // goMixHandler thread, hence @Volatile rather than plumbing yet
+        // another callback through GroupCallMixer for the identical data.
+        rawMixSpeakers = rankedActive
         val gc = groupCall ?: return
         if (gc.pinnedId != null) return // pin overrides VAD — see requestPin
         val leader = rankedActive.firstOrNull()
@@ -2999,8 +5500,77 @@ class OfflineMediaTransport(
         if (gc.activeSpeakerId == nodeId) return
         gc.activeSpeakerId = nodeId
         gc.pinnedId = if (pinned) nodeId else null
+        // PHASE 8 STEP 4: this fires identically on every device (GO's own
+        // debounce decision, or a client applying an inbound TYPE_SPEAKER —
+        // see this function's call sites), so "most recently spoke" for the
+        // tile budget's selection order is populated everywhere without any
+        // new wire traffic — it rides the existing speaker-highlight signal.
+        if (nodeId != null) lastSpokeAtMs[nodeId] = System.currentTimeMillis()
         log("MEDIA: group call speaker highlight -> ${nodeId?.let { MeshFrame.hex(it) } ?: "none"} pinned=$pinned")
         mainHandler.post { onGroupCallSpeaker?.invoke(nodeId, pinned) }
+    }
+
+    // ── PHASE 8 STEP 5: resolution ladder ───────────────────────────────────
+
+    /** Called whenever this device's participant count is known to have
+     *  changed (see call sites: evaluateGroupCallAfterChange on the GO,
+     *  handleParticipantsFrame on a client) — every device runs this
+     *  independently, computing the SAME tier from the SAME participant
+     *  count it already tracks locally (see [GroupCallState.participants]),
+     *  so no explicit "GO broadcasts the ladder tier" wire message is
+     *  needed: TYPE_PARTICIPANTS already IS that broadcast (its whole
+     *  payload is the participant list this function's count comes from).
+     *  A tier that hasn't changed is a no-op; a genuine change reconfigures
+     *  ONLY if this device currently has an active outgoing encoder — a
+     *  device with no camera on just adopts the new WIDTH/HEIGHT/FPS/BITRATE
+     *  for whenever it next starts one. */
+    /** OCP PHASE 5.4: [thermalForcedTier] (set by [applyThermalStatus]),
+     *  when non-null, OVERRIDES the participant-count ladder entirely —
+     *  the single point both mechanisms funnel through, so a participant
+     *  join/leave arriving mid-throttle can never silently undo it, and
+     *  clearing the override (thermal back to NONE/LIGHT) naturally falls
+     *  through to whatever the participant count says it should be,
+     *  1:1 calls included (ladderTierFor(0) resolves to LADDER_TIER1,
+     *  exactly restoring a 1:1 call's untouched default). */
+    private fun applyResolutionLadder(participantCount: Int) {
+        val tier = thermalForcedTier ?: ladderTierFor(participantCount)
+        if (tier === currentLadderTier) return
+        currentLadderTier = tier
+        WIDTH = tier.width
+        HEIGHT = tier.height
+        FPS = tier.fps
+        BITRATE = tier.bitrate
+        Log.d("OFFTRACE", "SCALE: participants=$participantCount videoBudget=$tileBudget ladder=${tier.width}x${tier.height}@${tier.fps}")
+        if (encoder != null) reconfigureEncoderForLadderChange()
+    }
+
+    /** Full stop/start of THIS device's own camera+encoder against the
+     *  now-updated WIDTH/HEIGHT/FPS/BITRATE — reuses releaseCamera/
+     *  releaseEncoder/startEncoderThenCamera exactly as-is (the same
+     *  functions every normal call start/stop already goes through), on a
+     *  dedicated one-shot thread so the (potentially slow) Camera2
+     *  close()/open() cycle never blocks whichever thread noticed the tier
+     *  change (the read thread, in the common case — see
+     *  applyResolutionLadder's call sites). A freshly (re)started encoder
+     *  ALWAYS re-sends csd on its first output (drainEncoderLoop's csdSent
+     *  is thread-local, reset every call) and its first frame is always a
+     *  sync frame by construction — satisfying "re-send csd plus an IDR"
+     *  without any extra logic; requestKeyFrame() below is a documented
+     *  belt-and-suspenders on top of that. On the RECEIVING end, the fresh
+     *  csd arriving for an srcId that already has an active decoder is what
+     *  triggers every remote peer's own rebuild — see dispatchLocal's
+     *  TYPE_CONFIG branch. */
+    private fun reconfigureEncoderForLadderChange() {
+        Thread({
+            try {
+                releaseCamera()
+                releaseEncoder()
+                startEncoderThenCamera()
+                requestKeyFrame()
+            } catch (e: Exception) {
+                if (running.get()) logE("OFFTRACE: SCALE: ladder reconfigure failed: ${e.message}")
+            }
+        }, "MediaLadderReconfig").guarded().start()
     }
 
     private fun startEncoderThenCamera() {
@@ -3019,13 +5589,107 @@ class OfflineMediaTransport(
             encoder = enc
             encoderRunning = true
             log("MEDIA: encoder started")
-            val drainThread = Thread({ drainEncoderLoop() }, "MediaEncoderDrain")
+            val drainThread = Thread({ drainEncoderLoop() }, "MediaEncoderDrain").guarded()
             encoderDrainThread = drainThread
             drainThread.start()
+            // OCP PHASE 5.1: the low encoder (if this call currently needs
+            // one — see shouldRunLowEncoder) is created and started BEFORE
+            // openCamera so its input Surface exists in time to be added as
+            // a THIRD simultaneous capture-session target, same pattern
+            // startCaptureSession already uses for the local preview
+            // Surface. A failure here is logged and swallowed, never fatal
+            // to the call — the low layer is additive; losing it just means
+            // grid tiles fall back to a still frame (Phase 4's existing
+            // behavior), never a broken call.
+            if (shouldRunLowEncoder()) startLowEncoder()
             openCamera(inputSurface)
         } catch (e: Exception) {
             if (running.get()) reportError("encoder setup: ${e.message}")
         }
+    }
+
+    /** OCP PHASE 5.1: the low encoder runs only for an active GROUP call
+     *  past SIMULCAST_PARTICIPANT_THRESHOLD — a 1:1 call, or a group call
+     *  at or below the threshold, never starts it (this function returning
+     *  false there is what keeps every smaller call's camera pipeline
+     *  byte-for-byte what it was before this phase). */
+    private fun shouldRunLowEncoder(): Boolean {
+        val gc = groupCall ?: return false
+        return gc.participants.size > SIMULCAST_PARTICIPANT_THRESHOLD
+    }
+
+    /** Mirrors [startEncoderThenCamera]'s encoder-creation half exactly, at
+     *  LOW_LAYER_WIDTH/HEIGHT/BITRATE/FPS. Never calls openCamera itself —
+     *  the caller (startEncoderThenCamera) adds [lowEncoderInputSurface] as
+     *  an extra capture-session target alongside the high encoder's. */
+    private fun startLowEncoder() {
+        try {
+            val enc = MediaCodec.createEncoderByType("video/avc")
+            val fmt = MediaFormat.createVideoFormat("video/avc", LOW_LAYER_WIDTH, LOW_LAYER_HEIGHT).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, LOW_LAYER_BITRATE)
+                setInteger(MediaFormat.KEY_FRAME_RATE, LOW_LAYER_FPS)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            }
+            enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            val inputSurface = enc.createInputSurface()
+            lowEncoderInputSurface = inputSurface
+            enc.start()
+            lowEncoder = enc
+            lowEncoderRunning = true
+            log("MEDIA: low-layer encoder started (${LOW_LAYER_WIDTH}x$LOW_LAYER_HEIGHT)")
+            val drainThread = Thread({ drainLowEncoderLoop() }, "MediaLowEncoderDrain").guarded()
+            lowEncoderDrainThread = drainThread
+            drainThread.start()
+        } catch (e: Exception) {
+            logW("OFFTRACE: SCALE: low encoder setup failed (${e.message}) — grid falls back to Phase 4 stills")
+            releaseLowEncoder()
+        }
+    }
+
+    /** Mirrors [drainEncoderLoop] exactly, sending TYPE_CONFIG_LOW/
+     *  TYPE_FRAME_LOW instead of TYPE_CONFIG/TYPE_FRAME — writeRawFrame's
+     *  broadcast branch (see its OCP PHASE 5.1 gate) is what actually
+     *  restricts these two brand-new types to CAP_SIMULCAST peers only. */
+    private fun drainLowEncoderLoop() {
+        val info = MediaCodec.BufferInfo()
+        val pendingCsdOut = mutableListOf<ByteArray>()
+        var csdSent = false
+        var frameCount = 0
+        try {
+            while (running.get() && callActive.get() && lowEncoderRunning) {
+                val enc = lowEncoder ?: break
+                if (!lowEncoderRunning) break
+                // B2: see drainEncoderLoop's identical guard — releaseLowEncoder
+                // gates on this before calling enc.stop()/release().
+                lowEncoderDrainInsideCodec = true
+                val idx = try { enc.dequeueOutputBuffer(info, 10_000L) } finally { lowEncoderDrainInsideCodec = false }
+                if (idx < 0) continue
+                val buf = enc.getOutputBuffer(idx)
+                if (buf == null) { enc.releaseOutputBuffer(idx, false); continue }
+                val bytes = ByteArray(info.size)
+                buf.position(info.offset)
+                buf.limit(info.offset + info.size)
+                buf.get(bytes)
+                enc.releaseOutputBuffer(idx, false)
+                when {
+                    info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0 -> break
+                    info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0 -> pendingCsdOut.add(bytes)
+                    else -> {
+                        if (!csdSent && pendingCsdOut.isNotEmpty()) {
+                            writeFrame(videoDst(), TYPE_CONFIG_LOW, combineByteArrays(pendingCsdOut))
+                            csdSent = true
+                        }
+                        writeFrame(videoDst(), TYPE_FRAME_LOW, bytes)
+                        frameCount++
+                        if (frameCount % 30 == 0) log("MEDIA: sent low-layer frame $frameCount bytes=${bytes.size}")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            handleMediaLoopException("low encoder drain", e)
+        }
+        log("MEDIA: low encoder drain thread exiting")
     }
 
     /** FIX: asks this device's own running encoder for an immediate IDR rather than
@@ -3069,7 +5733,11 @@ class OfflineMediaTransport(
                 // and here. This is the guard replacing the old catch-and-exit.
                 val enc = encoder ?: break
                 if (!encoderRunning) break
-                val idx = enc.dequeueOutputBuffer(info, 10_000L)
+                // B2: flag cleared in the finally regardless of outcome — see
+                // waitForCodecFree/releaseEncoder, which gate on this before
+                // ever calling enc.stop()/release() from another thread.
+                encoderDrainInsideCodec = true
+                val idx = try { enc.dequeueOutputBuffer(info, 10_000L) } finally { encoderDrainInsideCodec = false }
                 if (idx < 0) continue
 
                 val buf = enc.getOutputBuffer(idx)
@@ -3154,7 +5822,12 @@ class OfflineMediaTransport(
                 var lastSpeechMs = 0L
                 var lastVadSentMs = 0L
                 while (running.get() && callActive.get()) {
-                    val n = rec.read(chunk, 0, chunk.size)
+                    // B2: AudioRecord.read() is a native blocking call that
+                    // Thread.interrupt() cannot unblock — releaseAudio() gates
+                    // on this flag before ever calling audioRecord.stop()/
+                    // release() from another thread (see waitForCodecFree).
+                    audioSendInsideRecord = true
+                    val n = try { rec.read(chunk, 0, chunk.size) } finally { audioSendInsideRecord = false }
                     if (n <= 0) {
                         // FIX 1d: mic loop safety net — every non-positive read backs off
                         // 5ms before retrying, regardless of which branch below runs, so
@@ -3225,11 +5898,20 @@ class OfflineMediaTransport(
                         speaking = loud || (now - lastSpeechMs) < VAD_HANGOVER_MS
                         if (speaking != wasSpeaking || now - lastVadSentMs >= VAD_HEARTBEAT_MS) {
                             lastVadSentMs = now
-                            if (isGroupOwner) {
-                                groupCallMixer?.updateVad(localNodeId, speaking, energy)
-                            } else {
-                                sendVad(speaking, energy)
-                            }
+                            // PHASE 8 TRACK C4: was if(isGroupOwner){local}else{send}
+                            // — a relay node now needs BOTH: its own local
+                            // mixer (for its own children's ranking) AND a
+                            // send to its own parent (so its speaking status
+                            // propagates further up the tree). On the GO
+                            // (no uplink) sendVad is a no-op via
+                            // uplinkNodeId()'s own null guard, so this is
+                            // still exactly "local only" there — identical to
+                            // today. On a plain leaf, hasChildren() is always
+                            // false, so this is still exactly "send only" —
+                            // identical to today for the entire life of any
+                            // 2/3-device call.
+                            if (hasChildren()) groupCallMixer?.updateVad(localNodeId, speaking, energy)
+                            if (!isGroupOwner) sendVad(speaking, energy)
                         }
                         if (!speaking) continue // point 3: transmit Opus ONLY while speaking
                         // PHASE 3D: GO and client both fall through to the normal
@@ -3253,7 +5935,7 @@ class OfflineMediaTransport(
                 // classifier rather than deciding "error or clean shutdown" ad hoc here.
                 handleMediaLoopException("audio sender", e)
             }
-        }, "MediaAudioSend")
+        }, "MediaAudioSend").guarded()
         audioSendThread = t
         t.start()
     }
@@ -3276,13 +5958,32 @@ class OfflineMediaTransport(
         return kotlin.math.sqrt((sumSquares / count).toDouble()).toInt().coerceIn(0, 65535)
     }
 
+    // FIX 5: MeshSigner's seen-signature replay cache rejects an EXACT repeat
+    // of a signed frame's material within its window — VAD's payload used to
+    // carry nothing that changes between periodic heartbeat resends (see
+    // VAD_HEARTBEAT_MS=300ms), so two genuine heartbeats landing in the same
+    // second (MeshSigner's timestamp granularity) with the same (speaking,
+    // energy) produced byte-identical signed material and were wrongly
+    // dropped as replays ("SIG: replay rejected type=15 ... skew=0s"). A
+    // free-running counter appended to the payload makes every send unique
+    // WITHOUT touching MeshSigner's shared replay-cache logic (used by every
+    // other signed type) or weakening VAD's own replay protection — chosen
+    // over exempting type 15 from the cache because it fixes the actual root
+    // cause (a payload with no varying state) rather than special-casing the
+    // security layer, and matches this codebase's existing convention of a
+    // msgSeq/counter field on every other periodically-resent frame type
+    // (see MeshLocation.msgSeq, MeshSosManager.nextMsgSeq).
+    private var vadSendCounter: Byte = 0
+
     /** PHASE 3B: client -> GO only (the GO updates its own VAD state directly via
      *  GroupCallMixer.updateVad — see the call site above). */
     private fun sendVad(speaking: Boolean, energy: Int) {
         val go = uplinkNodeId() ?: return
-        val buf = ByteBuffer.allocate(3)
+        val buf = ByteBuffer.allocate(4)
         buf.put(if (speaking) 1 else 0)
         buf.putShort(energy.toShort())
+        buf.put(vadSendCounter)
+        vadSendCounter = (vadSendCounter + 1).toByte()
         writeFrame(go, TYPE_VAD, buf.array())
     }
 
@@ -3357,7 +6058,7 @@ class OfflineMediaTransport(
                     audioEncoder = null
                 }
             }
-        }, "MediaOpusEncode")
+        }, "MediaOpusEncode").guarded()
         opusEncodeThread = t
         t.start()
     }
@@ -3380,6 +6081,10 @@ class OfflineMediaTransport(
     }
 
     private fun encodeAndSendOpus(enc: MediaCodec, pcm: ByteArray) {
+        // B2: this whole function's body is codec I/O on opusEncodeThread —
+        // releaseAudio() gates on this flag before calling audioEncoder.stop()/
+        // release() from another thread (see waitForCodecFree).
+        opusEncodeInsideCodec = true
         try {
             val inIdx = enc.dequeueInputBuffer(2_000L)
             if (inIdx >= 0) {
@@ -3412,12 +6117,14 @@ class OfflineMediaTransport(
             }
         } catch (e: Exception) {
             if (running.get() && callActive.get()) reportError("opus encode: ${e.message}")
+        } finally {
+            opusEncodeInsideCodec = false
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun openCamera(encoderSurface: Surface) {
-        val ht = HandlerThread("MediaCameraThread").also { it.start() }
+        val ht = HandlerThread("MediaCameraThread").also { it.guarded().start() }
         cameraThread = ht
         val handler = Handler(ht.looper)
         cameraHandler = handler
@@ -3512,14 +6219,27 @@ class OfflineMediaTransport(
         tryOpen()
     }
 
-    private fun startCaptureSession(camera: CameraDevice, encoderSurface: Surface) {
+    /** OCP PHASE 5.1: [allowLowLayer] defaults true — [startEncoderThenCamera]
+     *  always calls this that way; a config failure with the low encoder's
+     *  Surface included (some Camera2 HALs cap concurrent stream count —
+     *  UNVERIFIED on real hardware, see this phase's report) retries ONCE
+     *  with allowLowLayer=false, which is a strict subset of the previous
+     *  target list and therefore never fails for a NEW reason. The low
+     *  layer being unavailable this session degrades to Phase 4's existing
+     *  still-frame fallback — never a broken call. */
+    private fun startCaptureSession(camera: CameraDevice, encoderSurface: Surface, allowLowLayer: Boolean = true) {
         try {
             // PHASE 3C: this device's own grid tile (group video only — null on a
             // 1:1 call, see setLocalPreviewSurface) is a SECOND simultaneous output
             // target on the same capture session, not a separate camera open —
             // Camera2 supports multiple targets from one repeating request.
             val previewSurface = localPreviewSurface
-            val targets = if (previewSurface != null) listOf(encoderSurface, previewSurface) else listOf(encoderSurface)
+            // OCP PHASE 5.1: a THIRD simultaneous target, same pattern —
+            // null whenever the low encoder isn't running (every call
+            // smaller than SIMULCAST_PARTICIPANT_THRESHOLD, or this is the
+            // post-failure retry), a pure no-op for every existing call shape.
+            val lowSurface = if (allowLowLayer) lowEncoderInputSurface else null
+            val targets = listOfNotNull(encoderSurface, previewSurface, lowSurface)
             camera.createCaptureSession(
                 targets,
                 object : CameraCaptureSession.StateCallback() {
@@ -3540,16 +6260,23 @@ class OfflineMediaTransport(
                                 .apply {
                                     addTarget(encoderSurface)
                                     previewSurface?.let { addTarget(it) }
+                                    lowSurface?.let { addTarget(it) }
                                 }
                                 .build()
                             session.setRepeatingRequest(req, null, cameraHandler)
                             val hasPreview = previewSurface != null
-                            log("MEDIA: camera capture running (preview=$hasPreview)")
+                            log("MEDIA: camera capture running (preview=$hasPreview low=${lowSurface != null})")
                         } catch (e: Exception) {
                             if (running.get()) reportError("capture request: ${e.message}")
                         }
                     }
                     override fun onConfigureFailed(session: CameraCaptureSession) {
+                        if (allowLowLayer && lowSurface != null) {
+                            logW("OFFTRACE: SCALE: capture session config failed WITH low-layer target — retrying without it")
+                            releaseLowEncoder()
+                            startCaptureSession(camera, encoderSurface, allowLowLayer = false)
+                            return
+                        }
                         reportError("capture session config failed")
                     }
                 },
@@ -3625,6 +6352,401 @@ class OfflineMediaTransport(
         }
     }
 
+    // ── PHASE 8 STEP 4: video tile decoder budget ───────────────────────────────
+
+    /** Queries the platform's actual AVC decoder instance ceiling — this
+     *  device's OWN hardware limit, not an assumption. Takes the SMALLEST
+     *  maxSupportedInstances reported across every video/avc decoder this
+     *  device exposes (usually just one, but some devices list more than
+     *  one implementation of the same mime type). Falls back to
+     *  DECODER_PROBE_FALLBACK only if the platform query itself throws or
+     *  reports nothing usable — see this app's own established "probe, don't
+     *  assume; state the fallback plainly when probing genuinely isn't
+     *  possible" convention (same spirit as the WFD client-limit note in
+     *  addGroupCallParticipant). */
+    private fun probeMaxAvcDecoderInstances(): Int = probeMaxAvcInstances(isEncoder = false)
+
+    /** OCP PHASE 0.1: mirrors [probeMaxAvcDecoderInstances] exactly, for
+     *  encoder instances instead — used only for the CAP diagnostic line
+     *  today (this app runs a single local encoder; nothing currently
+     *  arbitrates against this the way tileBudget arbitrates decoders). */
+    private fun probeMaxAvcEncoderInstances(): Int = probeMaxAvcInstances(isEncoder = true)
+
+    private fun probeMaxAvcInstances(isEncoder: Boolean): Int {
+        return try {
+            val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+            var min = Int.MAX_VALUE
+            for (info in list.codecInfos) {
+                if (info.isEncoder != isEncoder) continue
+                if (!info.supportedTypes.any { it.equals("video/avc", ignoreCase = true) }) continue
+                val caps = try { info.getCapabilitiesForType("video/avc") } catch (e: Exception) { continue }
+                val n = caps.maxSupportedInstances
+                if (n > 0) min = minOf(min, n)
+            }
+            if (min == Int.MAX_VALUE) DECODER_PROBE_FALLBACK else min
+        } catch (e: Exception) {
+            val kind = if (isEncoder) "encoder" else "decoder"
+            logW("OFFTRACE: SCALE: $kind probe failed (${e.message}) — using fallback=$DECODER_PROBE_FALLBACK")
+            DECODER_PROBE_FALLBACK
+        }
+    }
+
+    /** Called once per session (see [start]). OCP PHASE 4.3: tileBudget =
+     *  (probed-1) coerced into TILE_BUDGET_MIN..TILE_BUDGET_CEILING (2..8) —
+     *  the "-1" leaves headroom below the platform's own advertised ceiling
+     *  (this device's 1:1-call decoder, and MediaCodec allocation failures
+     *  right at the advertised max are a known real-world quirk on some
+     *  OEMs); the 2..8 range replaces the old flat "capped at 4 regardless"
+     *  — a stronger device now actually gets to use more of what it probed.
+     *  maxLiveCameras derives from the SAME probe, coerced into
+     *  MIN_LIVE_CAMERAS..MAX_GROUP_PARTICIPANTS (2..8) — likewise no longer
+     *  a flat 4 for every device regardless of hardware. */
+    private fun initTileBudget() {
+        val probed = probeMaxAvcDecoderInstances()
+        probedDecoderCount = probed
+        probedEncoderCount = probeMaxAvcEncoderInstances()
+        tileBudget = deriveTileBudget(probed)
+        maxLiveCameras = deriveMaxLiveCameras(probed)
+        Log.d("OFFTRACE", "SCALE: decoder probe maxInstances=$probed budget=$tileBudget maxLiveCameras=$maxLiveCameras")
+    }
+
+    /** OCP PHASE 0.1: current PowerManager thermal status as a short string
+     *  — getCurrentThermalStatus() is API 29+ (this app's minSdk is 26), so
+     *  below that this is always "n/a" (no on-device thermal signal exists
+     *  pre-Q; Phase 5.4's listener is likewise a no-op there). Never throws —
+     *  a diagnostic read must not risk the caller (call-start logging). */
+    private fun currentThermalStatusString(): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "n/a"
+        return try {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            thermalStatusString(pm.currentThermalStatus)
+        } catch (e: Exception) {
+            "n/a"
+        }
+    }
+
+    // OCP PHASE 5.4: this device's own thermal-status listener — API 29+
+    // only (Build.VERSION.SDK_INT guarded at every call site, matching
+    // currentThermalStatusString's own precedent); a pure no-op object
+    // below that. Registered once per session (see start()), unregistered
+    // in stop() — see registerThermalListener/unregisterThermalListener.
+    private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
+
+    /** Fired (main thread) with a human-readable reason the moment SEVERE
+     *  thermal forces this device's own camera off — the Activity uses this
+     *  to show a visible "camera off — device too hot" message rather than
+     *  a silently blank/frozen local tile. Audio and SOS are never touched
+     *  by any thermal status — see [applyThermalStatus]'s doc. */
+    var onThermalCameraForcedOff: ((reason: String) -> Unit)? = null
+
+    private fun registerThermalListener() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        try {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            val listener = PowerManager.OnThermalStatusChangedListener { status -> applyThermalStatus(status) }
+            pm.addThermalStatusListener(listener)
+            thermalListener = listener
+            applyThermalStatus(pm.currentThermalStatus) // pick up an already-hot device at call start, not just future transitions
+        } catch (e: Exception) {
+            logW("OFFTRACE: THERMAL: listener registration failed: ${e.message}")
+        }
+    }
+
+    private fun unregisterThermalListener() {
+        val listener = thermalListener ?: return
+        thermalListener = null
+        thermalForcedTier = null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        try {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            pm.removeThermalStatusListener(listener)
+        } catch (e: Exception) {
+            logW("OFFTRACE: THERMAL: listener removal failed: ${e.message}")
+        }
+    }
+
+    /** OCP PHASE 5.4: MODERATE throttles this device's own encoder to
+     *  LADDER_TIER3 (320x240@15fps, the same cheap tier the participant-
+     *  count ladder already uses at scale — see [applyResolutionLadder]'s
+     *  doc for how the two mechanisms share one override slot without
+     *  racing) — a throttled encoder still running at full resolution
+     *  would reproduce exactly the lag Phase 1/3 removed. SEVERE goes
+     *  further: this device's own camera is turned off outright (group
+     *  calls only — see this function's own doc on the 1:1 gap) via the
+     *  SAME [setGroupCallCameraOn] path a manual toggle uses, so every
+     *  other participant sees an ordinary, correctly-announced camera-off,
+     *  not a frozen tile. Below MODERATE (NONE/LIGHT), any override clears
+     *  and the ladder reverts to whatever the participant count says.
+     *  Audio/SOS are NEVER touched by any branch here — this function only
+     *  ever calls into camera/encoder state. */
+    private fun applyThermalStatus(status: Int) {
+        val statusStr = thermalStatusString(status)
+        when {
+            status >= PowerManager.THERMAL_STATUS_SEVERE -> {
+                thermalForcedTier = LADDER_TIER3
+                val gc = groupCall
+                val hadCameraOn = gc != null && gc.camStates[localNodeId] == true
+                if (hadCameraOn) {
+                    setGroupCallCameraOn(false)
+                    mainHandler.post { onThermalCameraForcedOff?.invoke("Device is too hot — camera turned off to cool down") }
+                } else if (gc == null && encoder != null) {
+                    // 1:1 VIDEO call: no clean mid-call camera-off protocol
+                    // exists in this app (see this function's doc) — best
+                    // effort is the same throttle MODERATE applies.
+                    applyResolutionLadder(0)
+                }
+                Log.d("OFFTRACE", "THERMAL: status=$statusStr cameraForcedOff=$hadCameraOn")
+            }
+            status == PowerManager.THERMAL_STATUS_MODERATE -> {
+                thermalForcedTier = LADDER_TIER3
+                if (groupCall != null) applyResolutionLadder(groupCall!!.participants.size) else if (encoder != null) applyResolutionLadder(0)
+                Log.d("OFFTRACE", "THERMAL: status=$statusStr encoderThrottled=true")
+            }
+            else -> {
+                if (thermalForcedTier != null) {
+                    thermalForcedTier = null
+                    val gc = groupCall
+                    if (gc != null) applyResolutionLadder(gc.participants.size) else if (encoder != null) applyResolutionLadder(0)
+                }
+                Log.d("OFFTRACE", "THERMAL: status=$statusStr encoderThrottled=false")
+            }
+        }
+    }
+
+    /** OCP PHASE 0.1: this device's own current live-camera count — the
+     *  group-call camState map when in a group call, else 1 iff this
+     *  device's own encoder is currently running a VIDEO-mode 1:1 call. */
+    private fun currentLiveCameraCount(): Int {
+        groupCall?.let { gc -> return gc.camStates.count { it.value } }
+        return if (resolvedMode == CallMode.VIDEO && encoder != null) 1 else 0
+    }
+
+    /** OCP PHASE 0.1: "Log on every device at call start" — called from both
+     *  [startSendersForMode] (1:1) and [startGroupCallAudio] (group). Reuses
+     *  the session's cached probe results ([probedDecoderCount]/
+     *  [probedEncoderCount], set once in [initTileBudget]) rather than
+     *  re-querying MediaCodecList per call. */
+    private fun logCapabilityLine() {
+        Log.d(
+            "OFFTRACE",
+            "CAP: probedDecoders=$probedDecoderCount probedEncoders=$probedEncoderCount " +
+                "tileBudget=$tileBudget liveCameras=${currentLiveCameraCount()} thermal=${currentThermalStatusString()}"
+        )
+    }
+
+    // PHASE 8 TRACK C2: null = never sent yet — distinct from emptySet() (a
+    // real, sent "no video wanted" state), same null-vs-empty distinction as
+    // PeerLink.videoSubscription on the receiving end.
+    private var lastSentSubscription: Set<Long>? = null
+    // OCP PHASE 5.1: same shape, for the low-layer list this device sends.
+    private var lastSentSubscriptionLow: Set<Long>? = null
+
+    /** Sends TYPE_SUBSCRIBE to this device's current uplink (see
+     *  uplinkNodeId()) whenever [desiredHigh]/[desiredLow] actually change —
+     *  a no-op on the GO (uplinkNodeId() is null there; the GO enforces its
+     *  own tile budget locally with no wire message needed) and a no-op for
+     *  any call small enough that neither differs from its last-sent value,
+     *  which is exactly what keeps a 2/3-device call from ever sending this
+     *  frame at all. OCP PHASE 5.1: [desiredLow] additively extends the
+     *  wire payload — see handleSubscribeFrame's doc on the receiving end. */
+    private fun maybeSendVideoSubscription(desiredHigh: Set<Long>, desiredLow: Set<Long> = emptySet()) {
+        if (desiredHigh == lastSentSubscription && desiredLow == lastSentSubscriptionLow) return
+        val dst = uplinkNodeId() ?: return
+        lastSentSubscription = desiredHigh
+        lastSentSubscriptionLow = desiredLow
+        val buf = ByteBuffer.allocate(1 + desiredHigh.size * 8 + 1 + desiredLow.size * 8)
+        buf.put(desiredHigh.size.coerceIn(0, 255).toByte())
+        desiredHigh.forEach { buf.putLong(it) }
+        buf.put(desiredLow.size.coerceIn(0, 255).toByte())
+        desiredLow.forEach { buf.putLong(it) }
+        writeFrame(dst, TYPE_SUBSCRIBE, buf.array())
+    }
+
+    /** OCP PHASE 0.2: one LAT line per peer per second, throttled via
+     *  [lastLatLogAtMs] — called from every incoming frame (see routeFrame),
+     *  same piggyback pattern as [maybeEvaluateTileBudget]. qd is this
+     *  DEVICE's own shared opusDecodeQueue (there is exactly one, not one
+     *  per peer — a 1:1-call-only queue; group calls decode per-sender
+     *  inline off dispatchLocal instead, see decodeGroupAudio), reported
+     *  identically on every peer's row since it isn't truly per-peer state;
+     *  every other field (qv/qa/dropV/dropA) IS genuinely this peer's own
+     *  PeerLink state. rttMs prefers this node's own measured RTT to its
+     *  uplink when [link] IS that uplink, else the GO-side aggregate from
+     *  LINK_REPORT (rttToUplinkByNode) reported BY that peer; -1 if neither
+     *  is known yet (e.g. before the first LINK_PROBE/ACK round trip).
+     *  ageMs is [AGE_MS_NOT_YET_IMPLEMENTED] until Phase 3 wires a real
+     *  per-frame timestamp — see that phase's TYPE_FRAME_TS/TYPE_AUDIO_TS. */
+    private fun maybeLogPeerLatency(link: PeerLink) {
+        val now = System.currentTimeMillis()
+        val last = lastLatLogAtMs[link.nodeId] ?: 0L
+        if (!shouldLogLatNow(last, now)) return
+        lastLatLogAtMs[link.nodeId] = now
+        val rtt = rttToUplinkByNode[link.nodeId]
+            ?: (if (link.nodeId == uplinkNodeId()) rttToOwnUplinkMs else null)
+            ?: -1L
+        Log.d(
+            "OFFTRACE",
+            "LAT: peer=${MeshFrame.hex(link.nodeId)} " +
+                "qv=${link.videoQueueDepth()}/${link.videoQueueCapacity()} " +
+                "qa=${link.audioQueueDepth()}/${link.audioQueueCapacity()} " +
+                "qd=${opusDecodeQueue.size} " +
+                "dropV=${link.totalVideoDropsCount()} dropA=${link.totalAudioDropsCount()} " +
+                "ageMs=${lastKnownAgeMs[link.nodeId] ?: AGE_MS_NOT_YET_IMPLEMENTED} rttMs=$rtt"
+        )
+    }
+
+    /** Rate-limited to TILE_BUDGET_EVAL_INTERVAL_MS — called opportunistically
+     *  off the existing group-video TYPE_FRAME dispatch path (see
+     *  dispatchLocal), not a dedicated thread; cheap enough (a sort over at
+     *  most MAX_GROUP_PARTICIPANTS-1 candidates) to piggyback on read-thread
+     *  traffic that is already happening every frame, same pattern as this
+     *  file's other throttled-but-inline checks. Runs on EVERY device (GO
+     *  and client alike) — decoder limits are per-device hardware, not a
+     *  GO-only concept like STEP 3's audio mixing. */
+    private fun maybeEvaluateTileBudget() {
+        val now = System.currentTimeMillis()
+        if (now - lastTileBudgetEvalMs < TILE_BUDGET_EVAL_INTERVAL_MS) return
+        lastTileBudgetEvalMs = now
+        evaluateTileBudget(now)
+        maybeToggleLowEncoder()
+    }
+
+    // OCP PHASE 5.1: reentrancy guard — reconfigureEncoderForLadderChange
+    // runs on its own background thread (camera close/open is slow); this
+    // prevents a second eval tick from queuing a duplicate restart while
+    // one is still in flight.
+    private val lowEncoderReconfigureInFlight = AtomicBoolean(false)
+
+    /** Piggybacks on [maybeEvaluateTileBudget]'s existing 1s throttle — this
+     *  device's own participant-count crossing is not a per-frame event,
+     *  every-second is more than enough responsiveness. Only acts while
+     *  THIS device's own camera is actually on ([cameraOn]) — an audio-only
+     *  participant has no capture session to add a low-encoder target to at
+     *  all, and starting/stopping an encoder with no camera pipeline behind
+     *  it would be meaningless. */
+    private fun maybeToggleLowEncoder() {
+        if (!cameraOn) return
+        if (shouldRunLowEncoder() == lowEncoderRunning) return
+        if (!lowEncoderReconfigureInFlight.compareAndSet(false, true)) return
+        // Same shape as reconfigureEncoderForLadderChange (camera close/open
+        // on a dedicated one-shot thread, never the caller's) — inlined
+        // rather than calling that shared function directly so this flag's
+        // clear-on-completion (not clear-on-thread-launch) actually guards
+        // the whole operation, including a restart slower than the 1s
+        // outer throttle.
+        Thread({
+            try {
+                releaseCamera()
+                releaseEncoder()
+                startEncoderThenCamera()
+                requestKeyFrame()
+            } catch (e: Exception) {
+                if (running.get()) logE("OFFTRACE: SCALE: low-layer toggle reconfigure failed: ${e.message}")
+            } finally {
+                lowEncoderReconfigureInFlight.set(false)
+            }
+        }, "MediaLowLayerToggle").guarded().start()
+    }
+
+    /** Selection order: pinned peer first, then currently speaking
+     *  ([GroupCallState.activeSpeakerId]), then most recently spoke (see
+     *  [lastSpokeAtMs], populated by [applySpeakerChange] on every device),
+     *  then join order ([joinSequence]) as the final tie-break. Only ever
+     *  swaps ONE peer per call (oldest-held-slot out, highest-ranked-missing
+     *  in) and only past TILE_SWAP_HYSTERESIS_MS, so a brief VAD blip can't
+     *  thrash decoders — the next eval tick (1s later) picks up any further
+     *  swap still needed. Reuses configureGroupDecoder/releaseGroupDecoder
+     *  exactly (the FIX 2 rebuild path), so success/failure/degraded
+     *  bookkeeping is identical to every other decoder lifecycle event. */
+    private fun evaluateTileBudget(now: Long) {
+        val gc = groupCall ?: return
+        val camOnPeers = gc.camStates.filterValues { it }.keys.filter { it != localNodeId }
+        val currentlyDecoded = groupDecoders.keys.toSet()
+
+        // OCP PHASE 5.1: once a group call actually needs grid thumbnails
+        // (participants > SIMULCAST_PARTICIPANT_THRESHOLD), every visible
+        // tile EXCEPT the pinned one and the active speaker subscribes to
+        // the LOW layer instead of HIGH — real bandwidth savings for every
+        // "just visible in the grid" tile, decoder count unaffected either
+        // way (see splitHighLow's doc).
+        val simulcastActive = gc.participants.size > SIMULCAST_PARTICIPANT_THRESHOLD
+        val pin = pinnedTilePeer
+
+        if (camOnPeers.size <= tileBudget) {
+            // Under budget — nothing excluded; clear any stale exclusion
+            // markers left over from a participant count that has since dropped.
+            if (tileBudgetExcluded.isNotEmpty()) {
+                val cleared = tileBudgetExcluded.toList()
+                tileBudgetExcluded.clear()
+                cleared.forEach { id -> mainHandler.post { onGroupTileBudgetChanged?.invoke(id, false) } }
+            }
+            // PHASE 8 TRACK C2: under budget — this device wants every
+            // currently-camera-on peer's video, nothing to restrict on
+            // DECODER COUNT — OCP PHASE 5.1 still splits which LAYER each
+            // one gets.
+            val (high, low) = splitHighLow(camOnPeers, pin, gc.activeSpeakerId, simulcastActive)
+            maybeSendVideoSubscription(high, low)
+            return
+        }
+
+        val ranked = camOnPeers.sortedWith(
+            compareByDescending<Long> { it == pin }
+                .thenByDescending { it == gc.activeSpeakerId }
+                .thenByDescending { lastSpokeAtMs[it] ?: 0L }
+                .thenBy { joinSequence[it] ?: Int.MAX_VALUE }
+        )
+        val want = ranked.take(tileBudget).toSet()
+        // PHASE 8 TRACK C2: over budget — subscribe to exactly the ranked set
+        // this device actually intends to decode, regardless of whether a
+        // decoder swap physically executes this tick (the hysteresis/surface-
+        // readiness checks below only gate the local codec swap, not what
+        // this device is willing to receive). OCP PHASE 5.1: split within
+        // that same decoded set by layer — see above.
+        val (wantHigh, wantLow) = splitHighLow(ranked.take(tileBudget), pin, gc.activeSpeakerId, simulcastActive)
+        maybeSendVideoSubscription(wantHigh, wantLow)
+
+        val newlyExcluded = camOnPeers.filter { it !in want && it !in tileBudgetExcluded }
+        val newlyIncluded = tileBudgetExcluded.filter { it in want }
+        (newlyExcluded + newlyIncluded).forEach { id ->
+            val excluded = id in newlyExcluded
+            if (excluded) tileBudgetExcluded.add(id) else tileBudgetExcluded.remove(id)
+            mainHandler.post { onGroupTileBudgetChanged?.invoke(id, excluded) }
+        }
+
+        val toDrop = currentlyDecoded - want
+        val toAdd = want - currentlyDecoded
+        if (toDrop.isEmpty() || toAdd.isEmpty()) return
+        val dropCandidate = toDrop.minByOrNull { tileSwapAtMs[it] ?: 0L } ?: return
+        if (now - (tileSwapAtMs[dropCandidate] ?: 0L) < TILE_SWAP_HYSTERESIS_MS) return
+        val addCandidate = toAdd.firstOrNull() ?: return
+        val csd = groupCsdCache[addCandidate] ?: return
+        if (groupTileSurfaces[addCandidate] == null) return
+
+        releaseGroupDecoder(dropCandidate)
+        configureGroupDecoder(addCandidate, csd, requestKeyframeAfter = true)
+        if (groupDecoders.containsKey(addCandidate)) {
+            tileSwapAtMs[addCandidate] = now
+            Log.d(
+                "OFFTRACE",
+                "SCALE: tile swap out=${MeshFrame.hex(dropCandidate)} in=${MeshFrame.hex(addCandidate)} reason=budget"
+            )
+        }
+    }
+
+    private fun resetTileBudgetState() {
+        lastSpokeAtMs.clear()
+        joinSequence.clear()
+        joinSequenceCounter.set(0)
+        pinnedTilePeer = null
+        tileSwapAtMs.clear()
+        lastTileBudgetEvalMs = 0L
+        if (tileBudgetExcluded.isNotEmpty()) {
+            val cleared = tileBudgetExcluded.toList()
+            tileBudgetExcluded.clear()
+            cleared.forEach { id -> mainHandler.post { onGroupTileBudgetChanged?.invoke(id, false) } }
+        }
+    }
+
     // ── PHASE 3C: multi-tile group video receive (per-sender decoder) ──────────
     // Same MediaCodec usage as the 1:1 decoder above, just keyed by srcId instead
     // of living in a single field — one instance per remote camera-on participant,
@@ -3644,47 +6766,175 @@ class OfflineMediaTransport(
             logW("OFFTRACE: MEDIA: no tile surface yet for ${MeshFrame.hex(srcId)} — dropping csd")
             return
         }
-        try {
-            val fmt = MediaFormat.createVideoFormat("video/avc", WIDTH, HEIGHT).apply {
-                setByteBuffer("csd-0", ByteBuffer.wrap(csd))
+        // B1: holds the per-srcId lock for the codec create/configure/start
+        // work only — [configured] tracks success so the keyframe request (a
+        // socket write) can be issued AFTER the lock is released, never under it.
+        var configured = false
+        synchronized(groupDecoderLock(srcId)) {
+            try {
+                val fmt = MediaFormat.createVideoFormat("video/avc", WIDTH, HEIGHT).apply {
+                    setByteBuffer("csd-0", ByteBuffer.wrap(csd))
+                }
+                val dec = MediaCodec.createDecoderByType("video/avc")
+                dec.configure(fmt, surface, null, 0)
+                dec.start()
+                groupDecoders[srcId] = dec
+                // FIX 3: a freshly (re)configured decoder is healthy again.
+                groupDecoderBroken.remove(srcId)
+                // PHASE 8 STEP 2: every configure success is a recovery point,
+                // whether this is the first-ever configure, FIX 2's surface-change
+                // rebuild, or an automatic retry — see markGroupPeerRecovered.
+                markGroupPeerRecovered(srcId)
+                log("MEDIA: group tile decoder configured for ${MeshFrame.hex(srcId)} (csd ${csd.size} bytes)")
+                configured = true
+            } catch (e: Exception) {
+                if (running.get()) logE("OFFTRACE: MEDIA: group decoder configure for ${MeshFrame.hex(srcId)}: ${e.message}")
+                // PHASE 8 STEP 2: fault isolation — this srcId's tile goes
+                // degraded; nothing else about the call is touched (not
+                // groupCall.participants, not any other peer's state).
+                markGroupPeerDegraded(srcId, "configure_failed")
             }
-            val dec = MediaCodec.createDecoderByType("video/avc")
-            dec.configure(fmt, surface, null, 0)
-            dec.start()
-            groupDecoders[srcId] = dec
-            log("MEDIA: group tile decoder configured for ${MeshFrame.hex(srcId)} (csd ${csd.size} bytes)")
-            if (requestKeyframeAfter) {
-                writeFrame(srcId, TYPE_KEYFRAME_REQUEST, ByteArray(0))
-                Log.d("OFFTRACE", "MEDIA: keyframe requested after csd retry for ${MeshFrame.hex(srcId)}")
-            }
-        } catch (e: Exception) {
-            if (running.get()) logE("OFFTRACE: MEDIA: group decoder configure for ${MeshFrame.hex(srcId)}: ${e.message}")
+        }
+        if (configured && requestKeyframeAfter) {
+            writeFrame(srcId, TYPE_KEYFRAME_REQUEST, ByteArray(0))
+            Log.d("OFFTRACE", "MEDIA: keyframe requested after csd retry for ${MeshFrame.hex(srcId)}")
         }
     }
 
+    /** FIX 3: [srcId] is skipped entirely (no MediaCodec call at all) once its
+     *  decoder is known-broken — a decoder whose Surface was destroyed out
+     *  from under it (see setGroupTileSurface's FIX 2 rebuild, which is what
+     *  actually recovers it) throws on EVERY subsequent call at 30fps, which
+     *  used to mean one identical exception+log line per frame; this instead
+     *  throttles to at most one drop notice per srcId per second. */
     private fun feedGroupDecoder(srcId: Long, data: ByteArray) {
-        val dec = groupDecoders[srcId] ?: return
-        try {
-            val idx = dec.dequeueInputBuffer(10_000L)
-            if (idx >= 0) {
-                val buf = dec.getInputBuffer(idx)!!
-                buf.clear()
-                buf.put(data)
-                dec.queueInputBuffer(idx, 0, data.size, System.nanoTime() / 1000, 0)
-            }
-            val info = MediaCodec.BufferInfo()
-            while (true) {
-                val out = dec.dequeueOutputBuffer(info, 0)
-                when (out) {
-                    MediaCodec.INFO_TRY_AGAIN_LATER -> break
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> handleGroupOutputFormatChanged(srcId, dec.outputFormat)
-                    MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> { /* deprecated, no-op */ }
-                    else -> dec.releaseOutputBuffer(out, true)
-                }
-            }
-        } catch (e: Exception) {
-            if (running.get()) logE("OFFTRACE: MEDIA: feedGroupDecoder ${MeshFrame.hex(srcId)}: ${e.message}")
+        if (srcId in groupDecoderBroken) {
+            logDroppedGroupFrame(srcId)
+            return
         }
+        // B1: same per-srcId lock configureGroupDecoder/releaseGroupDecoder
+        // hold — this runs on srcId's own MediaReadLoop-$idx thread at up to
+        // 30fps, so this lock is on the hot path; it guards only the
+        // MediaCodec calls below, no socket I/O.
+        synchronized(groupDecoderLock(srcId)) {
+            val dec = groupDecoders[srcId] ?: return
+            try {
+                val idx = dec.dequeueInputBuffer(10_000L)
+                if (idx >= 0) {
+                    val buf = dec.getInputBuffer(idx)!!
+                    buf.clear()
+                    buf.put(data)
+                    dec.queueInputBuffer(idx, 0, data.size, System.nanoTime() / 1000, 0)
+                }
+                val info = MediaCodec.BufferInfo()
+                while (true) {
+                    val out = dec.dequeueOutputBuffer(info, 0)
+                    when (out) {
+                        MediaCodec.INFO_TRY_AGAIN_LATER -> break
+                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> handleGroupOutputFormatChanged(srcId, dec.outputFormat)
+                        MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> { /* deprecated, no-op */ }
+                        else -> dec.releaseOutputBuffer(out, true)
+                    }
+                }
+            } catch (e: Exception) {
+                // FIX 3: mark broken so every subsequent frame this second (and
+                // until a rebuild replaces this decoder) short-circuits above
+                // instead of re-entering a MediaCodec that will just throw again.
+                groupDecoderBroken.add(srcId)
+                if (running.get()) logE("OFFTRACE: MEDIA: feedGroupDecoder ${MeshFrame.hex(srcId)}: ${e.message}")
+                logDroppedGroupFrame(srcId)
+                // PHASE 8 STEP 2: fault isolation — see configureGroupDecoder's
+                // identical call; automatic recovery (retryDegradedGroupPeers)
+                // will attempt to rebuild this decoder every 10s.
+                markGroupPeerDegraded(srcId, "feed_failed")
+            }
+        }
+    }
+
+    // ── PHASE 8 STEP 2: fault isolation / automatic recovery ────────────────
+
+    /** Marks [srcId]'s tile video degraded — fires [onGroupTileDegraded] (main
+     *  thread) only on the empty->non-empty transition, so a repeatedly
+     *  failing feed doesn't spam the UI callback. Never touches
+     *  groupCall.participants: a degraded peer is still fully in the call. */
+    private fun markGroupPeerDegraded(srcId: Long, reason: String) {
+        val health = groupPeerHealth.getOrPut(srcId) { PeerVideoHealth() }
+        health.attempts++
+        val firstTime = groupPeerDegraded.add(srcId)
+        Log.d("OFFTRACE", "SCALE: peer ${MeshFrame.hex(srcId)} DEGRADED reason=$reason attempt=${health.attempts}")
+        if (firstTime) mainHandler.post { onGroupTileDegraded?.invoke(srcId, true) }
+    }
+
+    /** Clears degraded state and fires [onGroupTileDegraded] with recovered=true
+     *  — called from every successful [configureGroupDecoder], whether that's
+     *  the first-ever configure, a surface-change rebuild, or an automatic retry. */
+    private fun markGroupPeerRecovered(srcId: Long) {
+        if (groupPeerDegraded.remove(srcId)) {
+            groupPeerHealth.remove(srcId)
+            Log.d("OFFTRACE", "SCALE: peer ${MeshFrame.hex(srcId)} recovered")
+            mainHandler.post { onGroupTileDegraded?.invoke(srcId, false) }
+        } else {
+            groupPeerHealth.remove(srcId)
+        }
+    }
+
+    /** Silently drops any degraded/health bookkeeping for [srcId] — called from
+     *  [releaseGroupDecoder] (camera-off OR genuine departure), where the
+     *  decoder going away is INTENTIONAL, not a recovery — no log, no UI
+     *  callback (the Activity already handles cam-off/departure through
+     *  onGroupCallCamState/onGroupCallParticipants). */
+    private fun clearGroupPeerHealth(srcId: Long) {
+        groupPeerDegraded.remove(srcId)
+        groupPeerHealth.remove(srcId)
+    }
+
+    private fun scheduleGroupPeerRetries() {
+        if (degradedRetryRunnable != null) return
+        val r = object : Runnable {
+            override fun run() {
+                retryDegradedGroupPeers()
+                mainHandler.postDelayed(this, DEGRADED_RETRY_INTERVAL_MS)
+            }
+        }
+        degradedRetryRunnable = r
+        mainHandler.postDelayed(r, DEGRADED_RETRY_INTERVAL_MS)
+    }
+
+    private fun stopGroupPeerRetries() {
+        degradedRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        degradedRetryRunnable = null
+    }
+
+    /** Automatic recovery: retries a degraded peer's decoder once every 10s,
+     *  up to DEGRADED_MAX_RETRY_ATTEMPTS total, using the persistent csd cache
+     *  (see groupCsdCache's doc) and whatever Surface is currently registered
+     *  for them. Past the attempt cap, this simply stops retrying — the peer
+     *  stays audio-only permanently (the attempt=5 DEGRADED log line already
+     *  on record is the "leave it audio-only and log it" evidence; nothing
+     *  else fires). Reuses configureGroupDecoder exactly, so success/failure
+     *  bookkeeping (markGroupPeerRecovered/Degraded) is identical to every
+     *  other configure call site. */
+    private fun retryDegradedGroupPeers() {
+        if (groupPeerDegraded.isEmpty()) return
+        val now = System.currentTimeMillis()
+        groupPeerDegraded.toList().forEach { srcId ->
+            val health = groupPeerHealth[srcId] ?: return@forEach
+            if (health.attempts >= DEGRADED_MAX_RETRY_ATTEMPTS) return@forEach
+            if (now - health.lastRetryAtMs < DEGRADED_RETRY_INTERVAL_MS) return@forEach
+            val csd = groupCsdCache[srcId] ?: return@forEach
+            if (groupTileSurfaces[srcId]?.isValid != true) return@forEach
+            health.lastRetryAtMs = now
+            Log.d("OFFTRACE", "SCALE: retrying degraded peer ${MeshFrame.hex(srcId)} attempt=${health.attempts + 1}")
+            configureGroupDecoder(srcId, csd, requestKeyframeAfter = true)
+        }
+    }
+
+    private fun logDroppedGroupFrame(srcId: Long) {
+        val now = System.currentTimeMillis()
+        val last = groupDecoderDropLogAtMs[srcId] ?: 0L
+        if (now - last < 1_000L) return
+        groupDecoderDropLogAtMs[srcId] = now
+        Log.d("OFFTRACE", "MEDIA: dropping frame for ${MeshFrame.hex(srcId)} — decoder not ready")
     }
 
     private fun handleGroupOutputFormatChanged(srcId: Long, format: MediaFormat) {
@@ -3704,15 +6954,39 @@ class OfflineMediaTransport(
         }
     }
 
+    /** Frees this srcId's decoder — called both when they genuinely leave the
+     *  call AND on an ordinary camera-off (still IN the call, see
+     *  [applyCamState]). FIX 1: deliberately does NOT touch [groupCsdCache]
+     *  here — only an actual departure clears that (see the field's doc) — so
+     *  a decoder released here can still be correctly rebuilt later via
+     *  [setGroupTileSurface] if their camera comes back on and their Surface
+     *  happens to cycle before a fresh TYPE_CONFIG arrives. */
     private fun releaseGroupDecoder(srcId: Long) {
-        groupDecoders.remove(srcId)?.let { try { it.stop(); it.release() } catch (_: Exception) {} }
+        // B1: same per-srcId lock feedGroupDecoder/configureGroupDecoder
+        // hold — without it, a release racing a feed on the SAME decoder
+        // object is a use-after-release on a MediaCodec, which is not
+        // thread-safe and does not fail cleanly.
+        synchronized(groupDecoderLock(srcId)) {
+            groupDecoders.remove(srcId)?.let { try { it.stop(); it.release() } catch (_: Exception) {} }
+        }
         groupPendingCsd.remove(srcId)
         groupDecoderReady.remove(srcId)
         groupVideoFrameCountRecv.remove(srcId)
+        // FIX 3: a released decoder is no longer "broken", it's just gone —
+        // don't let a stale broken-flag confuse a later fresh configure.
+        groupDecoderBroken.remove(srcId)
+        groupDecoderDropLogAtMs.remove(srcId)
+        // PHASE 8 STEP 2: silent — cam-off/departure is intentional, not a
+        // recovery; see clearGroupPeerHealth's doc.
+        clearGroupPeerHealth(srcId)
     }
 
     private fun releaseAllGroupDecoders() {
         groupDecoders.keys.toList().forEach { releaseGroupDecoder(it) }
+        // FIX 1: the whole group call is ending here (see call sites) — every
+        // participant is "leaving" at once, so the persistent csd cache goes too.
+        groupCsdCache.clear()
+        groupDecoderLocks.clear()
     }
 
     private fun feedAudioTrackPcm(data: ByteArray, sampleRate: Int, channelConfig: Int) {
@@ -3754,7 +7028,7 @@ class OfflineMediaTransport(
                     audioDecoder = null
                 }
             }
-        }, "MediaOpusDecode")
+        }, "MediaOpusDecode").guarded()
         opusDecodeThread = t
         t.start()
     }
@@ -3765,6 +7039,10 @@ class OfflineMediaTransport(
             dec = configureOpusAudioDecoder() ?: return
             audioDecoder = dec
         }
+        // B2: this whole function's body is codec I/O on opusDecodeThread —
+        // releaseAudio() gates on this flag before calling audioDecoder.stop()/
+        // release() from another thread (see waitForCodecFree).
+        opusDecodeInsideCodec = true
         try {
             val inIdx = dec.dequeueInputBuffer(10_000L)
             if (inIdx >= 0) {
@@ -3797,6 +7075,8 @@ class OfflineMediaTransport(
             }
         } catch (e: Exception) {
             if (running.get()) reportError("opus decode: ${e.message}")
+        } finally {
+            opusDecodeInsideCodec = false
         }
     }
 
@@ -3961,6 +7241,320 @@ class OfflineMediaTransport(
         groupRemoteAudioCodec.remove(srcId)
         groupLatestPcm.remove(srcId)
         groupLatestPcmMs.remove(srcId)
+    }
+
+    // ── PHASE 8 STEP 3: GO-side audio mixing (>= 4 participants only) ──────────
+    // Below GO_MIX_PARTICIPANT_THRESHOLD, none of this runs — the existing
+    // forward-and-mix-locally path above (audioDst/dispatchLocal's TYPE_AUDIO
+    // branch/mixAndPlayGroupAudio) is completely unchanged and untouched.
+
+    /** Fired on the main thread with the current GO-mix speaker set (empty
+     *  when GO-mixing isn't active) — a SET (up to 3), unlike
+     *  [onGroupCallSpeaker]'s single debounced highlight leader, so the UI
+     *  can show a "speaking" indicator for anyone currently being mixed in. */
+    var onGoMixSpeakersChanged: ((List<Long>) -> Unit)? = null
+
+    private fun startGoMixTicker() {
+        if (goMixThread != null) return
+        val ht = HandlerThread("GoAudioMix").also { it.guarded().start() }
+        goMixThread = ht
+        val handler = Handler(ht.looper)
+        goMixHandler = handler
+        val r = object : Runnable {
+            override fun run() {
+                try { tickGoMix() } catch (e: Exception) { logE("OFFTRACE: MIX-GO: tick failed: ${e.message}") }
+                handler.postDelayed(this, GO_MIX_TICK_MS)
+            }
+        }
+        goMixRunnable = r
+        handler.postDelayed(r, GO_MIX_TICK_MS)
+    }
+
+    private fun stopGoMixTicker() {
+        goMixRunnable?.let { goMixHandler?.removeCallbacks(it) }
+        goMixRunnable = null
+        goMixHandler = null
+        goMixThread?.quitSafely()
+        goMixThread = null
+        goMixEncoder?.let { try { it.stop(); it.release() } catch (_: Exception) {} }
+        goMixEncoder = null
+        rawMixSpeakers = emptyList()
+        pendingMixSpeakers = emptyList()
+        pendingMixSpeakersSinceMs = 0L
+        // OCP PHASE 2.1: teardown — same as a down-crossing, raw forwarding
+        // must never stay suppressed against a mixer that no longer runs.
+        goMixLive.set(false)
+        if (committedMixSpeakers.isNotEmpty()) {
+            committedMixSpeakers = emptyList()
+            mainHandler.post { onGoMixSpeakersChanged?.invoke(emptyList()) }
+        }
+    }
+
+    /** PHASE 8 TRACK C4: runs entirely on the dedicated goMixHandler thread —
+     *  was GO-only, now any node with children (hasChildren()) independently
+     *  runs this for its OWN subtree, using its OWN groupCallMixer/
+     *  committedMixSpeakers/groupLatestPcm (all per-transport-instance fields
+     *  — i.e. already naturally scoped to "this device's own view" with zero
+     *  new state needed). routingTable.all() here means exactly what it
+     *  means everywhere else in this class post-C3 — every direct neighbor,
+     *  parent included — so the distribution loop below explicitly excludes
+     *  parentNodeId: a relay's mixed-down variants are for ITS CHILDREN only;
+     *  its own contribution reaches its parent via the UNCHANGED raw-audio
+     *  broadcast path (see forwardBroadcast's directional suppression — a
+     *  relay always still relays raw TYPE_AUDIO upward even while it stops
+     *  relaying it sideways/downward), so the GO's OWN mixing continues to
+     *  see every participant's real audio at any tree depth without this
+     *  function needing to synthesize or forward a second, pre-mixed
+     *  contribution upward — avoiding a second wire format entirely. No-ops
+     *  below the participant threshold OR on a plain leaf (hasChildren()
+     *  false) — the below-4 path, and the entire 2/3-device path, are never
+     *  touched by this function running in the background. */
+    private fun tickGoMix() {
+        val gc = groupCall
+        val eligible = gc != null && hasChildren() && gc.participants.size >= GO_MIX_PARTICIPANT_THRESHOLD
+        if (!eligible) {
+            // OCP PHASE 2.3: down-crossing (or never-was-eligible, a no-op
+            // compareAndSet). Flip live OFF first — isGoMixReplacingBroadcastAudio
+            // is read on the read-loop thread and will see raw forwarding
+            // re-enabled as early as this write is visible. Raw relay was
+            // never actually stopped AT THE SENDER (every device always
+            // broadcasts its own raw TYPE_AUDIO — see audioDst), so it
+            // resumes on literally the next frame with no synthetic delay.
+            if (goMixLive.compareAndSet(true, false)) {
+                logMixCrossing(gc, live = false, gapMs = 0L)
+            }
+            if (committedMixSpeakers.isNotEmpty()) {
+                committedMixSpeakers = emptyList()
+                mainHandler.post { onGoMixSpeakersChanged?.invoke(emptyList()) }
+            }
+            return
+        }
+        val now = System.currentTimeMillis()
+        // OCP PHASE 2.2: seed the speaker set immediately on crossing —
+        // never wait out MIX_SPEAKER_HOLD_MS's hysteresis for the very
+        // FIRST commit (that hysteresis, via evaluateMixSpeakerHysteresis
+        // below, still applies to every CHANGE after this initial seed).
+        if (committedMixSpeakers.isEmpty()) {
+            val seed = seedMixSpeakers(rawMixSpeakers, gc!!.participants, localNodeId, joinSequence)
+            if (seed.isNotEmpty()) {
+                committedMixSpeakers = seed
+                pendingMixSpeakers = seed
+                pendingMixSpeakersSinceMs = now
+                mainHandler.post { onGoMixSpeakersChanged?.invoke(committedMixSpeakers) }
+            }
+        }
+        if (now - lastMixSpeakerEvalMs >= MIX_SPEAKER_EVAL_INTERVAL_MS) {
+            lastMixSpeakerEvalMs = now
+            evaluateMixSpeakerHysteresis(now)
+        }
+        val speakers = committedMixSpeakers
+        if (speakers.isEmpty()) return
+        // OCP PHASE 0.3: snapshot BEFORE this tick sends anything — if this
+        // tick is the one that flips goMixLive true, gapMs is the silence
+        // window between the last audio that actually flowed and this
+        // tick's delivery (see lastAudioDeliveredAtMs's doc).
+        val gapBaseline = lastAudioDeliveredAtMs
+
+        val fresh = speakers.mapNotNull { id ->
+            if (now - (groupLatestPcmMs[id] ?: 0L) >= GROUP_AUDIO_STALE_MS) null
+            else groupLatestPcm[id]?.let { id to it }
+        }
+        if (fresh.isEmpty()) return
+        val speakerIds = fresh.map { it.first }
+
+        var mixesBuilt = 0
+        var clientsServed = 0
+
+        // Variant 1: the full top-3 mix — everyone NOT currently one of the
+        // speakers gets this (including this device's own playback, if the
+        // GO itself isn't currently speaking).
+        val fullMixPcm = mixGroupPcm(fresh.map { it.second })
+        val fullMixOpus = encodeGoMixOpus(fullMixPcm)
+        if (fullMixOpus != null) {
+            mixesBuilt++
+            val fullPayload = buildGoMixPayload(speakerIds, fullMixOpus)
+            // PHASE 8 TRACK C4: exclude parentNodeId (null on the GO, so a
+            // pure no-op there) — a relay's mixed variant is for its own
+            // children only; the parent gets this node's contribution via
+            // the unchanged raw-audio path, not this synthesized payload.
+            routingTable.all().forEach { link ->
+                if (link.nodeId != parentNodeId && link.nodeId !in speakers) {
+                    writeFrame(link.nodeId, TYPE_AUDIO, fullPayload)
+                    clientsServed++
+                }
+            }
+            if (localNodeId !in speakers) {
+                feedAudioTrackPcm(fullMixPcm, groupOpusOutputSampleRate, channelCountToOutConfig(groupOpusOutputChannelCount))
+            }
+        }
+
+        // Variants 2-4: for EACH current speaker, the mix of everyone ELSE
+        // currently speaking (excluding their own voice) — at most 3 more
+        // distinct mixes, so at most 4 total regardless of N.
+        fresh.forEach { (excludeId, _) ->
+            val others = fresh.filter { it.first != excludeId }
+            val variantPcm = if (others.isEmpty()) ByteArray(AUDIO_CHUNK_BYTES) else mixGroupPcm(others.map { it.second })
+            val variantOpus = encodeGoMixOpus(variantPcm) ?: return@forEach
+            mixesBuilt++
+            if (excludeId == localNodeId) {
+                feedAudioTrackPcm(variantPcm, groupOpusOutputSampleRate, channelCountToOutConfig(groupOpusOutputChannelCount))
+            } else {
+                val variantPayload = buildGoMixPayload(others.map { it.first }, variantOpus)
+                writeFrame(excludeId, TYPE_AUDIO, variantPayload)
+                clientsServed++
+            }
+        }
+
+        // OCP PHASE 2.1/0.3: something was actually delivered this tick —
+        // update the liveness timestamp, and if this is the tick that
+        // crosses live=false->true, fire the crossing log with the
+        // measured gap. compareAndSet makes the log fire exactly once per
+        // episode, not on every subsequent tick.
+        if (mixesBuilt > 0) {
+            lastAudioDeliveredAtMs = now
+            if (goMixLive.compareAndSet(false, true)) {
+                logMixCrossing(gc, live = true, gapMs = (now - gapBaseline).coerceAtLeast(0L))
+            }
+        }
+
+        if (now - lastGoMixLogMs >= GROUP_MIX_LOG_INTERVAL_MS) {
+            lastGoMixLogMs = now
+            Log.d(
+                "OFFTRACE",
+                "MIX-GO: speakers=[${speakerIds.joinToString(",") { MeshFrame.hex(it) }}] mixes=$mixesBuilt clients=$clientsServed"
+            )
+            // PHASE 8 TRACK C4: required log format — subtree size = this
+            // node's own direct children (routingTable minus its parent),
+            // i.e. exactly who this tick's mixed variants were built for.
+            val subtreeSize = routingTable.all().count { it.nodeId != parentNodeId }
+            Log.d(
+                "OFFTRACE",
+                "MIX: subtree=$subtreeSize speakers=[${speakerIds.joinToString(",") { MeshFrame.hex(it) }}] passed up"
+            )
+        }
+    }
+
+    /** OCP PHASE 0.3: fires exactly once per threshold crossing (see the
+     *  compareAndSet call sites in tickGoMix) — a SEPARATE, one-shot log
+     *  from the continuously-repeating MIX-GO/"MIX: subtree=..." diagnostic
+     *  above. gapMs measures elapsed time since audio last actually flowed
+     *  (see lastAudioDeliveredAtMs) and should stay small — bounded by
+     *  GO_MIX_TICK_MS/one audio chunk interval, tens of ms — through every
+     *  crossing; a multi-hundred-ms value means the crossfade leaked and
+     *  raw relay was briefly suppressed with nothing live to replace it. */
+    private fun logMixCrossing(gc: GroupCallState?, live: Boolean, gapMs: Long) {
+        val n = gc?.participants?.size ?: 0
+        val ids = committedMixSpeakers.joinToString(",") { MeshFrame.hex(it) }
+        Log.d("OFFTRACE", "MIX: n=$n goMixLive=$live speakers=[$ids] gapMs=$gapMs")
+    }
+
+    /** Re-evaluates the COMMITTED speaker set from [rawMixSpeakers] (fed by
+     *  GroupCallMixer's VAD ranking) with hysteresis: a candidate set only
+     *  becomes committed once it has been the raw ranking continuously for
+     *  MIX_SPEAKER_HOLD_MS. Flapping here means creating/destroying Opus
+     *  decode work for whoever enters/leaves the set, unlike the video
+     *  active-speaker highlight's debounce (onRawActiveSpeakersChanged),
+     *  which only moves a UI border. */
+    private fun evaluateMixSpeakerHysteresis(now: Long) {
+        val raw = rawMixSpeakers
+        if (raw.toSet() != pendingMixSpeakers.toSet()) {
+            pendingMixSpeakers = raw
+            pendingMixSpeakersSinceMs = now
+        }
+        if (raw.toSet() == committedMixSpeakers.toSet()) return
+        if (now - pendingMixSpeakersSinceMs < MIX_SPEAKER_HOLD_MS) return
+        committedMixSpeakers = pendingMixSpeakers
+        mainHandler.post { onGoMixSpeakersChanged?.invoke(committedMixSpeakers) }
+    }
+
+    private fun ensureGoMixEncoder(): MediaCodec? {
+        goMixEncoder?.let { return it }
+        val enc = createOpusEncoderOrNull() ?: return null
+        goMixEncoder = enc
+        return enc
+    }
+
+    /** Synchronous encode+drain, called sequentially up to 4x per tick (once
+     *  per distinct mix variant) from [tickGoMix] — always on the dedicated
+     *  goMixHandler thread, never read/write threads. Reuses ONE persistent
+     *  encoder instance across every call rather than recreating one per
+     *  mix; on any exception the encoder is torn down and rebuilt on the
+     *  NEXT tick rather than risking feeding a codec left in a bad state. */
+    private fun encodeGoMixOpus(pcm: ByteArray): ByteArray? {
+        val enc = ensureGoMixEncoder() ?: return null
+        return try {
+            val inIdx = enc.dequeueInputBuffer(5_000L)
+            if (inIdx >= 0) {
+                val buf = enc.getInputBuffer(inIdx)!!
+                buf.clear()
+                buf.put(pcm)
+                enc.queueInputBuffer(inIdx, 0, pcm.size, System.nanoTime() / 1000, 0)
+            }
+            val chunks = mutableListOf<ByteArray>()
+            val info = MediaCodec.BufferInfo()
+            while (true) {
+                val outIdx = enc.dequeueOutputBuffer(info, 0)
+                if (outIdx < 0) break
+                if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 && info.size > 0) {
+                    val outBuf = enc.getOutputBuffer(outIdx)
+                    if (outBuf != null) {
+                        val bytes = ByteArray(info.size)
+                        outBuf.position(info.offset)
+                        outBuf.limit(info.offset + info.size)
+                        outBuf.get(bytes)
+                        chunks.add(bytes)
+                    }
+                }
+                enc.releaseOutputBuffer(outIdx, false)
+            }
+            if (chunks.isEmpty()) null else combineByteArrays(chunks)
+        } catch (e: Exception) {
+            logE("OFFTRACE: MIX-GO: encode failed: ${e.message}")
+            try { enc.stop(); enc.release() } catch (_: Exception) {}
+            goMixEncoder = null
+            null
+        }
+    }
+
+    /** Wire shape for a GO-mixed frame: [1B speakerCount][speakerCount * 8B
+     *  speakerId][opus bytes]. Sent as an ordinary TYPE_AUDIO frame — no new
+     *  frame type — but UNICAST (dst = one specific recipient) rather than
+     *  BROADCAST, which is what lets the receiver ([dispatchLocal]'s
+     *  TYPE_AUDIO branch) tell a GO-mixed frame apart from an ordinary
+     *  per-sender broadcast one with zero ambiguity: only this new code path
+     *  ever sends TYPE_AUDIO unicast, so "unicast, from my uplink, to me" is
+     *  a fully reliable, collision-free signal (see decodeAndPlayGoMixedAudio). */
+    private fun buildGoMixPayload(speakerIds: List<Long>, opus: ByteArray): ByteArray {
+        val buf = ByteBuffer.allocate(1 + speakerIds.size * 8 + opus.size)
+        buf.put(speakerIds.size.coerceIn(0, 255).toByte())
+        speakerIds.forEach { buf.putLong(it) }
+        buf.put(opus)
+        return buf.array()
+    }
+
+    /** Client-only receive path for a GO-mixed frame — decodes via a SINGLE
+     *  persistent decoder (there is exactly one incoming mixed stream now,
+     *  never one per sender), plays it directly, and reports the embedded
+     *  speaker ids for the UI. Runs on the read thread, same as every other
+     *  dispatchLocal branch — this is one decode per received frame, no
+     *  different in cost from the ordinary per-1:1-call decode path it
+     *  parallels; the EXPENSIVE work (mixing N-way, encoding up to 4
+     *  variants) already happened once on the GO's own dedicated thread. */
+    private fun decodeAndPlayGoMixedAudio(payload: ByteArray) {
+        if (payload.isEmpty()) return
+        val count = payload[0].toInt() and 0xFF
+        val headerLen = 1 + count * 8
+        if (payload.size < headerLen) {
+            logW("OFFTRACE: MIX-GO: malformed mixed-audio payload len=${payload.size}")
+            return
+        }
+        val speakerIds = ArrayList<Long>(count)
+        val buf = ByteBuffer.wrap(payload, 1, count * 8)
+        repeat(count) { speakerIds.add(buf.long) }
+        val opus = payload.copyOfRange(headerLen, payload.size)
+        val pcm = decodeGroupAudio(GO_MIX_DECODER_KEY, opus) ?: return
+        feedAudioTrackPcm(pcm, groupOpusOutputSampleRate, channelCountToOutConfig(groupOpusOutputChannelCount))
+        mainHandler.post { onGoMixSpeakersChanged?.invoke(speakerIds) }
     }
 
     /** Releases every per-sender decoder AND clears the codec/PCM bookkeeping maps
@@ -4132,7 +7726,17 @@ class OfflineMediaTransport(
         threads.forEach { t ->
             t.interrupt()
             try { t.join(CALL_THREAD_JOIN_MS) } catch (_: InterruptedException) {}
-            if (t.isAlive) timedOut++ else joined++
+            if (t.isAlive) {
+                timedOut++
+                // B2: named, not just counted — join() timing out on a thread
+                // parked inside a native AudioRecord.read()/MediaCodec call
+                // (interrupt() doesn't reach those) is exactly the scenario
+                // [waitForCodecFree] exists to still gate the actual release
+                // on, but it's worth surfacing which thread it was.
+                logW("OFFTRACE: MEDIA: call thread '${t.name}' still alive after ${CALL_THREAD_JOIN_MS}ms join")
+            } else {
+                joined++
+            }
         }
         audioSendThread = null
         opusEncodeThread = null
@@ -4141,6 +7745,32 @@ class OfflineMediaTransport(
         opusEncodeQueue.clear()
         opusDecodeQueue.clear()
         log("OFFTRACE: MEDIA: call threads stopped ($joined joined, $timedOut timed out)")
+    }
+
+    /** PART B / B2: waits for a worker thread's own "I am inside a native
+     *  codec/AudioRecord call right now" flag to clear before the caller is
+     *  allowed to actually stop()/release() that codec/AudioRecord — a join()
+     *  timeout in [stopCallThreads] is NOT proof the thread is safely out of
+     *  a native call (Thread.interrupt() does not unblock AudioRecord.read()
+     *  or MediaCodec.dequeueOutputBuffer()), so release gates on this instead
+     *  of trusting join() alone. Logs [threadName] if the flag never clears
+     *  within [CODEC_RELEASE_WAIT_MS] — release proceeds regardless at that
+     *  point (an unbounded wait would hang teardown forever), but the log
+     *  makes that rare race visible instead of a silent native crash. */
+    private fun waitForCodecFree(threadName: String, insideCodec: () -> Boolean) {
+        if (!insideCodec()) return
+        val deadline = System.currentTimeMillis() + CODEC_RELEASE_WAIT_MS
+        while (insideCodec() && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(10L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        if (insideCodec()) {
+            logW("OFFTRACE: MEDIA: '$threadName' still inside its codec after ${CODEC_RELEASE_WAIT_MS}ms — releasing anyway")
+        }
     }
 
     private fun closeSockets() {
@@ -4173,12 +7803,36 @@ class OfflineMediaTransport(
         // field here (rather than after stop/release) also means the drain
         // loop's own `encoder ?: break` sees null as early as possible.
         encoderRunning = false
+        // B2: gate on the drain thread's own flag, not just encoderRunning —
+        // it only clears that flag from INSIDE its dequeueOutputBuffer call's
+        // finally, so this waits for it to actually finish that call.
+        waitForCodecFree("MediaEncoderDrain") { encoderDrainInsideCodec }
         val enc = encoder
         encoder = null
         try { enc?.stop() } catch (_: Exception) {}
         try { enc?.release() } catch (_: Exception) {}
         try { encoderInputSurface?.release() } catch (_: Exception) {}
         encoderInputSurface = null
+        // OCP PHASE 5.1: the low encoder is always lifecycle-paired with the
+        // high one (never outlives it) — folded in here rather than added
+        // to all 6 of this function's call sites individually, so every
+        // existing teardown path picks it up automatically.
+        releaseLowEncoder()
+    }
+
+    /** OCP PHASE 5.1: mirrors [releaseEncoder] exactly, for the low-layer
+     *  simulcast encoder. Safe to call whether or not the low encoder was
+     *  ever actually running (every field is nullable/flag-guarded). */
+    private fun releaseLowEncoder() {
+        lowEncoderRunning = false
+        // B2: see releaseEncoder's identical gate.
+        waitForCodecFree("MediaLowEncoderDrain") { lowEncoderDrainInsideCodec }
+        val enc = lowEncoder
+        lowEncoder = null
+        try { enc?.stop() } catch (_: Exception) {}
+        try { enc?.release() } catch (_: Exception) {}
+        try { lowEncoderInputSurface?.release() } catch (_: Exception) {}
+        lowEncoderInputSurface = null
     }
 
     private fun releaseDecoder() {
@@ -4188,15 +7842,23 @@ class OfflineMediaTransport(
     }
 
     private fun releaseAudio() {
+        // B2: audioSendThread (rec.read), opusEncodeThread (audioEncoder) and
+        // opusDecodeThread (audioDecoder) each self-release their OWN codec
+        // once their loop notices callActive==false — these calls are the
+        // belt-and-suspenders path for whatever a stopCallThreads() join()
+        // timeout left behind, so each gates on that thread's own flag first.
+        waitForCodecFree("MediaAudioSend") { audioSendInsideRecord }
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
         try { audioTrack?.stop() } catch (_: Exception) {}
         try { audioTrack?.release() } catch (_: Exception) {}
         audioTrack = null
+        waitForCodecFree("MediaOpusEncode") { opusEncodeInsideCodec }
         try { audioEncoder?.stop() } catch (_: Exception) {}
         try { audioEncoder?.release() } catch (_: Exception) {}
         audioEncoder = null
+        waitForCodecFree("MediaOpusDecode") { opusDecodeInsideCodec }
         try { audioDecoder?.stop() } catch (_: Exception) {}
         try { audioDecoder?.release() } catch (_: Exception) {}
         audioDecoder = null
@@ -4255,6 +7917,22 @@ class OfflineMediaTransport(
 
     private fun logW(msg: String) {
         Log.w("OFFTRACE", msg)
+    }
+
+    // LOGGING cleanup (welcome, not required): these dedupe-drop/chat-recv
+    // lines were the three remaining unthrottled per-frame OFFTRACE call
+    // sites — throttled 1/sec per srcId, matching the exact pattern
+    // logIfRelayed/relayedLogAtMs already established for the relay-forward
+    // line above. A dedupe HIT is rarer than a plain relayed frame, but
+    // under a genuine retransmission storm (the scenario this whole relay-
+    // suppression phase exists for) it can still fire at frame rate.
+    private val dedupeDropLogAtMs = ConcurrentHashMap<Long, Long>()
+    private fun logPerSrcThrottled(srcId: Long, msg: () -> String) {
+        val now = System.currentTimeMillis()
+        val last = dedupeDropLogAtMs[srcId] ?: 0L
+        if (now - last < 1_000L) return
+        dedupeDropLogAtMs[srcId] = now
+        log(msg())
     }
 
     private fun logE(msg: String) {

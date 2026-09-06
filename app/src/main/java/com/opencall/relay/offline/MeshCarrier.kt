@@ -81,6 +81,14 @@ class MeshCarrier private constructor(context: Context) {
     companion object {
         const val MAX_QUEUE_SIZE = 200
         const val MAX_HOP_COUNT = 8
+        // PHASE 8 STEP 8: explicit memory ceiling, not just a message-count
+        // cap — holds regardless of participant count (this queue is a
+        // single shared instance, never scoped per-peer, so N never
+        // multiplies it) and stays meaningful even if a future change raises
+        // MAX_STORE_FWD_PAYLOAD_BYTES. At today's actual worst case (200 *
+        // ~4.1KB ~= 827KB) this never fires ahead of MAX_QUEUE_SIZE — it's a
+        // safety net, not the primary control.
+        private const val MAX_QUEUE_BYTES = 1_500_000
         private const val DEDUPE_CAPACITY = 512
         private const val DEDUPE_TTL_MS = 30 * 60 * 1000L
         private const val CARRY_DIR_NAME = "carry"
@@ -203,8 +211,13 @@ class MeshCarrier private constructor(context: Context) {
     var sendAck: ((dst: Long, payload: ByteArray) -> Unit)? = null
     /** Unwraps a delivered-to-us message back into the normal dispatch path
      *  (chat UI, SOS alert/ledger, etc.) — wired to
-     *  OfflineMediaTransport.dispatchCarriedInner. */
-    var dispatchInner: ((originId: Long, finalDstId: Long, innerType: Byte, inner: ByteArray) -> Unit)? = null
+     *  OfflineMediaTransport.dispatchCarriedInner. OFFLINE UI STEP 4: now
+     *  also passes [carrierId] (whoever physically handed us this message —
+     *  the STORE_FWD frame's own header.srcId, distinct from [originId] the
+     *  true sender) and [hopCount] (already on the wire, see class doc) —
+     *  both real, already-known-at-this-point values, not new data, just
+     *  finally threaded to whoever wants to show "carried via X, N hops". */
+    var dispatchInner: ((originId: Long, finalDstId: Long, innerType: Byte, inner: ByteArray, carrierId: Long, hopCount: Int) -> Unit)? = null
 
     init {
         ioHandler.post { loadAllFromDisk() }
@@ -284,18 +297,25 @@ class MeshCarrier private constructor(context: Context) {
         ioHandler.post { try { File(carryDir, "$msgId.json").delete() } catch (_: Exception) {} }
     }
 
+    /** PHASE 8 STEP 8: enforces BOTH the message-count cap and an explicit
+     *  memory ceiling — SOS is never a candidate for either (see the
+     *  [typeSosProtected] filter below), and both checks evict the SAME way:
+     *  oldest non-SOS first. Independent of participant count N — this is
+     *  one shared queue, never scoped per-peer, so N never multiplies it. */
     private fun evictIfOverCapacity() {
-        if (queue.size <= MAX_QUEUE_SIZE) return
+        var overCount = queue.size - MAX_QUEUE_SIZE
+        var overBytes = queue.values.sumOf { it.inner.size } - MAX_QUEUE_BYTES
+        if (overCount <= 0 && overBytes <= 0) return
         val candidates = queue.values.filter { it.innerType != typeSosProtected }.sortedBy { it.createdUnix }
-        var overBy = queue.size - MAX_QUEUE_SIZE
         for (c in candidates) {
-            if (overBy <= 0) break
+            if (overCount <= 0 && overBytes <= 0) break
             queue.remove(c.msgId)
             dirtyMsgIds.remove(c.msgId)
             val msgId = c.msgId
             ioHandler.post { try { File(carryDir, "$msgId.json").delete() } catch (_: Exception) {} }
             Log.d("OFFTRACE", "CARRY: evicted msgId=$msgId reason=capacity queue=${queue.size}")
-            overBy--
+            overCount--
+            overBytes -= c.inner.size
         }
     }
 
@@ -374,7 +394,10 @@ class MeshCarrier private constructor(context: Context) {
         }
         val forUs = env.finalDstId == MeshFrame.BROADCAST_ID || env.finalDstId == localNodeId
         if (forUs) {
-            dispatchInner?.invoke(env.originId, env.finalDstId, env.innerType, env.inner)
+            // header.srcId here is whoever physically handed us this STORE_FWD
+            // frame — the carrier, not the true originator (env.originId) —
+            // see class doc's ENVELOPE note.
+            dispatchInner?.invoke(env.originId, env.finalDstId, env.innerType, env.inner, header.srcId, env.hopCount)
             sendAck?.invoke(header.srcId, ackPayload(env.msgId))
         }
         if (env.finalDstId == MeshFrame.BROADCAST_ID) {
@@ -403,6 +426,26 @@ class MeshCarrier private constructor(context: Context) {
     }
 
     fun queueSize(): Int = queue.size
+
+    /** OFFLINE UI STEP 4: how many peers have confirmed delivery (via
+     *  TYPE_SF_ACK) OR were already in the roster when this device sent it
+     *  live (pre-seeded — see [put]'s alreadyDeliveredTo param) — the
+     *  "heard by N" figure. Null once the message has left the queue
+     *  entirely (single-recipient messages remove themselves on ack; a
+     *  BROADCAST message stays until expiry). */
+    fun deliveredCountFor(msgId: String): Int? = queue[msgId]?.deliveredTo?.size
+
+    fun hopCountFor(msgId: String): Int? = queue[msgId]?.hopCount
+
+    /** OFFLINE UI STEP 4: one line per currently-queued message — backs the
+     *  party screen's "N waiting to be carried" chip's expanded view. Real
+     *  data straight from the queue (msgId/type/hop count/age), nothing
+     *  synthesized. */
+    data class PendingSummary(val msgId: String, val innerType: Byte, val hopCount: Int, val ageSec: Long)
+    fun pendingSummaries(): List<PendingSummary> {
+        val nowSec = System.currentTimeMillis() / 1000L
+        return queue.values.map { q -> PendingSummary(q.msgId, q.innerType, q.hopCount, (nowSec - q.createdUnix).coerceAtLeast(0L)) }
+    }
 
     // ── Persistence: atomic + batched, see class doc ────────────────────────────
 

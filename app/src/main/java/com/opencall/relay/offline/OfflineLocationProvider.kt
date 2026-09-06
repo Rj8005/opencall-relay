@@ -53,7 +53,19 @@ class OfflineLocationProvider private constructor(context: Context) {
         val altitudeMeters: Double?,
         /** Wall-clock time this fix was received, NOT a GPS-provided timestamp. */
         val fixTimeMs: Long,
-        val tier: Tier
+        val tier: Tier,
+        /** PEER DIRECTION READOUT: the fix's OWN GNSS course, never derived by
+         *  differencing two positions (see MeshSosManager.buildLocationPayload,
+         *  which used to do exactly that via MeshLedger.computeHeadingAndSpeed
+         *  — kept there only for the LOST-contact dead-reckoning case, which
+         *  has no live fix to read this from). NaN (not null) whenever the
+         *  platform Location didn't report a bearing, didn't report a speed,
+         *  or speed was too low for the bearing to be meaningful (a
+         *  stationary/slow phone's GNSS course is noise, not direction) —
+         *  see [toFix]. */
+        val bearingDeg: Float,
+        /** NaN whenever the platform Location never reported a speed at all. */
+        val speedMps: Float
     )
 
     companion object {
@@ -63,6 +75,9 @@ class OfflineLocationProvider private constructor(context: Context) {
         private const val MIN_UPDATE_DISTANCE_M = 0f
         private const val GPS_LIVE_MAX_AGE_MS = 60_000L
         private const val GPS_STALE_MAX_AGE_MS = 30 * 60_000L
+        // PEER DIRECTION READOUT: below this speed, GNSS course is noise, not
+        // direction — see toFix().
+        private const val MIN_SPEED_FOR_BEARING_MPS = 0.8f
 
         @Volatile private var instance: OfflineLocationProvider? = null
 
@@ -253,14 +268,30 @@ class OfflineLocationProvider private constructor(context: Context) {
         Log.d("OFFTRACE", "GPS: passive fix acquired acc=${location.accuracy}m provider=passive")
     }
 
-    private fun toFix(location: Location): Fix = Fix(
-        latitude = location.latitude,
-        longitude = location.longitude,
-        accuracyMeters = if (location.hasAccuracy()) location.accuracy else null,
-        altitudeMeters = if (location.hasAltitude()) location.altitude else null,
-        fixTimeMs = System.currentTimeMillis(),
-        tier = Tier.NONE // placeholder — real tier is computed fresh on every getBestFix() read
-    )
+    /** PEER DIRECTION READOUT STEP 4: heading/speed read straight from the
+     *  Location object — never differenced from two fixes. A GNSS course is
+     *  only meaningful above a real walking pace; below MIN_SPEED_FOR_BEARING_MPS
+     *  the reported bearing is noise (GPS drift can point "backward" while
+     *  standing still), so it's suppressed to NaN even when hasBearing() is
+     *  true. */
+    private fun toFix(location: Location): Fix {
+        val hdg = if (location.hasBearing() && location.hasSpeed() && location.speed >= MIN_SPEED_FOR_BEARING_MPS) {
+            location.bearing
+        } else {
+            Float.NaN
+        }
+        val spd = if (location.hasSpeed()) location.speed else Float.NaN
+        return Fix(
+            latitude = location.latitude,
+            longitude = location.longitude,
+            accuracyMeters = if (location.hasAccuracy()) location.accuracy else null,
+            altitudeMeters = if (location.hasAltitude()) location.altitude else null,
+            fixTimeMs = System.currentTimeMillis(),
+            tier = Tier.NONE, // placeholder — real tier is computed fresh on every getBestFix() read
+            bearingDeg = hdg,
+            speedMps = spd
+        )
+    }
 
     /** Null whenever there's nothing to report. Never fabricates coordinates — a
      *  genuine TIER_NONE returns null, exactly like PHASE 5A's single-tier

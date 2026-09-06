@@ -8,14 +8,37 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- PART 3.1: RelayService's foregroundServiceType is now phoneCall|microphone
+         (was dataSync, which didn't describe what it actually does) —
+         phoneCall also requires holding MANAGE_OWN_CALLS, already declared
+         below. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <!-- PART 3.1: OfflineCallService's foregroundServiceType now includes
+         location — the continuous GPS feed behind the party-ring/lost-
+         contact/Group Alert beacon was running under this service's
+         foreground grant without ever declaring the type that actually
+         describes it. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- PART 4.1: REMOVED RECEIVE_BOOT_COMPLETED — no <receiver> for
+         BOOT_COMPLETED exists anywhere in this manifest and none did before
+         this pass either; the OS never delivers that broadcast to an app
+         with no registered receiver for it regardless of this declaration,
+         so it was pure dead weight (and a restricted-adjacent permission
+         reviewers ask about for no reason). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- PART 4.1: REMOVED SYSTEM_ALERT_WINDOW — its only call site
+         (MainActivity.onActivityResult's Settings.canDrawOverlays retry,
+         requestCode 2001) was already dead code before this pass — nothing
+         ever triggered that request code — and was deleted outright during
+         Part 0 of the prior restructure pass. Zero remaining references.
+         This is Google's most heavily scrutinized special permission
+         ("draw over other apps"); removing an unused declaration of it is
+         a genuine rejection-surface reduction, not just cleanup. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -24,6 +47,23 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- PHASE 5BC: SOS siren vibration pattern (SosAlarm.kt) -->
     <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- DIALER PART 1.3: runtime-requested in context (see
+         com.opencall.relay.dialer.role.DialerPermissions' own doc for the
+         Play-policy declaration READ_CALL_LOG/READ_PHONE_STATE both need).
+         READ_PHONE_STATE and CALL_PHONE are already declared above. -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="android.permission.WRITE_CALL_LOG" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+    <!-- Normal permission (install-time, never runtime-requested) — lets
+         this app's own Calls (placed via TelecomManager) surface with this
+         app's identity/UI rather than being treated as an anonymous call. -->
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <!-- DIALER PART 2.3: the incoming-call notification's full-screen
+         intent (IncomingCallNotifier) — calling apps are a documented
+         sanctioned use case for this permission. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <!-- PHASE 6 TRACK C: BLE presence + beacon broadcast (MeshBleBeacon.kt).
          Pre-API31 devices instead rely on plain BLUETOOTH/BLUETOOTH_ADMIN plus
          the already-declared ACCESS_FINE_LOCATION for BLE scan. -->
@@ -47,9 +87,30 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.OpenCallRelay">
 
+        <!-- PART 2.2: targeting API 36 means every android:screenOrientation
+             below is IGNORED on displays with smallest width >= 600dp (this
+             is the platform behavior, not something a manifest flag alone
+             can restore) — this is Google's own sanctioned, TEMPORARY
+             escape hatch (removed entirely at API 37): it restores the old
+             locked-orientation/fixed-aspect-ratio behavior on large screens
+             app-wide rather than letting the video-call grid, the in-call
+             screen, and the rest of this deliberately phone-portrait UI
+             stretch/reflow into layouts they were never designed for. This
+             is a real trade-off, not a default I picked silently — see
+             this task's own report for the reasoning and what "actually
+             adaptive" would require instead. -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY"
+            android:value="true" />
+
+        <!-- PART 1/4.2: singleTask so FLAG_ACTIVITY_REORDER_TO_FRONT (used by
+             every pillar-tab switch, see MainActivity's own class doc) reuses
+             this one instance instead of creating a duplicate or re-running
+             onCreate — the same reason OfflineCallActivity below now has it. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
@@ -57,6 +118,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".settings.SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
 
         <activity
             android:name=".DialerActivity"
@@ -72,46 +138,178 @@
             android:screenOrientation="portrait"
             android:excludeFromRecents="true" />
 
-        <activity
-            android:name=".RelayWebViewActivity"
-            android:exported="false"
-            android:configChanges="orientation|screenSize"
-            android:windowSoftInputMode="adjustResize" />
-
+        <!-- PART 4.2: singleTask added for the three-tab restructure — see
+             OfflineCallActivity's own class doc for exactly why (tab-switch
+             navigation via FLAG_ACTIVITY_REORDER_TO_FRONT, never finish(),
+             is what keeps an active mesh session alive across tab switches). -->
         <activity
             android:name=".offline.OfflineCallActivity"
-            android:exported="false"
+            android:exported="true"
+            android:launchMode="singleTask"
             android:screenOrientation="portrait"
-            android:windowSoftInputMode="adjustResize" />
+            android:windowSoftInputMode="adjustResize">
+            <!-- PART D5: registers this app as an Android share target so
+                 any file, from any app, can be sent optically — see
+                 OfflineCallActivity.handleShareSheetIntent. exported=true
+                 is required for the share sheet (a different app/process)
+                 to launch this Activity; the intent handler only ever
+                 reads the shared content:// stream via the URI permission
+                 grant ACTION_SEND itself carries, nothing broader. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
 
+        <!-- DIALER PART 1.2/3.4: the dialer's own tab-shell entry point —
+             ALSO the app's declared ACTION_DIAL default-dialer-role
+             handler (RoleManager/TelecomManager will not offer this app
+             the dialer role without an Activity declaring this). -->
+        <activity
+            android:name=".dialer.ui.DialerHostActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.DIAL" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.DIAL" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="tel" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="tel" />
+            </intent-filter>
+        </activity>
+
+        <!-- DIALER PART 1.1: shown before every system role/default-dialer
+             prompt — see DialerRoleExplainerActivity's own doc. -->
+        <activity
+            android:name=".dialer.role.DialerRoleExplainerActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- DIALER PART 2.2/2.3: this app's own in-call UI — both the
+             active-call screen and the full-screen incoming-call target
+             (IncomingCallNotifier's PendingIntent). Not exported: only ever
+             launched from within this app's own components (a PendingIntent
+             this app created still works from the notification-shade
+             process without android:exported — see IncomingCallNotifier's
+             own doc). showOnLockScreen/turnScreenOn mirror the existing
+             (unrelated) top-level IncomingCallActivity's own flags for the
+             identical "must be visible over the lock screen" reason. -->
+        <activity
+            android:name=".dialer.ui.InCallActivity"
+            android:exported="false"
+            android:showOnLockScreen="true"
+            android:turnScreenOn="true"
+            android:excludeFromRecents="true"
+            android:screenOrientation="portrait" />
+
+        <!-- DIALER PART 2.3: backs the incoming-call notification's
+             Answer/Decline actions. -->
+        <receiver
+            android:name=".dialer.telecom.IncomingCallActionReceiver"
+            android:exported="false" />
+
+        <!-- FIX 4: overrides zxing-android-embedded's own CaptureActivity,
+             which its AAR manifest declares screenOrientation="sensorLandscape"
+             — this is what made the QR scanner rotate. Attributes otherwise
+             mirror the library's own declaration exactly (see the extracted
+             AAR manifest), only screenOrientation differs. -->
+        <activity
+            android:name=".offline.PortraitCaptureActivity"
+            android:exported="false"
+            android:clearTaskOnLaunch="true"
+            android:screenOrientation="portrait"
+            android:stateNotNeeded="true"
+            android:theme="@style/zxing_CaptureTheme"
+            android:windowSoftInputMode="stateAlwaysHidden" />
+
+        <!-- PART 2.6 (optical transfer): SHOW/SCAN screens for the
+             animated-QR channel — see OpticalShowActivity/OpticalScanActivity
+             class docs. Portrait-locked and not exported, same posture as
+             every other in-app-only screen here. -->
+        <activity
+            android:name=".offline.OpticalShowActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
+            android:name=".offline.OpticalScanActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- PART "WHY THE QR JOIN FAILS" B2-B5: continuous-decode pairing
+             scanner — see PairingScanActivity's own class doc for why this
+             replaced the single-shot IntentIntegrator/PortraitCaptureActivity
+             flow (IntentIntegrator exposes no per-frame decode visibility). -->
+        <activity
+            android:name=".offline.PairingScanActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- PART 3.1: RelayService places real phone calls (Intent.ACTION_CALL,
+             TelecomManager.endCall(), AudioManager.MODE_IN_COMMUNICATION —
+             see that class's own onStartCommand) and captures the mic for
+             the WebRTC leg it bridges to that call. "dataSync" never
+             described what this service actually does; phoneCall+microphone
+             does. -->
         <service
             android:name=".RelayService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="phoneCall|microphone" />
 
+        <!-- PART 3.1: SMS relaying over a WebSocket — genuinely a data-sync
+             workload (no call, no mic, no camera), left unchanged. -->
         <service
             android:name=".RelayForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- PART 3.1: this one service anchors the whole mesh session —
+             Wi-Fi Direct peer connections (connectedDevice), offline audio/
+             video calls (camera/microphone — NOT phoneCall: these calls
+             never touch TelecomManager, they're this app's own private
+             protocol over raw sockets), the continuous GPS feed behind the
+             party-ring/lost-contact/SOS "Group Alert" beacon (location —
+             was missing entirely before this pass), and mesh chat/roster/
+             store-and-forward sync (dataSync). -->
         <service
             android:name=".offline.OfflineCallService"
             android:exported="false"
-            android:foregroundServiceType="camera|microphone|connectedDevice|dataSync" />
+            android:foregroundServiceType="camera|microphone|connectedDevice|location|dataSync" />
+
+        <!-- DIALER PART 1.2: the InCallService itself — required exact
+             permission/action pair for Telecom to bind this as (one of) the
+             device's InCallServices, and the IN_CALL_SERVICE_UI metadata
+             that tells Telecom THIS is the one allowed to show its own
+             full-screen calling UI (vs. a car/watch companion InCallService
+             that only observes). Must be exported (Telecom, a different
+             process/UID, binds it). -->
+        <service
+            android:name=".dialer.telecom.OcpInCallService"
+            android:exported="true"
+            android:permission="android.permission.BIND_INCALL_SERVICE">
+            <meta-data
+                android:name="android.telecom.IN_CALL_SERVICE_UI"
+                android:value="true" />
+            <intent-filter>
+                <action android:name="android.telecom.InCallService" />
+            </intent-filter>
+        </service>
 
         <receiver
             android:name=".CallStateReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.PHONE_STATE"/>
-            </intent-filter>
-        </receiver>
-
-        <receiver
-            android:name=".BootReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
 

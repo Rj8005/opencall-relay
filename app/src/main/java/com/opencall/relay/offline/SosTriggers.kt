@@ -330,8 +330,8 @@ class SosTriggers private constructor(context: Context) {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                NOTIF_CHANNEL_ID, "SOS trigger countdown", NotificationManager.IMPORTANCE_HIGH
-            ).apply { description = "Cancel window before an automatic SOS trigger fires" }
+                NOTIF_CHANNEL_ID, "Group Alert trigger countdown", NotificationManager.IMPORTANCE_HIGH
+            ).apply { description = "Cancel window before an automatic Group Alert trigger fires" }
             notificationManager.createNotificationChannel(channel)
         }
     }
@@ -352,7 +352,7 @@ class SosTriggers private constructor(context: Context) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val notification = NotificationCompat.Builder(appContext, NOTIF_CHANNEL_ID)
-            .setContentTitle("SOS will fire in ${secondsRemaining}s")
+            .setContentTitle("Group Alert will fire in ${secondsRemaining}s")
             .setContentText("Trigger: $triggerName — tap Cancel if this was a false alarm")
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setPriority(NotificationCompat.PRIORITY_MAX)

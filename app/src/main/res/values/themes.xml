@@ -10,5 +10,17 @@
         <item name="android:statusBarColor">#060a10</item>
         <item name="android:navigationBarColor">#060a10</item>
         <item name="android:windowLightStatusBar">false</item>
+        <!-- TOPO PART B5: every Button() in OfflineCallActivity.kt is a
+             plain platform Button — Theme.MaterialComponents' default
+             button style force-uppercases its text regardless of the
+             Kotlin string literal's own casing (Part A / A6). One theme
+             attribute fixes every button in the app at once, rather than
+             setting isAllCaps=false at each of the dozens of Button(this)
+             call sites individually. -->
+        <item name="android:buttonStyle">@style/OcpButtonStyle</item>
+    </style>
+
+    <style name="OcpButtonStyle" parent="Widget.AppCompat.Button">
+        <item name="android:textAllCaps">false</item>
     </style>
 </resources>

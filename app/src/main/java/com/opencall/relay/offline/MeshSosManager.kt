@@ -2,9 +2,11 @@ package com.opencall.relay.offline
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.roundToInt
 
 /**
  * PHASE 5A/5BC: SOS distress beacon, "find this peer" request/response, the
@@ -122,7 +124,36 @@ class MeshSosManager(
         // BUG 1 FIX 3: a store-and-forward REPLAY (isLive=false) of an SOS whose
         // ORIGINAL fix timestamp is older than this is historical — shown, but
         // must never sound the siren on the newly-joining peer that receives it.
+        // PART A: only reachable today via [carriedVerifiedAgeSec] being null
+        // (see [computeAlarmable]) — every actual carried-SOS delivery now goes
+        // through OfflineMediaTransport.dispatchCarriedInner's
+        // MeshSigner.verifyCarried path, which always supplies a signed age and
+        // therefore uses [CARRIED_SOS_ALARM_MAX_AGE_SEC] instead.
         private const val HISTORICAL_REPLAY_AGE_SEC = 30 * 60L
+        // PART A / A3: the age ceiling for a CRYPTOGRAPHICALLY VERIFIED carried
+        // SOS — deliberately the same window as [SOS_CARRY_EXPIRY_MINS] (6h),
+        // not the much stricter [HISTORICAL_REPLAY_AGE_SEC] (30m): that shorter
+        // constant was a defensive heuristic against an UNAUTHENTICATED replay
+        // (the pre-PART-A bug — anyone could forge loc.unixSeconds to look
+        // fresh). Once the SIGNED wire timestamp proves this SOS really was
+        // sent that recently, there is no reason to be more paranoid about
+        // alarming than about carrying it in the first place — a store-and-
+        // forward SOS legitimately reaching a rescuer hours later is the whole
+        // point of carry, not an edge case to silence.
+        private const val CARRIED_SOS_ALARM_MAX_AGE_SEC = SOS_CARRY_EXPIRY_MINS * 60L
+
+        /** PART A: pure alarmability decision, extracted for direct unit
+         *  testing (see MeshSosManagerTest) — same "pure companion" pattern as
+         *  MeshSigner.isWithinReplayWindow. [carriedVerifiedAgeSec] non-null
+         *  means [ageSec] came from a signature-VERIFIED carried delivery (see
+         *  handleSosFrame's doc) and therefore uses the wider carry-window
+         *  ceiling instead of the stricter unauthenticated-replay one. */
+        fun computeAlarmable(active: Boolean, isLive: Boolean, ageSec: Long, isCarriedVerified: Boolean, existingAlarmable: Boolean?): Boolean {
+            if (!active) return true
+            if (isLive) return existingAlarmable ?: true
+            val maxAgeSec = if (isCarriedVerified) CARRIED_SOS_ALARM_MAX_AGE_SEC else HISTORICAL_REPLAY_AGE_SEC
+            return ageSec <= maxAgeSec
+        }
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -273,13 +304,22 @@ class MeshSosManager(
      *  from "a store-and-forward REPLAY just delivered by MeshCarrier" (see
      *  dispatchCarriedInner's call site, which passes false). A replay older
      *  than [HISTORICAL_REPLAY_AGE_SEC] is marked NOT alarmable — it is still
-     *  recorded/shown, just never sounds the siren (see [SosEntry.alarmable]). */
-    fun handleSosFrame(header: MeshFrame.Header, payload: ByteArray, isLive: Boolean = true) {
+     *  recorded/shown, just never sounds the siren (see [SosEntry.alarmable]).
+     *
+     *  PART A: [carriedVerifiedAgeSec], when non-null, is the SIGNED wire
+     *  timestamp's age (computed by OfflineMediaTransport.dispatchCarriedInner
+     *  from MeshSigner.verifyCarried's result) — an age the attacker cannot
+     *  forge, unlike [loc]'s own embedded unixSeconds field. It REPLACES the
+     *  loc.unixSeconds-derived age for this call only, both for the log line
+     *  and for [computeAlarmable]'s decision; null (every live call, and
+     *  every non-SOS carried type) keeps today's loc.unixSeconds behavior
+     *  unchanged. */
+    fun handleSosFrame(header: MeshFrame.Header, payload: ByteArray, isLive: Boolean = true, carriedVerifiedAgeSec: Long? = null) {
         val loc = MeshLocation.decode(payload) ?: return
         // FIX 4: loc.unixSeconds is the SENDER's clock, nowUnixSeconds() is ours —
         // cross-device clock skew (even a few seconds of drift) can make this go
         // negative; clamp rather than show a nonsensical "age=-1s".
-        val ageSec = (nowUnixSeconds() - loc.unixSeconds).coerceAtLeast(0L)
+        val ageSec = carriedVerifiedAgeSec ?: (nowUnixSeconds() - loc.unixSeconds).coerceAtLeast(0L)
         Log.d(
             "OFFTRACE",
             "SOS: recv from=${MeshFrame.hex(header.srcId)} seq=${loc.msgSeq} hasFix=${loc.hasFix} " +
@@ -294,13 +334,13 @@ class MeshSosManager(
         // subsequent 30s repeats, rather than looking like a fresh onset every
         // time); a fresh episode (no existing entry, or the previous one was
         // CLEARed) always starts alarmable.
-        val alarmable = if (!active) {
-            true
-        } else if (!isLive) {
-            ageSec <= HISTORICAL_REPLAY_AGE_SEC
-        } else {
-            sosEntries[header.srcId]?.takeIf { it.active }?.alarmable ?: true
-        }
+        val alarmable = computeAlarmable(
+            active = active,
+            isLive = isLive,
+            ageSec = ageSec,
+            isCarriedVerified = carriedVerifiedAgeSec != null,
+            existingAlarmable = sosEntries[header.srcId]?.takeIf { it.active }?.alarmable
+        )
         if (!isLive && !alarmable) {
             Log.d("OFFTRACE", "SOS: replayed entry age=${ageSec / 60}m — historical, no siren")
         }
@@ -480,7 +520,11 @@ class MeshSosManager(
         headingDeg = loc.headingDeg,
         speedCms = loc.speedCms,
         tier = loc.locTier,
-        receivedAtMs = System.currentTimeMillis()
+        receivedAtMs = System.currentTimeMillis(),
+        // PEER DIRECTION READOUT STEP 5: monotonic clock, stamped at the
+        // moment THIS device received the frame — see MeshLedger.Entry's doc
+        // for why age must be computed from this, never receivedAtMs.
+        recvElapsedMs = SystemClock.elapsedRealtime()
     )
 
     /** Opportunistic barometer recalibration — any fix (self or peer) with GPS
@@ -557,6 +601,14 @@ class MeshSosManager(
         val pressureHpaX10 = pressureHpa?.let { (it * 10.0).toInt() }
         val seqSinceBoot = (nextPositionSeqSinceBoot.getAndIncrement() and 0xFFFFL).toInt()
         return if (fix != null) {
+            // PEER DIRECTION READOUT STEP 4: read straight from THIS fix's own
+            // GNSS course (see OfflineLocationProvider.Fix.bearingDeg/speedMps
+            // — NaN, not differenced from history) rather than
+            // ledger.computeHeadingAndSpeed's dead-reckoning, which stays in
+            // MeshLedger ONLY for markLostContact/searchCone's use (no live
+            // fix exists to read a course from once a peer is actually lost).
+            val hdg = if (fix.bearingDeg.isNaN()) null else fix.bearingDeg.roundToInt().mod(360)
+            val spd = if (fix.speedMps.isNaN()) null else (fix.speedMps * 100f).roundToInt().coerceIn(0, 254)
             ledger.record(
                 localNodeId,
                 MeshLedger.Entry(
@@ -565,13 +617,13 @@ class MeshSosManager(
                     accuracyMeters = fix.accuracyMeters?.toInt(),
                     altitudeBaroM = barometer.currentAltitudeEstimateM(),
                     pressureHpaX10 = pressureHpaX10,
-                    headingDeg = null,
-                    speedCms = null,
+                    headingDeg = hdg,
+                    speedCms = spd,
                     tier = fix.tier.wireValue,
-                    receivedAtMs = System.currentTimeMillis()
+                    receivedAtMs = System.currentTimeMillis(),
+                    recvElapsedMs = SystemClock.elapsedRealtime()
                 )
             )
-            val (hdg, spd) = ledger.computeHeadingAndSpeed(localNodeId)
             val loc = MeshLocation(
                 payloadVersion = MeshLocation.PAYLOAD_VERSION,
                 hasFix = true,

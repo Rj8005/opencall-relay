@@ -180,7 +180,7 @@ class SosRelay private constructor(context: Context) {
             timeZone = java.util.TimeZone.getTimeZone("UTC")
         }.format(java.util.Date())
         return buildString {
-            appendLine("SOS relayed via OpenCall mesh")
+            appendLine("Group Alert relayed via OpenCall mesh")
             appendLine("From: ${sos.senderName}")
             appendLine("Location: $coordLine")
             appendLine("Fix: $tierWord, ${sos.fixAgeSec}s old")

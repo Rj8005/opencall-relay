@@ -4,13 +4,18 @@ plugins {
 }
 android {
     namespace 'com.opencall.relay'
-    compileSdk 34
+    compileSdk 36
     defaultConfig {
         applicationId "com.opencall.relay"
         minSdk 26
-        targetSdk 34
+        targetSdk 36
         versionCode 3
         versionName "3.0"
+        // PART 5.2: AccountStore's Keystore-wrapping round-trip needs a real
+        // AndroidKeyStore — same limitation OfflineIdentityTest's class doc
+        // already documents for that class — so it's an instrumented test,
+        // not a JVM unit test. First androidTest in this project.
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
     signingConfigs {
         release {
@@ -42,6 +47,15 @@ android {
     buildFeatures {
         viewBinding true
     }
+    testOptions {
+        unitTests {
+            // No Robolectric in this project — this is the minimal, standard
+            // alternative: android.jar's stub methods (Log.d/Log.w/etc.)
+            // return a default value instead of throwing
+            // "not mocked" in a plain JVM unit test.
+            returnDefaultValues = true
+        }
+    }
 }
 dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
@@ -53,6 +67,11 @@ dependencies {
     implementation 'io.github.webrtc-sdk:android:114.5735.07'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
     implementation 'androidx.lifecycle:lifecycle-service:2.7.0'
+    // PART 0: lifecycleScope — background work that auto-cancels on Activity
+    // destroy, used to get ContactsContract/CallLog queries and photo
+    // decoding off the main thread (see ContactsScreen/CallLogScreen/
+    // PhoneTabController's own docs).
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.7.0'
     implementation 'io.michaelrocks:libphonenumber-android:8.13.14'
     implementation 'com.google.android.flexbox:flexbox:3.0.0'
     implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
@@ -66,4 +85,8 @@ dependencies {
     // PHASE 5A: first JVM-only unit tests in this project (MeshLocationTest) — pure
     // Kotlin codec, no Android/Robolectric dependency needed.
     testImplementation 'junit:junit:4.13.2'
+    // PART 5.2: first instrumented (on-device) test in this project — see
+    // AccountStoreInstrumentedTest and the testInstrumentationRunner above.
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test:runner:1.5.2'
 }

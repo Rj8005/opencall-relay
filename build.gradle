@@ -1,11 +1,17 @@
 buildscript {
-    ext.kotlin_version = '1.9.0'
+    // PART 2.1: bumped for compileSdk/targetSdk 36 — AGP 8.13.0 is the
+    // first line that supports API 36.1 (the .1 revision, not just the
+    // initial 36), needs Gradle >= 8.13 (see gradle-wrapper.properties)
+    // and JDK 17 to run (already the JDK on this machine). Kotlin bumped
+    // alongside it to a version AGP 8.13 actually tests against — 1.9.0
+    // predates API 36 tooling entirely.
+    ext.kotlin_version = '2.0.21'
     repositories {
         google()
         mavenCentral()
     }
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.1.0'
+        classpath 'com.android.tools.build:gradle:8.13.0'
         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
     }
 }
