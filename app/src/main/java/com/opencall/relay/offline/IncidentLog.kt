@@ -2,6 +2,7 @@ package com.opencall.relay.offline
 
 import android.content.Context
 import android.util.Log
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -33,6 +34,13 @@ import java.io.FileOutputStream
 class IncidentLog private constructor(context: Context) {
 
     enum class EventType { RAISED, CLEARED, ACKED }
+
+    /** One parsed log line. [extra] carries whatever type-specific fields
+     *  [append] was called with (message/hasFix/seenBy/etc.), untyped —
+     *  the reader (IncidentExporter) already knows which keys each
+     *  [EventType] carries, same "untyped bag, typed by convention" shape
+     *  [append]'s own [extra] parameter uses on the write side. */
+    data class Event(val atMs: Long, val type: EventType, val nodeIdHex: String, val extra: Map<String, Any?>)
 
     companion object {
         private const val INCIDENTS_DIR_NAME = "incidents"
@@ -74,5 +82,37 @@ class IncidentLog private constructor(context: Context) {
                 Log.w("OFFTRACE", "INCIDENT: log append failed: ${e.javaClass.simpleName}:${e.message}")
             }
         }
+    }
+
+    /** Reads every event ever appended, oldest first. Tolerates a
+     *  truncated/malformed final line (see this class's own FORMAT doc —
+     *  the one line a crash mid-append could have torn) by skipping just
+     *  that line rather than failing the whole read; any OTHER malformed
+     *  line (which should never happen — every write is one complete,
+     *  well-formed JSON object per line) is likewise skipped and logged,
+     *  same defensive posture as MeshLedger.loadAllFromDisk's per-file
+     *  try/catch. Returns an empty list if the log doesn't exist yet. */
+    fun readAll(): List<Event> {
+        if (!logFile.exists()) return emptyList()
+        val events = mutableListOf<Event>()
+        synchronized(writeLock) {
+            logFile.forEachLine(Charsets.UTF_8) { line ->
+                if (line.isBlank()) return@forEachLine
+                try {
+                    val json = JSONObject(line)
+                    val type = EventType.valueOf(json.getString("type"))
+                    val extra = mutableMapOf<String, Any?>()
+                    json.keys().forEach { key ->
+                        if (key != "atMs" && key != "type" && key != "nodeId") extra[key] = json.get(key)
+                    }
+                    events.add(Event(json.getLong("atMs"), type, json.getString("nodeId"), extra))
+                } catch (e: JSONException) {
+                    Log.w("OFFTRACE", "INCIDENT: skipping malformed log line: ${e.message}")
+                } catch (e: IllegalArgumentException) {
+                    Log.w("OFFTRACE", "INCIDENT: skipping log line with unknown type: ${e.message}")
+                }
+            }
+        }
+        return events
     }
 }

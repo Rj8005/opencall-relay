@@ -3188,6 +3188,23 @@ class OfflineCallActivity : AppCompatActivity() {
             body.addView(settingsInfoLine(
                 "OpenCall's Group Alert supplements, but does NOT replace, a personal locator beacon (PLB) or satellite messenger. Carry one on any serious trip."
             ))
+            // B1 (diagnostic follow-up): plain-text SOS timeline + last-known
+            // positions, from durably-persisted data (IncidentLog/MeshLedger)
+            // — see IncidentExporter's own doc. Shared via the standard share
+            // sheet rather than saved directly, so no new storage permission
+            // or file-picker plumbing is needed.
+            body.addView(settingsSectionHeader("Incident report"))
+            body.addView(settingsButtonRow(
+                "Export SOS timeline + last-known positions",
+                "Export"
+            ) {
+                val report = IncidentExporter.buildReport(applicationContext)
+                startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "OpenCall Relay — Incident Report")
+                    putExtra(Intent.EXTRA_TEXT, report)
+                }, "Share incident report via"))
+            })
         }
     }
 
