@@ -849,6 +849,16 @@ class OfflineCallActivity : AppCompatActivity() {
     private lateinit var sosSsidBroadcast: SosSsidBroadcast
     private lateinit var ssidBroadcastButton: Button
 
+    // B5 (diagnostic follow-up): push-to-talk voice notes — recorder is
+    // per-Activity-instance (not a process-wide singleton, see its own
+    // class doc), player is swapped out (stop previous, start next) so
+    // only one voice note ever plays at a time.
+    private val voiceNoteRecorder: VoiceNoteRecorder by lazy { VoiceNoteRecorder(applicationContext) }
+    private var voiceNotePlayer: android.media.MediaPlayer? = null
+    private var voiceNotePlayingRow: LinearLayout? = null
+    private lateinit var voiceNoteHoldButton: Button
+    private lateinit var voiceNotesListBody: LinearLayout
+
     // PHASE 6 TRACK E: self-healing GO re-election state — see handleGoLost/
     // handleElectionResult/becomeNewGoAfterElection/waitForInviteAfterElection.
     private var reconnectingAfterGoLoss = false
@@ -3205,7 +3215,150 @@ class OfflineCallActivity : AppCompatActivity() {
                     putExtra(Intent.EXTRA_TEXT, report)
                 }, "Share incident report via"))
             })
+
+            // B5 (diagnostic follow-up): push-to-talk voice notes — a
+            // fallback broadcast channel independent of an active call.
+            // Placed here (SOS/Group Alert overlay) rather than a new
+            // top-level surface: "walkie-talkie fallback" is squarely an
+            // emergency-adjacent use case, and this overlay is already the
+            // one reachable regardless of what else is happening on screen.
+            body.addView(settingsSectionHeader("Voice notes"))
+            body.addView(settingsInfoLine(
+                "Hold the button to record, release to send to everyone nearby. Max ${OfflineMediaTransport.VOICE_NOTE_MAX_DURATION_MS / 1000}s."
+            ))
+            voiceNoteHoldButton = Button(this).apply {
+                text = "Hold to talk"
+                setOnTouchListener { _, event ->
+                    when (event.actionMasked) {
+                        android.view.MotionEvent.ACTION_DOWN -> {
+                            val started = voiceNoteRecorder.start { result ->
+                                runOnUiThread {
+                                    voiceNoteHoldButton.text = "Hold to talk"
+                                    mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
+                                }
+                            }
+                            voiceNoteHoldButton.text = if (started) "Recording… release to send" else "Hold to talk"
+                            if (!started) {
+                                Toast.makeText(this@OfflineCallActivity, "Couldn't start recording", Toast.LENGTH_SHORT).show()
+                            }
+                            true
+                        }
+                        android.view.MotionEvent.ACTION_UP -> {
+                            voiceNoteHoldButton.text = "Hold to talk"
+                            voiceNoteRecorder.stop()?.let { result ->
+                                mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
+                            }
+                            true
+                        }
+                        android.view.MotionEvent.ACTION_CANCEL -> {
+                            voiceNoteHoldButton.text = "Hold to talk"
+                            voiceNoteRecorder.cancel()
+                            true
+                        }
+                        else -> false
+                    }
+                }
+            }
+            body.addView(
+                voiceNoteHoldButton,
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (56 * density).toInt()).apply {
+                    setMargins(0, (8 * density).toInt(), 0, (8 * density).toInt())
+                }
+            )
+            voiceNotesListBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            body.addView(voiceNotesListBody)
         }
+    }
+
+    /** Wired to OfflineMediaTransport.onVoiceNoteReceived — appends a row to
+     *  the (already-built, possibly not currently visible) voice notes list.
+     *  A no-op before the SOS overlay has ever been built is impossible in
+     *  practice (buildSosSectionOverlay runs eagerly during initial UI
+     *  construction, unlike the lazy Groups/Settings overlays — see its own
+     *  call site), but the isInitialized guard is cheap insurance regardless. */
+    private fun onVoiceNoteReceived(note: OfflineMediaTransport.VoiceNote) {
+        if (!::voiceNotesListBody.isInitialized) return
+        appendVoiceNoteRow(note)
+    }
+
+    private fun formatVoiceNoteDuration(durationMs: Int): String {
+        val totalSec = (durationMs / 1000).coerceIn(0, 99)
+        return "0:%02d".format(totalSec)
+    }
+
+    private fun appendVoiceNoteRow(note: OfflineMediaTransport.VoiceNote) {
+        val density = resources.displayMetrics.density
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = (48 * density).toInt()
+        }
+        val who = nameForGroupParticipant(note.srcId)
+        val carried = if (note.carrierId != null) " (carried, ${note.hopCount ?: 0}h)" else ""
+        row.addView(TextView(this).apply {
+            text = "$who — ${formatVoiceNoteDuration(note.durationMs)}$carried"
+            textSize = 16f
+            setTextColor(TopoPalette.fg(nightModeEnabled))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        row.addView(Button(this).apply {
+            text = "Play"
+            setOnClickListener { toggleVoiceNotePlayback(note, row, this) }
+        })
+        voiceNotesListBody.addView(row, 0) // newest first
+    }
+
+    /** Only one voice note plays at a time — starting a new one (or
+     *  tapping the currently-playing row's button again, to stop it)
+     *  always stops whatever was playing first. */
+    private fun toggleVoiceNotePlayback(note: OfflineMediaTransport.VoiceNote, row: LinearLayout, button: Button) {
+        val wasThisRow = voiceNotePlayingRow == row
+        stopVoiceNotePlayback()
+        if (wasThisRow) return
+        val player = android.media.MediaPlayer()
+        try {
+            player.setDataSource(VoiceNoteDataSource(note.audioBytes))
+            player.setOnCompletionListener { stopVoiceNotePlayback() }
+            player.setOnErrorListener { _, _, _ -> stopVoiceNotePlayback(); true }
+            player.prepare()
+            player.start()
+            voiceNotePlayer = player
+            voiceNotePlayingRow = row
+            button.text = "Stop"
+        } catch (e: Exception) {
+            Log.w("OFFTRACE", "VOICENOTE: playback failed: ${e.javaClass.simpleName}:${e.message}")
+            try { player.release() } catch (_: Exception) {}
+            Toast.makeText(this, "Couldn't play voice note", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun stopVoiceNotePlayback() {
+        voiceNotePlayer?.let { p ->
+            try { p.stop() } catch (_: Exception) {}
+            try { p.release() } catch (_: Exception) {}
+        }
+        voiceNotePlayer = null
+        voiceNotePlayingRow = null
+        if (!::voiceNotesListBody.isInitialized) return
+        for (i in 0 until voiceNotesListBody.childCount) {
+            val r = voiceNotesListBody.getChildAt(i) as? LinearLayout ?: continue
+            (r.getChildAt(1) as? Button)?.text = "Play"
+        }
+    }
+
+    /** Plays straight from the in-memory recording — no temp file, no
+     *  cleanup-on-disk to forget. [close] is a no-op: the backing
+     *  ByteArray is owned by the OfflineMediaTransport.VoiceNote this
+     *  came from, not this class. */
+    private class VoiceNoteDataSource(private val data: ByteArray) : android.media.MediaDataSource() {
+        override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+            if (position >= data.size) return -1
+            val length = minOf(size.toLong(), data.size - position).toInt()
+            System.arraycopy(data, position.toInt(), buffer, offset, length)
+            return length
+        }
+        override fun getSize(): Long = data.size.toLong()
+        override fun close() {}
     }
 
     // ── PART 1 (batch A): single scroll, overlay-based Groups/Settings ──────
@@ -5863,6 +6016,7 @@ class OfflineCallActivity : AppCompatActivity() {
         transport.onPhraseReceived = { fromNodeId, code, seq, carrierId, hopCount ->
             runOnUiThread { onPhraseReceived(fromNodeId, code, seq, carrierId, hopCount) }
         }
+        transport.onVoiceNoteReceived = { note -> runOnUiThread { onVoiceNoteReceived(note) } }
         // PHASE 3: fires for BOTH the initiator (right after placeCall) and the callee
         // (auto-answered) — see onCallStarted for how each is handled.
         transport.onModeResolved = { peerId, peerName, mode -> runOnUiThread { onCallStarted(peerId, peerName, mode) } }
@@ -7992,5 +8146,11 @@ class OfflineCallActivity : AppCompatActivity() {
         resetConnectionAttemptState()
         stopCallTimer()
         nearbyRefreshHandler.removeCallbacksAndMessages(null)
+        // B5: voiceNoteRecorder/voiceNotePlayer are this-Activity-instance-scoped
+        // (unlike sosAlarm/sosSsidBroadcast above) — always clean up regardless
+        // of isFinishing, same reasoning as every other per-instance resource
+        // in this unconditional block.
+        voiceNoteRecorder.cancel()
+        stopVoiceNotePlayback()
     }
 }

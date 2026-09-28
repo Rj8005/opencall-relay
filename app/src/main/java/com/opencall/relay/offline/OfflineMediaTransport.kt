@@ -543,18 +543,35 @@ class OfflineMediaTransport(
         // separate types.
         private const val TYPE_PHRASE: Byte = 35
 
-        // TOPO PHASE 3.4: voice messages — RESERVED, next free number in the
-        // 36-127 range (35 was the previous highest, TYPE_PHRASE). Payload
-        // envelope (never a header/VERSION change — see G2): [4B durationMs
-        // LE][4B opusByteLength LE][opus bytes] for the payload itself, sent
-        // dst=peer (1:1) or dst=BROADCAST (group) exactly like TYPE_CHAT,
-        // and routed through TYPE_STORE_FWD for out-of-range delivery
-        // exactly as TYPE_CHAT already is. NOT YET WIRED to
-        // send/receive/dispatch in this build — see the OUTPUT report's
-        // Phase 3.4 disclosure for exactly what is and isn't implemented.
-        // The constant is declared now so the number is reserved and
-        // documented rather than left ambiguous for whoever wires the rest.
+        // TOPO PHASE 3.4 / B5 (diagnostic follow-up, NOW WIRED): push-to-talk
+        // voice notes. Payload: [1B codecId][4B BE durationMs][audio bytes,
+        // remaining] — a deviation from this constant's ORIGINAL reservation
+        // comment (which assumed Opus, LE byte order): the confirmed capture
+        // path is a standalone MediaRecorder (see VoiceNoteRecorder.kt), and
+        // MediaRecorder's Opus output (OutputFormat.OGG + AudioEncoder.OPUS)
+        // is API 29+ only — this app's minSdk is 26. AAC/MPEG_4
+        // (VOICE_NOTE_CODEC_AAC_MP4) is broadly supported since long before
+        // API 26 and needs no version gate; BE matches every other
+        // multi-byte field this app's wire format uses elsewhere (see e.g.
+        // TYPE_FRAME_TS's identical BE convention). [codecId] is stamped so
+        // a future second codec is self-describing on the wire, same
+        // discipline as AudioCodec's own wireId byte for live calls.
+        //
+        // DELIVERY: exactly [sendPhrase]'s existing broadcast pattern (a
+        // one-shot message, not a repeating heartbeat like SOS) — live
+        // writeFrame to whoever's connected now, plus carrier.put with
+        // alreadyDeliveredTo=current roster so MeshCarrier only ever offers
+        // it to someone who reconnects LATER, never re-delivers to someone
+        // who already got the live copy. No separate content-level dedupe
+        // needed on receive, same reasoning as TYPE_PHRASE/TYPE_CHAT.
         const val TYPE_VOICE_NOTE: Byte = 36
+        const val VOICE_NOTE_CODEC_AAC_MP4: Byte = 1
+        const val VOICE_NOTE_CARRY_EXPIRY_MINS = 24 * 60
+        // Recording-side cap (enforced by VoiceNoteRecorder, not this class) —
+        // documented here too since it bounds this payload's realistic max
+        // size: ~30s of mono AAC at a modest bitrate is well under any
+        // practical mesh-frame size concern.
+        const val VOICE_NOTE_MAX_DURATION_MS = 30_000
 
         // OCP PHASE 3.1 (AUTHORISED WIRE ADDITION #1): timestamped video/audio
         // — next free numbers after TYPE_VOICE_NOTE(36, reserved but not yet
@@ -655,6 +672,34 @@ class OfflineMediaTransport(
 
         fun deriveTileBudget(probedDecoders: Int): Int = (probedDecoders - 1).coerceIn(TILE_BUDGET_MIN, TILE_BUDGET_CEILING)
         fun deriveMaxLiveCameras(probedDecoders: Int): Int = (probedDecoders - 1).coerceIn(MIN_LIVE_CAMERAS, MAX_GROUP_PARTICIPANTS)
+
+        /** B5: pure encode/decode for TYPE_VOICE_NOTE's payload — see that
+         *  constant's wire doc for the exact layout. Extracted for direct
+         *  unit testing without a constructed transport, same "pure
+         *  companion" pattern as MeshLocation.encode/decode. */
+        fun encodeVoiceNotePayload(codecId: Byte, durationMs: Int, audioBytes: ByteArray): ByteArray =
+            ByteBuffer.allocate(1 + 4 + audioBytes.size).apply {
+                put(codecId)
+                putInt(durationMs)
+                put(audioBytes)
+            }.array()
+
+        data class DecodedVoiceNote(val codecId: Byte, val durationMs: Int, val audioBytes: ByteArray)
+
+        /** Null for a payload too short to even hold the fixed header (5
+         *  bytes) — an unrecognized [DecodedVoiceNote.codecId] in an
+         *  otherwise well-formed payload is NOT null here; the caller
+         *  decides whether to reject an unknown codec (see
+         *  handleVoiceNoteFrame), same "decode succeeds, dispatch decides"
+         *  split MeshLocation.decode uses. */
+        fun decodeVoiceNotePayload(payload: ByteArray): DecodedVoiceNote? {
+            if (payload.size < 5) return null
+            val buf = ByteBuffer.wrap(payload)
+            val codecId = buf.get()
+            val durationMs = buf.int
+            val audioBytes = ByteArray(payload.size - 5).also { buf.get(it) }
+            return DecodedVoiceNote(codecId, durationMs, audioBytes)
+        }
 
         /** OCP PHASE 5.1: splits [visiblePeersRanked] (everyone this device
          *  intends to decode SOMETHING for — pin-first, then speaker, then
@@ -2343,6 +2388,95 @@ class OfflineMediaTransport(
      *  the carrier). [code] outside PhraseCode's table renders "unknown
      *  message" — see handlePhraseFrame's doc. */
     var onPhraseReceived: ((fromNodeId: Long, code: Int, seq: Long, carrierId: Long?, hopCount: Int?) -> Unit)? = null
+
+    // ── B5 (diagnostic follow-up): push-to-talk voice notes ─────────────────
+
+    /** One received voice note — [audioBytes] is the raw AAC/MPEG_4 file
+     *  content exactly as recorded (see VoiceNoteRecorder), ready to hand
+     *  straight to a MediaPlayer via a temp file or MediaDataSource. No
+     *  msgId here (unlike MeshCarrier's own Queued envelope) — a LIVE
+     *  delivery never carries one (see TYPE_VOICE_NOTE's wire doc: the
+     *  payload deliberately doesn't embed it, matching TYPE_PHRASE's
+     *  leaner shape), so this class doesn't pretend to have one either. */
+    data class VoiceNote(
+        val srcId: Long,
+        val durationMs: Int,
+        val audioBytes: ByteArray,
+        val receivedAtMs: Long,
+        val carrierId: Long?,
+        val hopCount: Int?
+    )
+
+    // Bounded so a long session's worth of received voice notes can't grow
+    // this in-memory list (and its raw audio bytes) unboundedly — oldest
+    // dropped first, same shape as MeshSosManager's dedupe cache eviction.
+    private val MAX_VOICE_NOTES_RETAINED = 30
+    private val voiceNotesInternal = mutableListOf<VoiceNote>()
+    private val voiceNotesLock = Any()
+
+    /** Snapshot of every voice note received this session, oldest first —
+     *  read fresh by the inbox UI when it opens, same "pull current state,
+     *  don't require having been subscribed since session start" contract
+     *  as [sosEntries]. */
+    val voiceNotes: List<VoiceNote> get() = synchronized(voiceNotesLock) { voiceNotesInternal.toList() }
+
+    /** Fired on the main thread whenever a new voice note is received
+     *  (live or carried — [VoiceNote.carrierId] tells which). */
+    var onVoiceNoteReceived: ((VoiceNote) -> Unit)? = null
+
+    /** Records-and-sends entry point is [VoiceNoteRecorder] (mic capture);
+     *  this is the send-over-the-mesh half, called once recording stops
+     *  with the finished file's bytes. Broadcast only (no 1:1 targeting,
+     *  matching "push-to-talk voice-note BROADCAST" — unlike [sendPhrase],
+     *  which supports both). Exactly [sendPhrase]'s existing broadcast
+     *  pattern: live now, carried for anyone who reconnects later, current
+     *  roster pre-marked as already-delivered so they're never double-sent. */
+    fun sendVoiceNote(audioBytes: ByteArray, durationMs: Int) {
+        if (!running.get() || !alive.get()) {
+            logW("MEDIA: voice note send dropped — not connected")
+            return
+        }
+        val handler = chatHandler ?: return
+        val payload = encodeVoiceNotePayload(VOICE_NOTE_CODEC_AAC_MP4, durationMs, audioBytes)
+        val msgId = MeshCarrier.newMsgId()
+        handler.post {
+            writeFrame(MeshFrame.BROADCAST_ID, TYPE_VOICE_NOTE, payload)
+            Log.d("OFFTRACE", "VOICENOTE: send durationMs=$durationMs bytes=${audioBytes.size}")
+            val alreadyPresent = routingTable.roster().map { it.nodeId }.toSet()
+            carrier.put(
+                msgId, localNodeId, MeshFrame.BROADCAST_ID, TYPE_VOICE_NOTE, payload,
+                expiryMins = VOICE_NOTE_CARRY_EXPIRY_MINS,
+                alreadyDeliveredTo = alreadyPresent
+            )
+        }
+    }
+
+    /** [carrierInfo] non-null only for a store-and-forward delivery — same
+     *  contract as [handlePhraseFrame]'s identical parameter. */
+    private fun handleVoiceNoteFrame(header: MeshFrame.Header, payload: ByteArray, carrierInfo: Pair<Long, Int>?) {
+        val decoded = decodeVoiceNotePayload(payload) ?: run {
+            logW("MEDIA: malformed VOICE_NOTE len=${payload.size} — ignoring")
+            return
+        }
+        if (decoded.codecId != VOICE_NOTE_CODEC_AAC_MP4) {
+            logW("MEDIA: VOICE_NOTE unknown codecId=${decoded.codecId} — ignoring (future codec this build doesn't understand)")
+            return
+        }
+        val durationMs = decoded.durationMs
+        val audioBytes = decoded.audioBytes
+        val (carrierId, hopCount) = carrierInfo ?: (null to null)
+        Log.d(
+            "OFFTRACE",
+            "VOICENOTE: recv from=${MeshFrame.hex(header.srcId)} durationMs=$durationMs bytes=${audioBytes.size} " +
+                "hops=${hopCount ?: 0}"
+        )
+        val note = VoiceNote(header.srcId, durationMs, audioBytes, System.currentTimeMillis(), carrierId, hopCount)
+        synchronized(voiceNotesLock) {
+            voiceNotesInternal.add(note)
+            while (voiceNotesInternal.size > MAX_VOICE_NOTES_RETAINED) voiceNotesInternal.removeAt(0)
+        }
+        mainHandler.post { onVoiceNoteReceived?.invoke(note) }
+    }
 
     /** PHASE 3: initiator API — places a 1:1 call to a specific roster member (found
      *  via a TYPE_ROSTER broadcast, see [onRosterUpdated]). Transparent whether that
@@ -5015,6 +5149,7 @@ class OfflineMediaTransport(
             }
             TYPE_CHAT -> handleChatFrame(header, payload)
             TYPE_PHRASE -> handlePhraseFrame(header, payload, carrierInfo)
+            TYPE_VOICE_NOTE -> handleVoiceNoteFrame(header, payload, carrierInfo)
             TYPE_MODE -> handleModeFrame(header, payload)
             TYPE_AUDIO_CODEC -> {
                 val gc = groupCall

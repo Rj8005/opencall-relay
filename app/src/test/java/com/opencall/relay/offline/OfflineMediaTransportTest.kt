@@ -1,5 +1,6 @@
 package com.opencall.relay.offline
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -628,6 +629,43 @@ class OfflineMediaTransportTest {
     fun `thermalStatusString never throws on an unrecognized value`() {
         assertEquals("unknown", OfflineMediaTransport.thermalStatusString(999))
         assertEquals("unknown", OfflineMediaTransport.thermalStatusString(-1))
+    }
+
+    // ── B5: TYPE_VOICE_NOTE payload encode/decode ───────────────────────────
+
+    @Test
+    fun `voice note payload round-trips codec, duration, and audio bytes exactly`() {
+        val audio = byteArrayOf(1, 2, 3, 4, 5, -1, -128, 127)
+        val payload = OfflineMediaTransport.encodeVoiceNotePayload(OfflineMediaTransport.VOICE_NOTE_CODEC_AAC_MP4, 4200, audio)
+        val decoded = OfflineMediaTransport.decodeVoiceNotePayload(payload)
+        assertNotNull(decoded)
+        assertEquals(OfflineMediaTransport.VOICE_NOTE_CODEC_AAC_MP4, decoded!!.codecId)
+        assertEquals(4200, decoded.durationMs)
+        assertArrayEquals(audio, decoded.audioBytes)
+    }
+
+    @Test
+    fun `voice note payload round-trips an empty audio recording`() {
+        val payload = OfflineMediaTransport.encodeVoiceNotePayload(OfflineMediaTransport.VOICE_NOTE_CODEC_AAC_MP4, 0, ByteArray(0))
+        val decoded = OfflineMediaTransport.decodeVoiceNotePayload(payload)
+        assertNotNull(decoded)
+        assertEquals(0, decoded!!.audioBytes.size)
+    }
+
+    @Test
+    fun `voice note payload decode returns null for anything shorter than the fixed header`() {
+        assertNull(OfflineMediaTransport.decodeVoiceNotePayload(ByteArray(4)))
+        assertNull(OfflineMediaTransport.decodeVoiceNotePayload(ByteArray(0)))
+    }
+
+    @Test
+    fun `voice note payload decode succeeds even for an unrecognized codecId — dispatch decides, not decode`() {
+        // Mirrors MeshLocation.decode's split: decode is purely structural,
+        // rejecting an unknown codec is handleVoiceNoteFrame's call.
+        val payload = OfflineMediaTransport.encodeVoiceNotePayload(99, 1000, byteArrayOf(9))
+        val decoded = OfflineMediaTransport.decodeVoiceNotePayload(payload)
+        assertNotNull(decoded)
+        assertEquals(99.toByte(), decoded!!.codecId)
     }
 
     // NOTE on 2.5's "no window exists where raw is suppressed AND
