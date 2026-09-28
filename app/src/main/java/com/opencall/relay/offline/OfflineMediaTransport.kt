@@ -1361,6 +1361,9 @@ class OfflineMediaTransport(
     // Process-wide singleton (same pattern as ledger/barometer); [configure] and
     // the callback wiring below are this transport instance's own session setup.
     val carrier = MeshCarrier.get(context)
+    // B1 (diagnostic follow-up): durable SOS raised/cleared/acked history —
+    // see IncidentLog.kt. Process-wide singleton, same pattern as the others above.
+    val incidentLog = IncidentLog.get(context)
     // PHASE 6 TRACK B1: beacon mode — see SosBeaconMode.kt. Process-wide
     // singleton, same pattern as the others above.
     val sosBeaconMode = SosBeaconMode.get(context)
@@ -1440,6 +1443,7 @@ class OfflineMediaTransport(
         barometer = barometer,
         ledger = ledger,
         carrier = carrier,
+        incidentLog = incidentLog,
         sendFrame = { dst, type, payload -> writeFrame(dst, type, payload) },
         otherMemberCount = { (routingTable.size() - 1).coerceAtLeast(0) },
         onSosEntry = { entry -> handleMeshSosEntryForBle(entry) },

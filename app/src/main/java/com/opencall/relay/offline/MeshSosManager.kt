@@ -61,6 +61,11 @@ class MeshSosManager(
      *  queue instead of this class's own hardcoded cache/replay — see
      *  [cacheForCarry] and the removal of PHASE 5BC's sosCache/replayCachedSosTo. */
     private val carrier: MeshCarrier,
+    /** B1 (diagnostic follow-up): durable raised/cleared/acked history —
+     *  see IncidentLog's own class doc. Same DI pattern as [ledger]/
+     *  [barometer]/[carrier] above, so this class itself never touches a
+     *  raw Context. */
+    private val incidentLog: IncidentLog,
     /** Wired by the owner to its own writeFrame — dst may be MeshFrame.BROADCAST_ID
      *  (SOS/POSITION) or a specific nodeId (FIND_REQ/FIND_RESP/SOS_ACK). Always
      *  stamps srcId=localNodeId, same as every other frame this device sends. */
@@ -249,6 +254,7 @@ class MeshSosManager(
         sosActive = true
         sosMessage = message ?: ""
         ackedByForMySos.clear()
+        incidentLog.append(IncidentLog.EventType.RAISED, localNodeId, mapOf("self" to true, "message" to sosMessage))
         // PHASE 6 TRACK A: one msgId per SOS EPISODE (not per 30s rebroadcast) —
         // every broadcastSos() call below upserts the SAME carrier queue entry.
         ourSosMsgId = MeshCarrier.newMsgId()
@@ -275,6 +281,7 @@ class MeshSosManager(
         val loc = MeshLocation.noFix(seq, nowUnixSeconds()).copy(message = CLEAR_MESSAGE)
         sendFrame(MeshFrame.BROADCAST_ID, typeSos, MeshLocation.encode(loc))
         Log.d("OFFTRACE", "SOS: broadcast seq=$seq hasFix=false msgLen=${CLEAR_MESSAGE.length}")
+        incidentLog.append(IncidentLog.EventType.CLEARED, localNodeId, mapOf("self" to true))
         sosMessage = ""
         // PHASE 6 TRACK A: CLEAR removes it from the carry queue too — matches
         // PHASE 5BC's "CLEAR removes the cache entry" exactly (see class doc).
@@ -351,6 +358,13 @@ class MeshSosManager(
         if (!isLive && !alarmable) {
             Log.d("OFFTRACE", "SOS: replayed entry age=${ageSec / 60}m — historical, no siren")
         }
+        // B1 (diagnostic follow-up): read the PREVIOUS active state before
+        // overwriting sosEntries below, so only a genuine transition (a
+        // fresh raise, a fresh clear, or a new episode after a prior clear)
+        // gets logged — not every 30s rebroadcast of an already-active
+        // episode. header.srcId == localNodeId is skipped: this device's
+        // own raise/clear is already logged directly in startSos/stopSos.
+        val previousActive = sosEntries[header.srcId]?.active
         val entry = SosEntry(
             srcId = header.srcId,
             hasFix = loc.hasFix,
@@ -364,6 +378,13 @@ class MeshSosManager(
             alarmable = alarmable
         )
         sosEntries[header.srcId] = entry
+        if (header.srcId != localNodeId && previousActive != active) {
+            incidentLog.append(
+                if (active) IncidentLog.EventType.RAISED else IncidentLog.EventType.CLEARED,
+                header.srcId,
+                mapOf("hasFix" to loc.hasFix, "isLive" to isLive, "ageSec" to ageSec)
+            )
+        }
         if (loc.hasFix) {
             ledger.record(header.srcId, entryFromLocation(loc))
             ledger.clearLostContact(header.srcId)
@@ -382,10 +403,16 @@ class MeshSosManager(
      *  same node is absorbed by the Set, never double-counted. */
     fun handleSosAckFrame(header: MeshFrame.Header) {
         if (!sosActive) return
-        ackedByForMySos.add(header.srcId)
+        val alreadyAcked = !ackedByForMySos.add(header.srcId)
         val seenBy = ackedByForMySos.size
         val total = otherMemberCount()
         Log.d("OFFTRACE", "SOS: ack from=${MeshFrame.hex(header.srcId)} seenBy=$seenBy/$total")
+        // B1: only the FIRST ack from a given node is a new event worth logging —
+        // Set.add already absorbs a duplicate ack for the in-memory seenBy count,
+        // so mirror that here rather than appending one log line per repeated ack.
+        if (!alreadyAcked) {
+            incidentLog.append(IncidentLog.EventType.ACKED, header.srcId, mapOf("seenBy" to seenBy, "total" to total))
+        }
         mainHandler.post { onSosAckUpdate(seenBy, total) }
     }
 
