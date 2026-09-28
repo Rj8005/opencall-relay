@@ -14,7 +14,7 @@ class OpenCallApp : Application() {
     override fun onCreate() {
         super.onCreate()
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CHANNEL_RELAY, "Relay Service", NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
+        nm.createNotificationChannel(NotificationChannel(CHANNEL_RELAY, "Call Bridge", NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
         nm.createNotificationChannel(NotificationChannel(CHANNEL_CALL, "Incoming Calls", NotificationManager.IMPORTANCE_HIGH).apply { setShowBadge(true) })
     }
 }

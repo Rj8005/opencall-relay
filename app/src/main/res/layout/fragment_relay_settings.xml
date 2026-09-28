@@ -23,7 +23,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Relay Settings"
+            android:text="Call Bridge Settings"
             android:textColor="#f0ede8"
             android:textSize="20sp"
             android:textStyle="bold"
@@ -32,7 +32,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Run this device as an OpenCall relay node"
+            android:text="Let this device bridge calls for other people"
             android:textColor="#555555"
             android:textSize="13sp"
             android:layout_marginBottom="24dp"/>
@@ -208,12 +208,12 @@
             android:background="#1f1f1f"
             android:layout_marginBottom="20dp"/>
 
-        <!-- Relay state label -->
+        <!-- Bridge state label -->
         <TextView
             android:id="@+id/tv_relay_status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="○ Relay is STOPPED"
+            android:text="○ Bridge is STOPPED"
             android:textColor="#666666"
             android:textSize="14sp"
             android:layout_marginBottom="16dp"/>

@@ -125,12 +125,6 @@
             android:screenOrientation="portrait" />
 
         <activity
-            android:name=".DialerActivity"
-            android:exported="false"
-            android:screenOrientation="portrait"
-            android:windowSoftInputMode="adjustResize" />
-
-        <activity
             android:name=".IncomingCallActivity"
             android:exported="false"
             android:showOnLockScreen="true"

@@ -17,17 +17,26 @@ android {
         // not a JVM unit test. First androidTest in this project.
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
+    // Release credentials live in the gitignored keystore.properties at the
+    // repo root — never as literals here. Absent file = release signing left
+    // unconfigured (debug builds are unaffected).
+    def keystorePropertiesFile = rootProject.file("keystore.properties")
+    def keystoreProperties = new Properties()
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+    }
     signingConfigs {
         release {
-            storeFile file("../opencall-release.jks")
-            storePassword "opencall123"
-            keyAlias "opencall"
-            keyPassword "opencall123"
+            if (keystorePropertiesFile.exists()) {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
         }
     }
     buildTypes {
         debug {
-            signingConfig signingConfigs.release
             applicationIdSuffix ""
             debuggable true
         }

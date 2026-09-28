@@ -20,7 +20,7 @@ class IncomingCallActivity : AppCompatActivity() {
         com.opencall.relay.shell.AppShell.applySystemBarInsets(findViewById(android.R.id.content))
         val callId = intent.getStringExtra("callId") ?: ""
         val dialNumber = intent.getStringExtra("dialNumber") ?: ""
-        findViewById<TextView>(R.id.tv_dial_number).text = "Relaying call to\n$dialNumber"
+        findViewById<TextView>(R.id.tv_dial_number).text = "Bridging call to\n$dialNumber"
         findViewById<Button>(R.id.btn_cancel_relay).setOnClickListener {
             startService(Intent(this, RelayService::class.java).apply {
                 action = RelayService.ACTION_HANGUP

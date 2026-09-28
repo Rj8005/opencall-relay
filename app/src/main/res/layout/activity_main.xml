@@ -5,162 +5,17 @@
     android:background="@drawable/ambient_rings">
 
     <!-- ═══════════════════════════════════════════════════════════════
-         SCREEN A — Setup (shown on first launch only)
+         SCREEN A — Onboarding (shown on first launch only)
+         ONBOARDING REWRITE: content is now built entirely programmatically
+         by OnboardingFlow, same "empty container, controller class owns the
+         content" pattern as tab_international/tab_phone below — see that
+         class for the three swipeable screens themselves.
     ════════════════════════════════════════════════════════════════ -->
-    <LinearLayout
+    <FrameLayout
         android:id="@+id/screen_setup"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:orientation="vertical"
-        android:visibility="visible">
-
-        <ScrollView
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:fillViewport="true"
-            android:overScrollMode="never">
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:padding="24dp"
-                android:gravity="center_horizontal">
-
-                <!-- OCP logo -->
-                <ImageView
-                    android:layout_width="80dp"
-                    android:layout_height="80dp"
-                    android:src="@drawable/ic_launcher_foreground"
-                    android:background="@drawable/card_bg"
-                    android:padding="12dp"
-                    android:scaleType="centerInside"
-                    android:layout_marginTop="32dp"
-                    android:contentDescription="OCP logo"/>
-
-                <!-- Title -->
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="OpenCall Relay"
-                    android:textSize="26sp"
-                    android:textStyle="bold"
-                    android:textColor="@color/text_primary"
-                    android:layout_marginTop="20dp"/>
-
-                <!-- Subtitle -->
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Relay Node Setup"
-                    android:textSize="14sp"
-                    android:textColor="@color/text_secondary"
-                    android:layout_marginTop="6dp"
-                    android:layout_marginBottom="28dp"/>
-
-                <!-- Setup form card -->
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="vertical"
-                    android:background="@drawable/card_bg"
-                    android:padding="16dp">
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Your name"
-                        android:textSize="11sp"
-                        android:textColor="@color/text_secondary"
-                        android:letterSpacing="0.05"/>
-
-                    <EditText
-                        android:id="@+id/et_setup_name"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="4dp"
-                        android:layout_marginBottom="16dp"
-                        android:background="@drawable/field_bg"
-                        android:padding="10dp"
-                        android:textSize="14sp"
-                        android:textColor="@color/text_primary"
-                        android:inputType="textPersonName"
-                        android:singleLine="true"/>
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Your number (with country code)"
-                        android:textSize="11sp"
-                        android:textColor="@color/text_secondary"
-                        android:letterSpacing="0.05"/>
-
-                    <EditText
-                        android:id="@+id/et_setup_number"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="4dp"
-                        android:layout_marginBottom="16dp"
-                        android:background="@drawable/field_bg"
-                        android:padding="10dp"
-                        android:textSize="14sp"
-                        android:textColor="@color/text_primary"
-                        android:hint="+91 98005 05720"
-                        android:textColorHint="@color/text_muted"
-                        android:inputType="phone"
-                        android:singleLine="true"/>
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Signal server"
-                        android:textSize="11sp"
-                        android:textColor="@color/text_secondary"
-                        android:letterSpacing="0.05"/>
-
-                    <EditText
-                        android:id="@+id/et_setup_server"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="4dp"
-                        android:background="@drawable/field_bg"
-                        android:padding="10dp"
-                        android:textSize="13sp"
-                        android:textColor="@color/text_primary"
-                        android:text="wss://signal.opencall.space"
-                        android:inputType="textUri"
-                        android:singleLine="true"/>
-
-                </LinearLayout>
-
-                <!-- Set up relay node button -->
-                <Button
-                    android:id="@+id/btn_setup_complete"
-                    android:layout_width="match_parent"
-                    android:layout_height="52dp"
-                    android:layout_marginTop="20dp"
-                    android:text="Set up relay node →"
-                    android:textSize="15sp"
-                    android:textStyle="bold"
-                    android:textColor="#0a0a0a"
-                    android:background="@drawable/btn_primary"
-                    android:stateListAnimator="@null"/>
-
-                <!-- OCP address (monospace, small) -->
-                <TextView
-                    android:id="@+id/tv_setup_ocp_address"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="16dp"
-                    android:layout_marginBottom="32dp"
-                    android:text=""
-                    android:textSize="11sp"
-                    android:textColor="@color/text_muted"
-                    android:fontFamily="monospace"/>
-
-            </LinearLayout>
-        </ScrollView>
-    </LinearLayout>
+        android:visibility="visible"/>
 
     <!-- ═══════════════════════════════════════════════════════════════
          SCREEN B — Three-tab shell (shown after setup)

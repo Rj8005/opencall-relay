@@ -41,7 +41,7 @@ class RelayForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                startForeground(NOTIF_ID, buildNotification("Relay starting..."))
+                startForeground(NOTIF_ID, buildNotification("Call bridge starting..."))
                 startNativeRelay()
             }
             ACTION_STOP -> {
@@ -66,7 +66,7 @@ class RelayForegroundService : Service() {
 
         connectWebSocket(serverUrl, country, number, mode)
 
-        updateNotification("Relay active 🟢")
+        updateNotification("Call bridge active 🟢")
         Log.d(TAG, "Native relay started")
     }
 
@@ -77,7 +77,7 @@ class RelayForegroundService : Service() {
         webSocket = wsClient.newWebSocket(request, object : okhttp3.WebSocketListener() {
             override fun onOpen(ws: okhttp3.WebSocket, response: okhttp3.Response) {
                 Log.d(TAG, "✅ WebSocket connected")
-                updateNotification("Relay connected 🟢")
+                updateNotification("Call bridge connected 🟢")
 
                 val msg = org.json.JSONObject().apply {
                     put("type", "register_relay")
@@ -117,7 +117,7 @@ class RelayForegroundService : Service() {
             when (type) {
                 "relay_registered" -> {
                     Log.d(TAG, "✅ Registered as relay")
-                    updateNotification("Relay active 🟢 — ready for SMS")
+                    updateNotification("Call bridge active 🟢 — ready for SMS")
                 }
 
                 "relay_sms" -> {
@@ -143,7 +143,7 @@ class RelayForegroundService : Service() {
                         sms.sendMultipartTextMessage(to, null, parts, null, null)
                         Log.d(TAG, "✅ SMS sent to $to (${parts.size} part(s))")
                         sendWsStatus(threadId, to, "sent", null)
-                        updateNotification("Relay active 🟢 — SMS sent")
+                        updateNotification("Call bridge active 🟢 — SMS sent")
                     } catch (e: Exception) {
                         Log.e(TAG, "SMS send failed: ${e.message}")
                         sendWsStatus(threadId, to, "failed", e.message)
@@ -218,10 +218,10 @@ class RelayForegroundService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "OCP Relay",
+                "OpenCall Call Bridge",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "OpenCall relay node status"
+                description = "OpenCall call bridge status"
                 setShowBadge(false)
                 setSound(null, null)
             }
@@ -243,7 +243,7 @@ class RelayForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("OpenCall Relay")
+            .setContentTitle("OpenCall Call Bridge")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_call)
             .setOngoing(true)

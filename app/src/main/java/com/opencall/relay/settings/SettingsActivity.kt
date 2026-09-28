@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
+import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 import com.opencall.relay.RelayForegroundService
 import com.opencall.relay.RelayService
@@ -17,6 +18,7 @@ import com.opencall.relay.dialer.ui.runOffMainThread
 import com.opencall.relay.offline.OfflineCallActivity
 import com.opencall.relay.offline.OfflineCallService
 import com.opencall.relay.offline.OfflineIdentity
+import com.opencall.relay.shell.AppShell
 
 /**
  * PART 1.3: "Relay controls on today's first screen ... are an operator
@@ -76,19 +78,27 @@ class SettingsActivity : AppCompatActivity() {
         }
         binding.tvDeleteAccount.setOnClickListener { confirmDeleteAccount() }
 
-        setupStatusBar()
-        setupRelayButton()
-        setupModeButtons()
-        restoreRelayMode()
-        binding.etServerUrl.setText(
-            getSharedPreferences("opencall", MODE_PRIVATE)
-                .getString("server_url", RelayService.DEFAULT_SERVER) ?: RelayService.DEFAULT_SERVER
-        )
+        // ONBOARDING REWRITE: the whole call-bridge section (Start/Stop
+        // Bridge, bridge mode, server URL — formerly "RELAY NODE") is
+        // Pillar 1's own live control surface; gated behind the same flag
+        // that hides Tab 1 rather than left reachable with nowhere for the
+        // user to have arrived from (see AppShell.PILLAR_1_ENABLED's doc).
+        binding.sectionCallBridge.visibility = if (AppShell.PILLAR_1_ENABLED) View.VISIBLE else View.GONE
+        if (AppShell.PILLAR_1_ENABLED) {
+            setupStatusBar()
+            setupRelayButton()
+            setupModeButtons()
+            restoreRelayMode()
+            binding.etServerUrl.setText(
+                getSharedPreferences("opencall", MODE_PRIVATE)
+                    .getString("server_url", RelayService.DEFAULT_SERVER) ?: RelayService.DEFAULT_SERVER
+            )
+        }
     }
 
     private fun renderAccountSection() {
         val account = AccountStore.get(this)
-        binding.tvAccountNodeId.text = "Node: ${account.nodeIdHex}"
+        binding.tvAccountNodeId.text = "Device ID: ${account.nodeIdHex}"
         binding.tvAccountDisplayName.text = account.displayName
         binding.tvAccountSim.text = if (account.simNumber != null)
             "SIM: ${account.simNumber}${if (account.simVerified) " (verified)" else " (unverified)"}"
@@ -109,7 +119,7 @@ class SettingsActivity : AppCompatActivity() {
 
     /** PART 5.1: a native-only display format — "ocp:" + this device's own
      *  8-byte mesh node id (the same [AccountStore.Account.nodeIdHex]
-     *  already shown elsewhere in this Activity as "Node: ..."). NOT the
+     *  already shown elsewhere in this Activity as "Device ID: ..."). NOT the
      *  same namespace as the PWA's own ocp: addresses (a completely
      *  separate Ed25519 keypair, generated client-side in JS from a BIP-39
      *  mnemonic) — the two are not interchangeable and a peer on one system
@@ -185,7 +195,7 @@ class SettingsActivity : AppCompatActivity() {
                 "hardware-backed keystore and never leaves it — there is no seed " +
                 "phrase to export. If you reinstall the app or move to a new " +
                 "device, a new identity is generated automatically; your contacts " +
-                "will see it as a new node.\n\n" +
+                "will see it as a new device.\n\n" +
                 "What you CAN back up is your public address, so you can tell " +
                 "contacts who you were:\n\n$address"
             )
@@ -281,8 +291,8 @@ class SettingsActivity : AppCompatActivity() {
             startService(intent)
         }
         binding.tvStatusPill.text = "ACTIVE"
-        binding.btnToggleRelay.text = "Stop Relay"
-        android.widget.Toast.makeText(this, "Relay service started", android.widget.Toast.LENGTH_SHORT).show()
+        binding.btnToggleRelay.text = "Stop Bridge"
+        android.widget.Toast.makeText(this, "Call bridge started", android.widget.Toast.LENGTH_SHORT).show()
     }
 
     private fun stopRelayService() {
@@ -337,14 +347,14 @@ class SettingsActivity : AppCompatActivity() {
         val grey    = Color.parseColor("#666666")
         binding.tvStatusPill.text = if (running) "ACTIVE" else "STOPPED"
         binding.tvStatusPill.setTextColor(if (running) accent else grey)
-        binding.btnToggleRelay.text = if (running) "Stop Relay" else "Start Relay"
+        binding.btnToggleRelay.text = if (running) "Stop Bridge" else "Start Bridge"
     }
 
     override fun onResume() {
         super.onResume()
         val running = RelayForegroundService.instance != null
         binding.tvStatusPill.text = if (running) "ACTIVE" else "IDLE"
-        binding.btnToggleRelay.text = if (running) "Stop Relay" else "Start Relay"
+        binding.btnToggleRelay.text = if (running) "Stop Bridge" else "Start Bridge"
         renderAccountSection()
         renderIdentitySection()
     }
@@ -369,7 +379,7 @@ class SettingsActivity : AppCompatActivity() {
             .setTitle("Delete account?")
             .setMessage(
                 "This permanently deletes, on this device and on OpenCall's server:\n" +
-                "  • Your mesh identity (node ${account.nodeIdHex}) — a new one is generated " +
+                "  • Your mesh identity (device ${account.nodeIdHex}) — a new one is generated " +
                 "if you use OpenCall again, but it will not be the same identity your contacts know$simLine$sipLine\n" +
                 "  • Your display name and all local settings\n\n" +
                 "This cannot be undone."

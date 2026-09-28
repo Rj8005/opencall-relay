@@ -346,7 +346,7 @@ class RelayService : Service() {
                 Log.d(TAG, "✅ RELAY REGISTERED with server successfully")
                 Log.d(TAG, "Server response: $msg")
                 isRegistered = true
-                updateNotif("Relay active — ready to bridge calls")
+                updateNotif("Call bridge active — ready to bridge calls")
                 statusText = "Active"
                 registerInDHT(areaCode, country)
                 sendBroadcast(Intent("com.opencall.relay.REGISTERED"))
@@ -761,7 +761,7 @@ class RelayService : Service() {
         updateNotif("Error: ${msg.take(50)}")
         statusText = "Error"
         scope.launch(Dispatchers.Main) {
-            Toast.makeText(this@RelayService, "Relay: $msg", Toast.LENGTH_LONG).show()
+            Toast.makeText(this@RelayService, "Call bridge: $msg", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -772,7 +772,7 @@ class RelayService : Service() {
             PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, OpenCallApp.CHANNEL_RELAY)
-            .setContentTitle("OpenCall Relay")
+            .setContentTitle("OpenCall Call Bridge")
             .setContentText(status)
             .setSmallIcon(android.R.drawable.ic_menu_call)
             .setOngoing(true)

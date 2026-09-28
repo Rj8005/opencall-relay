@@ -15,10 +15,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.telecom.TelecomManager
 import android.telephony.SmsManager
-import android.text.Editable
-import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.widget.*
@@ -33,6 +30,7 @@ import com.opencall.relay.databinding.ActivityMainBinding
 import com.opencall.relay.dialer.ui.PhoneTabController
 import com.opencall.relay.international.InternationalCallScreen
 import com.opencall.relay.offline.OfflineCallActivity
+import com.opencall.relay.onboarding.OnboardingFlow
 import com.opencall.relay.settings.SettingsActivity
 import com.opencall.relay.shell.AppShell
 import com.opencall.relay.shell.AppTab
@@ -71,6 +69,7 @@ class MainActivity : AppCompatActivity() {
     private var currentTab: AppTab = AppTab.INTERNATIONAL
     private lateinit var internationalScreen: InternationalCallScreen
     private lateinit var phoneTabController: PhoneTabController
+    private lateinit var onboardingFlow: OnboardingFlow
 
     // PART 0: every permission-result path in this app — this class's own
     // legacy onRequestPermissionsResult below included — checks the
@@ -87,6 +86,9 @@ class MainActivity : AppCompatActivity() {
     private val phoneContactsPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted -> ifAliveAndReady { phoneTabController.handleContactsPermissionResult(granted) } }
+    private val roleExplainerLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result -> ifAliveAndReady { phoneTabController.handleRoleExplainerResult(result.resultCode) } }
 
     /** PART 0: the shared guard — Activity not finishing/destroyed, and the
      *  tab-shell Views/controllers this callback would touch actually exist
@@ -167,56 +169,22 @@ class MainActivity : AppCompatActivity() {
         // to fire right here, unconditionally, on every cold launch, with
         // no rationale — exactly what that Part's instruction singles out.
         // Every permission this Activity needs is now requested at its own
-        // point of use instead: see startRelayService's rationale dialog
-        // below (CALL_PHONE/RECORD_AUDIO, right before the user's own "Set
-        // up relay node" tap actually needs them).
+        // point of use instead.
         setupTabShell()
 
-        binding.btnSetupComplete.setOnClickListener {
-            val name   = binding.etSetupName.text.toString().trim()
-            val number = binding.etSetupNumber.text.toString().trim()
-            val server = binding.etSetupServer.text.toString().trim()
-
-            if (name.isEmpty() || number.isEmpty()) {
-                Toast.makeText(this, "Please enter your name and number", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (!number.startsWith("+")) {
-                Toast.makeText(this, "Add country code: +91, +1, +44...", Toast.LENGTH_LONG).show()
-                return@setOnClickListener
-            }
-
-            val normalized = normalizeNumber(number)
-            getSharedPreferences("opencall", MODE_PRIVATE).edit()
-                .putString("user_name",   name)
-                .putString("user_number", normalized)
-                .putString("server_url",  server)
-                .putBoolean("setup_complete", true)
-                .apply()
-            // PART 5.1/5.2: this onboarding step doubles as "who is this
-            // device" for the whole app now — written alongside (not instead
-            // of) the "opencall" keys above, which the untouched relay/SMS
-            // code in this file still reads directly.
-            AccountStore.setDisplayName(this, name)
-            AccountStore.setSimNumber(this, normalized, verified = true)
-
+        // ONBOARDING REWRITE: three swipeable screens (what this is / the
+        // three things it does / your name only), replacing the old single
+        // "Relay Node Setup" form — see OnboardingFlow. No phone number, no
+        // server URL: neither belongs at first run any more (Pillar 2 reads
+        // the SIM's own MSISDN at its own point of use, Pillar 3's identity
+        // needs no phone number, and the signal server field now lives in
+        // Settings behind the same PILLAR_1_ENABLED gate as the rest of
+        // Pillar 1's controls — see SettingsActivity).
+        onboardingFlow = OnboardingFlow(this, binding.screenSetup) {
+            showTab(OnboardingFlow.landingTabAfterOnboarding())
             showScreen("dashboard")
-            startRelayService(server, normalized)
         }
-
-        binding.etSetupNumber.addTextChangedListener(object : TextWatcher {
-            override fun afterTextChanged(s: Editable?) {
-                val num = s.toString().trim()
-                if (num.isNotEmpty() && !num.startsWith("+")) {
-                    binding.etSetupNumber.error =
-                        "Add country code: +91 India · +1 USA/Canada · +44 UK"
-                } else {
-                    binding.etSetupNumber.error = null
-                }
-            }
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-        })
+        onboardingFlow.start()
 
         // PART 1.2: the "change" link that used to sit in this header moved
         // into Settings' Account section ("Change account") — see
@@ -238,6 +206,7 @@ class MainActivity : AppCompatActivity() {
                 .putBoolean("setup_complete", false)
                 .apply()
             stopRelayService()
+            onboardingFlow.restart()
             showScreen("setup")
             return
         }
@@ -265,7 +234,8 @@ class MainActivity : AppCompatActivity() {
         internationalScreen = InternationalCallScreen(this, binding.tabInternational)
         phoneTabController = PhoneTabController(
             this, binding.tabPhone,
-            phoneCallPermissionLauncher, phoneCallLogPermissionLauncher, phoneContactsPermissionLauncher
+            phoneCallPermissionLauncher, phoneCallLogPermissionLauncher, phoneContactsPermissionLauncher,
+            roleExplainerLauncher
         )
         // PART 2.1: same AppShell.buildTopBar() call OfflineCallActivity.kt:2911
         // makes — one header-rendering code path for all three tabs now.
@@ -336,19 +306,17 @@ class MainActivity : AppCompatActivity() {
         showTab(AppShell.restoreTab(savedInstanceState.getString(PREF_LAST_TAB)))
     }
 
+    /** ONBOARDING REWRITE: "a stored display name skips onboarding on next
+     *  launch" is now just `setup_complete` — OnboardingFlow sets it only
+     *  after a display name (typed, or the existing default) is already
+     *  resolved, so this one flag is sufficient. The old gate also required
+     *  non-blank `user_name`/`user_number` raw prefs; neither is written by
+     *  onboarding any more (see OnboardingFlow.finish/skip and this task's
+     *  report on user_number), so requiring them here would have made setup
+     *  never complete for a new install. */
     private fun initFlow() {
-        val prefs   = getSharedPreferences("opencall", MODE_PRIVATE)
-        val claimed = prefs.getBoolean("setup_complete", false)
-        val name    = prefs.getString("user_name",   null)
-        val number  = prefs.getString("user_number", null)
-        if (claimed && !name.isNullOrBlank() && !number.isNullOrBlank()) {
-            showScreen("dashboard")
-            // PART 1.3: the server-URL field itself now lives in
-            // SettingsActivity (Card 2), which reads/restores it on its own
-            // onCreate — nothing to do with it here anymore.
-        } else {
-            showScreen("setup")
-        }
+        val claimed = getSharedPreferences("opencall", MODE_PRIVATE).getBoolean("setup_complete", false)
+        if (OnboardingFlow.isOnboardingComplete(claimed)) showScreen("dashboard") else showScreen("setup")
     }
 
     // â”€â”€ Relay service helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -379,7 +347,7 @@ class MainActivity : AppCompatActivity() {
                 .setTitle("Call and microphone access")
                 .setMessage(
                     "OpenCall needs to place calls and use the microphone " +
-                    "to relay a call for you. You'll be asked to grant both next."
+                    "to bridge a call for you. You'll be asked to grant both next."
                 )
                 .setPositiveButton("Continue") { _, _ ->
                     ActivityCompat.requestPermissions(
@@ -432,11 +400,10 @@ class MainActivity : AppCompatActivity() {
         if (denied.isEmpty()) {
             Toast.makeText(
                 this,
-                "\u2705 All permissions granted \u2014 relay ready",
+                "\u2705 All permissions granted \u2014 call bridge ready",
                 Toast.LENGTH_SHORT
             ).show()
-            // PART 4.3: resumes exactly where the user left off \u2014 they
-            // shouldn't have to re-tap "Set up relay node" after granting.
+            // PART 4.3: resumes exactly where the user left off.
             pendingRelayStart?.let { (serverUrl, e164) -> startRelayService(serverUrl, e164) }
             pendingRelayStart = null
         } else {
@@ -444,7 +411,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(
                 this,
                 "\u26a0\ufe0f Denied: ${denied.joinToString { it.substringAfterLast('.') }}" +
-                "\nRelay may not work fully",
+                "\nCall bridge may not work fully",
                 Toast.LENGTH_LONG
             ).show()
         }
@@ -481,47 +448,23 @@ class MainActivity : AppCompatActivity() {
     // PART 1.3: the ACTIVE/Stop-Relay pill-sync used to live in onResume()
     // here — that UI is now SettingsActivity's own (see its onResume()).
 
+    override fun onResume() {
+        super.onResume()
+        if (::onboardingFlow.isInitialized) onboardingFlow.onResume()
+        // Default-dialer role revoked in system Settings while backgrounded.
+        if (::phoneTabController.isInitialized) phoneTabController.onHostResume()
+    }
+
     override fun onPause() {
         super.onPause()
         if (smsReceiverRegistered) {
             unregisterReceiver(relaySmsReceiver)
             smsReceiverRegistered = false
         }
-    }
-
-    // â”€â”€ Default dialer prompt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-    private fun checkDefaultDialer() {
-        val prefs = getSharedPreferences("opencall", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("default_dialer_prompted", false)) return
-
-        val tm = getSystemService(TelecomManager::class.java) ?: return
-        if (tm.defaultDialerPackage == packageName) return
-
-        prefs.edit().putBoolean("default_dialer_prompted", true).apply()
-
-        androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("Enable full privacy protection")
-            .setMessage(
-                "Set OpenCall as your default dialer so relay calls show " +
-                "the OCP number \u2014 not your real number."
-            )
-            .setPositiveButton("Set as default") { _, _ ->
-                try {
-                    startActivity(
-                        Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER).apply {
-                            putExtra(
-                                TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME,
-                                packageName
-                            )
-                        }
-                    )
-                } catch (_: Exception) {
-                    Toast.makeText(this, "Could not open dialer settings", Toast.LENGTH_SHORT).show()
-                }
-            }
-            .setNegativeButton("Not now", null)
-            .show()
+        // ONBOARDING REWRITE: RingMarkView's pulse is a running ValueAnimator
+        // — stop it whenever this Activity isn't visible, per the task's own
+        // instruction.
+        if (::onboardingFlow.isInitialized) onboardingFlow.onPause()
     }
 
     // â”€â”€ SMS relay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -533,7 +476,7 @@ class MainActivity : AppCompatActivity() {
                 this, arrayOf(Manifest.permission.SEND_SMS), 102
             )
             Toast.makeText(
-                this, "SMS permission required to relay messages", Toast.LENGTH_LONG
+                this, "SMS permission required to bridge messages", Toast.LENGTH_LONG
             ).show()
             return
         }

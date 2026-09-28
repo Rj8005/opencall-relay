@@ -196,7 +196,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Node ID"
+                    android:text="Device ID"
                     android:textSize="9sp"
                     android:textColor="@color/text_secondary"
                     android:letterSpacing="0.1"
@@ -326,18 +326,31 @@
 
             </LinearLayout>
 
-            <!-- ── Relay node (PART 1.3: moved from the old dashboard,
-                   verbatim — same ids, same behaviour) ──────────────── -->
+            <!-- ── Call bridge (PART 1.3: moved from the old dashboard,
+                   verbatim — same ids, same behaviour); ONBOARDING REWRITE:
+                   the whole section is now wrapped in section_call_bridge,
+                   gone by default — SettingsActivity shows it only when
+                   AppShell.PILLAR_1_ENABLED is true. Was "RELAY NODE" —
+                   renamed along with everything inside it since it stays in
+                   the layout (just hidden) and will read correctly the
+                   moment Pillar 1 ships. ──────────────── -->
+            <LinearLayout
+                android:id="@+id/section_call_bridge"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="RELAY NODE"
+                android:text="CALL BRIDGE"
                 android:textSize="10sp"
                 android:textColor="@color/text_secondary"
                 android:letterSpacing="0.1"
                 android:layout_marginBottom="8dp"/>
 
-            <!-- CARD 1: Node status -->
+            <!-- CARD 1: Bridge status -->
             <LinearLayout
                 android:id="@+id/relay_status_bar"
                 android:layout_width="match_parent"
@@ -358,7 +371,7 @@
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Node status"
+                        android:text="Bridge status"
                         android:textSize="10sp"
                         android:textColor="@color/text_secondary"
                         android:letterSpacing="0.1"
@@ -483,7 +496,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="48dp"
                     android:layout_marginTop="14dp"
-                    android:text="Start Relay"
+                    android:text="Start Bridge"
                     android:textSize="14sp"
                     android:textStyle="bold"
                     android:textColor="@color/accent_green"
@@ -492,7 +505,7 @@
 
             </LinearLayout>
 
-            <!-- CARD 2: Relay mode -->
+            <!-- CARD 2: Bridge mode -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -504,7 +517,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Relay mode"
+                    android:text="Bridge mode"
                     android:textSize="10sp"
                     android:textColor="@color/text_secondary"
                     android:letterSpacing="0.1"
@@ -654,6 +667,9 @@
                 </LinearLayout>
 
             </LinearLayout>
+
+            </LinearLayout>
+            <!-- /section_call_bridge -->
 
             <!-- CARD 3: Credits -->
             <LinearLayout

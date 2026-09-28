@@ -279,11 +279,11 @@ class RelaySettingsFragment : BottomSheetDialogFragment() {
         val black   = Color.parseColor("#0a0a0a")
 
         btn.isEnabled = true
-        btn.text      = if (running) "STOP RELAY" else "START RELAY"
+        btn.text      = if (running) "STOP BRIDGE" else "START BRIDGE"
         btn.setBackgroundColor(if (running) red else accent)
         btn.setTextColor(black)
 
-        status.text = if (running) "● Relay is ACTIVE" else "○ Relay is STOPPED"
+        status.text = if (running) "● Bridge is ACTIVE" else "○ Bridge is STOPPED"
         status.setTextColor(if (running) accent else grey)
 
         credits.text = "Credits: ${prefs.getInt("credits", 0)}"
@@ -297,7 +297,7 @@ class RelaySettingsFragment : BottomSheetDialogFragment() {
             .getString("relay_id", "") ?: ""
 
         if (ocpAddress.isEmpty()) {
-            tvInviteLink?.text = "Start relay once to get your address"
+            tvInviteLink?.text = "Start the bridge once to get your address"
             return
         }
 
