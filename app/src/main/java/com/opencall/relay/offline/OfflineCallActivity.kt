@@ -952,6 +952,22 @@ class OfflineCallActivity : AppCompatActivity() {
     // all. In-memory only, same lifetime as chatMessages itself.
     private data class ThreadPreview(var lastText: String, var lastFromMe: Boolean, var lastAtMs: Long, var unread: Int)
     private val threadPreviews = mutableMapOf<Long, ThreadPreview>()
+
+    /** B2 (diagnostic follow-up): the chat-wipe half of DuressPin.trigger()
+     *  — chatMessages/threadPreviews are private, in-memory, instance-scoped
+     *  state, so DuressPin (a standalone Context-only object) cannot reach
+     *  them; a caller wiring the duress trigger inside a live
+     *  OfflineCallActivity calls this directly instead. Not wired to
+     *  anything yet — see DuressPin's own class doc for the open question
+     *  on where the trigger itself lives. Safe to call even if chat was
+     *  never opened this session (chatAdapter may not exist yet). */
+    fun wipeChatForDuress() {
+        chatMessages.clear()
+        threadPreviews.clear()
+        if (::chatAdapter.isInitialized) chatAdapter.notifyDataSetChanged()
+        Log.w("OFFTRACE", "DURESS: chat wiped")
+    }
+
     // Which thread's overlay is currently open — that thread's unread count
     // never increments while it's the one on screen.
     private var openThreadKey: Long? = null
