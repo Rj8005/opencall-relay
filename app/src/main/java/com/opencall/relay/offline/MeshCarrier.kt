@@ -186,7 +186,15 @@ class MeshCarrier private constructor(context: Context) {
     private val queue = ConcurrentHashMap<String, Queued>()
     private val dirtyMsgIds = ConcurrentHashMap.newKeySet<String>()
 
-    private val ioThread = HandlerThread("MeshCarrierIO").apply { start() }
+    // STABILITY AUDIT 3.1c: without an uncaught-exception handler, an
+    // exception on this thread silently kills it — same guard as
+    // RoutingTable's PeerLink writer thread.
+    private val ioThread = HandlerThread("MeshCarrierIO").apply {
+        setUncaughtExceptionHandler { thread, e ->
+            Log.e("OFFTRACE", "CRASH-GUARD: ${thread.name} caught ${e.javaClass.simpleName}: ${e.message} - ${Log.getStackTraceString(e)}")
+        }
+        start()
+    }
     private val ioHandler = Handler(ioThread.looper)
     @Volatile private var periodicFlushScheduled = false
     private val periodicFlush = object : Runnable {

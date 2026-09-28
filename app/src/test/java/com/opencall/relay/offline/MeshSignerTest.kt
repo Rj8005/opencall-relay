@@ -238,6 +238,9 @@ class MeshSignerTest {
     // instance-tested either — only its pure building blocks are).
 
     private val TYPE_SOS: Byte = 20
+    private val TYPE_FIND_REQ: Byte = 21
+    private val TYPE_FIND_RESP: Byte = 22
+    private val TYPE_POSITION: Byte = 23
 
     /** Builds a wire-format carried inner payload — innerPayload || timestamp
      *  (4B) || signature (64B) — exactly what MeshSosManager.cacheForCarry now
@@ -355,5 +358,57 @@ class MeshSignerTest {
         val payload = buildCarriedPayload(originId, finalDstId, TYPE_SOS, sixHoursAgo, "sos-fix-bytes".toByteArray(), priv)
         val split = MeshSigner.splitCarriedTrailer(payload)!!
         assertTrue(MeshSigner.verifyCarriedTrailer(originId, finalDstId, TYPE_SOS, split, pub.encoded))
+    }
+
+    // ── Part 4: dispatchCarriedInner widened from TYPE_SOS-only to every
+    // MeshSosManager.isSosFindType type (SOS/FIND_REQ/FIND_RESP/POSITION) — a
+    // carried FIND_REQ, FIND_RESP or POSITION now goes through this exact same
+    // verifyCarried chokepoint (splitCarriedTrailer + verifyCarriedTrailer)
+    // before it can ever reach dispatchLocal, instead of the old unverified
+    // dedupe-then-dispatch fallback. These mirror the TYPE_SOS bad/absent
+    // signature tests above, one per newly-widened type.
+
+    @Test
+    fun `a carried FIND_REQ, FIND_RESP or POSITION with a bad signature is rejected`() {
+        val (priv, pub) = randomKeypair()
+        val originId = 0xAABBCCDDL
+        val finalDstId = MeshFrame.BROADCAST_ID
+        val timestampSec = 1_700_000_000L - 60L
+        for (type in listOf(TYPE_FIND_REQ, TYPE_FIND_RESP, TYPE_POSITION)) {
+            val payload = buildCarriedPayload(originId, finalDstId, type, timestampSec, "loc-fix-bytes".toByteArray(), priv)
+            payload[0] = (payload[0].toInt() xor 0x01).toByte() // flip one byte of the inner payload
+            val split = MeshSigner.splitCarriedTrailer(payload)!!
+            assertFalse(
+                "carried type=$type with a flipped payload byte must fail verification",
+                MeshSigner.verifyCarriedTrailer(originId, finalDstId, type, split, pub.encoded)
+            )
+        }
+    }
+
+    @Test
+    fun `a carried FIND_REQ, FIND_RESP or POSITION with no signature trailer at all is rejected outright`() {
+        val bareInner = "no trailer at all, just raw bytes".toByteArray()
+        for (type in listOf(TYPE_FIND_REQ, TYPE_FIND_RESP, TYPE_POSITION)) {
+            // splitCarriedTrailer doesn't take a type param — a missing trailer
+            // is rejected purely on shape, same as the TYPE_SOS case above; the
+            // per-type assertion here just documents this covers all three.
+            assertNull("type=$type with no trailer must not split", MeshSigner.splitCarriedTrailer(bareInner))
+        }
+    }
+
+    @Test
+    fun `a carried FIND_REQ, FIND_RESP or POSITION with a valid signature still verifies — the widening does not break legitimate traffic`() {
+        val (priv, pub) = randomKeypair()
+        val originId = 0x99887766L
+        val finalDstId = MeshFrame.BROADCAST_ID
+        val timestampSec = 1_700_000_000L - 30L
+        for (type in listOf(TYPE_FIND_REQ, TYPE_FIND_RESP, TYPE_POSITION)) {
+            val payload = buildCarriedPayload(originId, finalDstId, type, timestampSec, "loc-fix-bytes".toByteArray(), priv)
+            val split = MeshSigner.splitCarriedTrailer(payload)!!
+            assertTrue(
+                "carried type=$type with a genuinely valid signature must verify",
+                MeshSigner.verifyCarriedTrailer(originId, finalDstId, type, split, pub.encoded)
+            )
+        }
     }
 }

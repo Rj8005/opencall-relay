@@ -209,7 +209,7 @@ class SosSsidBroadcast private constructor(context: Context) {
         // call fails outright, nothing was ever changed, so there's nothing to
         // restore; if it succeeds, we restore to a fixed OpenCall default name
         // rather than a name we can't actually read back.
-        originalDeviceName = "OpenCall Relay"
+        originalDeviceName = "OpenCall"
     }
 
     private fun trySetDeviceNameViaReflection(name: String): Boolean {

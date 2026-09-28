@@ -15,11 +15,18 @@ import kotlin.math.roundToInt
  * envelope (see OfflineMediaTransport's class doc for the frame types
  * themselves) using [MeshLocation] as the shared wire payload.
  *
- * SECURITY NOTE — READ BEFORE RELYING ON THIS: SOS/FIND/POSITION frames are
- * completely UNAUTHENTICATED, the same trust model as every other frame type in
- * this protocol. [OfflineIdentity]'s private key is generated and immediately
- * discarded, so signing these frames is out of scope for this phase; this class
- * deliberately does not attempt any crypto.
+ * SECURITY NOTE: SOS/FIND/POSITION frames were originally completely
+ * UNAUTHENTICATED (this class's original PHASE 5A/5BC trust model, back when
+ * [OfflineIdentity]'s private key was generated and immediately discarded).
+ * That is no longer true: PHASE 7A gave every device a persisted signing
+ * identity, and a LIVE frame of any of these four types is now
+ * signature-verified by MeshSigner.verifyIncoming before it ever reaches this
+ * class (see OfflineMediaTransport.routeFrame). A CARRIED (store-and-forward)
+ * delivery of any of these four types is likewise verified by
+ * MeshSigner.verifyCarried before it reaches this class (see
+ * OfflineMediaTransport.dispatchCarriedInner). This class itself still does
+ * not attempt any crypto of its own — it only ever sees payloads MeshSigner
+ * has already accepted.
  *
  * PHASE 5BC additions over PHASE 5A:
  *   - TYPE_POSITION: a 30s ambient broadcast, independent of any SOS, that feeds

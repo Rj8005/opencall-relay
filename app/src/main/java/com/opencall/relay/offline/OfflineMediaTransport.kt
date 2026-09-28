@@ -1536,7 +1536,7 @@ class OfflineMediaTransport(
         // handleSosFrame, unlike every other carried type below (which keeps
         // the exact pre-existing dedupe-then-dispatch behavior). See
         // MeshSigner.verifyCarried's doc for the full A2-A5 rationale.
-        if (innerType == TYPE_SOS) {
+        if (meshSosManager.isSosFindType(innerType)) {
             when (val result = meshSigner.verifyCarried(originId, finalDstId, innerType, inner, carrierId, hopCount)) {
                 is MeshSigner.CarriedVerifyResult.Accepted -> {
                     // Re-applies MeshSosManager's own msgSeq-based dedupe to the
@@ -1851,6 +1851,16 @@ class OfflineMediaTransport(
     // received pre-mixed from the GO. Never touched by a 1:1 call (that keeps using
     // the single audioDecoder/opusDecodeQueue below).
     private val groupAudioDecoders = ConcurrentHashMap<Long, MediaCodec>()
+    // STABILITY AUDIT 2.2: MediaCodec is not thread-safe — decodeGroupAudio runs
+    // on that srcId's own MediaReadLoop-$idx thread on every inbound TYPE_AUDIO
+    // frame, while releaseGroupAudioDecoder for the SAME srcId can fire from the
+    // main thread (peer decline/kick, group-call teardown) or from a DIFFERENT
+    // read thread mid reconnect churn — the exact same race the video decoders'
+    // groupDecoderLocks/groupDecoderLock exist to prevent (see that field's own
+    // doc just above the video maps). One lock object per srcId, held by every
+    // decode/release for that srcId, mirrored exactly from the video path.
+    private val groupAudioDecoderLocks = ConcurrentHashMap<Long, Any>()
+    private fun groupAudioDecoderLock(srcId: Long): Any = groupAudioDecoderLocks.getOrPut(srcId) { Any() }
     // Each sender's own announced outgoing codec (see TYPE_AUDIO_CODEC handling) —
     // defaults to PCM, same fallback convention as the 1:1 path's remoteAudioCodec.
     private val groupRemoteAudioCodec = ConcurrentHashMap<Long, AudioCodec>()
@@ -6499,7 +6509,13 @@ class OfflineMediaTransport(
             }
             status == PowerManager.THERMAL_STATUS_MODERATE -> {
                 thermalForcedTier = LADDER_TIER3
-                if (groupCall != null) applyResolutionLadder(groupCall!!.participants.size) else if (encoder != null) applyResolutionLadder(0)
+                // STABILITY AUDIT 1b: [groupCall] is @Volatile and can be
+                // nulled by endGroupCallState() on a different thread (e.g.
+                // the read-loop thread, once the participant count drops
+                // below 2) between this check and a re-read — capture a
+                // local val, exactly as the SEVERE branch above already does.
+                val gc = groupCall
+                if (gc != null) applyResolutionLadder(gc.participants.size) else if (encoder != null) applyResolutionLadder(0)
                 Log.d("OFFTRACE", "THERMAL: status=$statusStr encoderThrottled=true")
             }
             else -> {
@@ -7123,47 +7139,55 @@ class OfflineMediaTransport(
 
     // ── PHASE 3D: multi-sender group AUDIO receive (per-sender decode + local mix) ──
     // Same MediaCodec usage/csd as the 1:1 Opus decoder above (configureOpusAudioDecoder
-    // is shared), just one instance per remote sender instead of one shared field —
-    // exact same pattern as the group VIDEO decoders further up this file. Called
-    // directly off dispatchLocal, on the read loop thread, same as the video path.
+    // is shared), just one instance per remote sender instead of one shared field.
+    // STABILITY AUDIT 2.2: called directly off dispatchLocal, on that srcId's own
+    // read loop thread — same as the group VIDEO decoders — and now actually
+    // synchronized under [groupAudioDecoderLock] the same way, so a concurrent
+    // [releaseGroupAudioDecoder] on the main thread can never race a decode call
+    // for the same srcId onto the same (possibly just-released) MediaCodec.
 
     private fun decodeGroupAudio(srcId: Long, opusBytes: ByteArray): ByteArray? {
-        val dec = groupAudioDecoders.getOrPut(srcId) { configureOpusAudioDecoder() ?: return null }
-        return try {
-            val inIdx = dec.dequeueInputBuffer(10_000L)
-            if (inIdx >= 0) {
-                val buf = dec.getInputBuffer(inIdx)!!
-                buf.clear()
-                buf.put(opusBytes)
-                dec.queueInputBuffer(inIdx, 0, opusBytes.size, System.nanoTime() / 1000, 0)
-            }
-            val chunks = mutableListOf<ByteArray>()
-            val info = MediaCodec.BufferInfo()
-            while (true) {
-                val outIdx = dec.dequeueOutputBuffer(info, 0)
-                when {
-                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> break
-                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> handleGroupAudioOutputFormatChanged(dec.outputFormat)
-                    outIdx == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> { /* deprecated, no-op */ }
-                    outIdx >= 0 -> {
-                        if (info.size > 0) {
-                            val outBuf = dec.getOutputBuffer(outIdx)
-                            if (outBuf != null) {
-                                val pcm = ByteArray(info.size)
-                                outBuf.position(info.offset)
-                                outBuf.limit(info.offset + info.size)
-                                outBuf.get(pcm)
-                                chunks.add(pcm)
+        // B1 (mirrors feedGroupDecoder): holds the per-srcId lock for the whole
+        // decode call — getOrPut's configure included — never across a socket
+        // write (there is none on this path).
+        synchronized(groupAudioDecoderLock(srcId)) {
+            val dec = groupAudioDecoders.getOrPut(srcId) { configureOpusAudioDecoder() ?: return null }
+            return try {
+                val inIdx = dec.dequeueInputBuffer(10_000L)
+                if (inIdx >= 0) {
+                    val buf = dec.getInputBuffer(inIdx)!!
+                    buf.clear()
+                    buf.put(opusBytes)
+                    dec.queueInputBuffer(inIdx, 0, opusBytes.size, System.nanoTime() / 1000, 0)
+                }
+                val chunks = mutableListOf<ByteArray>()
+                val info = MediaCodec.BufferInfo()
+                while (true) {
+                    val outIdx = dec.dequeueOutputBuffer(info, 0)
+                    when {
+                        outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> break
+                        outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> handleGroupAudioOutputFormatChanged(dec.outputFormat)
+                        outIdx == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> { /* deprecated, no-op */ }
+                        outIdx >= 0 -> {
+                            if (info.size > 0) {
+                                val outBuf = dec.getOutputBuffer(outIdx)
+                                if (outBuf != null) {
+                                    val pcm = ByteArray(info.size)
+                                    outBuf.position(info.offset)
+                                    outBuf.limit(info.offset + info.size)
+                                    outBuf.get(pcm)
+                                    chunks.add(pcm)
+                                }
                             }
+                            dec.releaseOutputBuffer(outIdx, false)
                         }
-                        dec.releaseOutputBuffer(outIdx, false)
                     }
                 }
+                if (chunks.isEmpty()) null else if (chunks.size == 1) chunks[0] else combineByteArrays(chunks)
+            } catch (e: Exception) {
+                logE("OFFTRACE: MEDIA: group audio decode for ${MeshFrame.hex(srcId)} failed: ${e.message}")
+                null
             }
-            if (chunks.isEmpty()) null else if (chunks.size == 1) chunks[0] else combineByteArrays(chunks)
-        } catch (e: Exception) {
-            logE("OFFTRACE: MEDIA: group audio decode for ${MeshFrame.hex(srcId)} failed: ${e.message}")
-            null
         }
     }
 
@@ -7237,7 +7261,13 @@ class OfflineMediaTransport(
     }
 
     private fun releaseGroupAudioDecoder(srcId: Long) {
-        groupAudioDecoders.remove(srcId)?.let { try { it.stop(); it.release() } catch (_: Exception) {} }
+        // STABILITY AUDIT 2.2: same per-srcId lock decodeGroupAudio holds —
+        // without it, a release racing a decode on the SAME MediaCodec object
+        // is a use-after-release, exactly as releaseGroupDecoder's identical
+        // comment (video path) describes.
+        synchronized(groupAudioDecoderLock(srcId)) {
+            groupAudioDecoders.remove(srcId)?.let { try { it.stop(); it.release() } catch (_: Exception) {} }
+        }
         groupRemoteAudioCodec.remove(srcId)
         groupLatestPcm.remove(srcId)
         groupLatestPcmMs.remove(srcId)
@@ -7563,11 +7593,15 @@ class OfflineMediaTransport(
      *  entry at all, but still populate groupRemoteAudioCodec/groupLatestPcm), which
      *  would otherwise leak stale entries into the next call. */
     private fun releaseAllGroupAudioDecoders() {
-        groupAudioDecoders.values.forEach { try { it.stop(); it.release() } catch (_: Exception) {} }
-        groupAudioDecoders.clear()
+        // STABILITY AUDIT 2.2: delegates to the locked single-srcId release
+        // (same structure as releaseAllGroupDecoders' video-path equivalent)
+        // instead of iterating groupAudioDecoders.values directly, which used
+        // to release every decoder with no lock held at all.
+        groupAudioDecoders.keys.toList().forEach { releaseGroupAudioDecoder(it) }
         groupRemoteAudioCodec.clear()
         groupLatestPcm.clear()
         groupLatestPcmMs.clear()
+        groupAudioDecoderLocks.clear()
     }
 
     private fun buildOpusIdHeader(): ByteArray {

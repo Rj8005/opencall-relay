@@ -201,30 +201,59 @@ class LocalSignaling(
      *  dead peer. */
     private fun startKeepalive() {
         var lastPingSentMs = System.currentTimeMillis()
-        keepaliveThread = Thread {
+        val t = Thread({
             while (running.get()) {
-                try { Thread.sleep(KEEPALIVE_CHECK_INTERVAL_MS) } catch (_: InterruptedException) { return@Thread }
-                val now = System.currentTimeMillis()
-                val silentMs = now - lastReceivedAtMs
-                if (silentMs >= KEEPALIVE_TIMEOUT_MS) {
-                    Log.e("OFFTRACE", "signaling: keepalive timeout — no message in ${KEEPALIVE_TIMEOUT_MS}ms")
-                    reportPeerGone("keepalive timeout")
-                    return@Thread
-                }
-                if (silentMs >= DEGRADED_THRESHOLD_MS) {
-                    if (degradedReported.compareAndSet(false, true)) {
-                        Log.w("OFFTRACE", "SIG: link degraded, ${silentMs / 1000}s silent")
-                        mainHandler.post { onDegraded?.invoke(silentMs) }
+                // STABILITY AUDIT 3.1a: the whole loop body — not just
+                // Thread.sleep — is now inside this try/catch. This thread
+                // is the dead-link watchdog for the whole WFD group
+                // connection; before this fix an uncaught exception ANYWHERE
+                // in the body (ping build, degraded/recovered transitions,
+                // reportPeerGone) killed it silently, permanently disabling
+                // link-loss detection for the rest of the call while the UI
+                // kept showing "connected". Template: RoutingTable's
+                // PeerLink.startWriter, which pairs a try/catch around its
+                // whole loop with a setUncaughtExceptionHandler below —
+                // adapted here so a caught exception logs at ERROR and the
+                // loop keeps running, instead of the writer thread's "this
+                // exception means the link itself is dead, let it die" intent.
+                try {
+                    Thread.sleep(KEEPALIVE_CHECK_INTERVAL_MS)
+                    val now = System.currentTimeMillis()
+                    val silentMs = now - lastReceivedAtMs
+                    if (silentMs >= KEEPALIVE_TIMEOUT_MS) {
+                        Log.e("OFFTRACE", "signaling: keepalive timeout — no message in ${KEEPALIVE_TIMEOUT_MS}ms")
+                        reportPeerGone("keepalive timeout")
+                        return@Thread
                     }
-                } else if (degradedReported.compareAndSet(true, false)) {
-                    mainHandler.post { onRecovered?.invoke() }
-                }
-                if (now - lastPingSentMs >= PING_INTERVAL_MS) {
-                    send(JSONObject().put("t", "ping"))
-                    lastPingSentMs = now
+                    if (silentMs >= DEGRADED_THRESHOLD_MS) {
+                        if (degradedReported.compareAndSet(false, true)) {
+                            Log.w("OFFTRACE", "SIG: link degraded, ${silentMs / 1000}s silent")
+                            mainHandler.post { onDegraded?.invoke(silentMs) }
+                        }
+                    } else if (degradedReported.compareAndSet(true, false)) {
+                        mainHandler.post { onRecovered?.invoke() }
+                    }
+                    if (now - lastPingSentMs >= PING_INTERVAL_MS) {
+                        send(JSONObject().put("t", "ping"))
+                        lastPingSentMs = now
+                    }
+                } catch (_: InterruptedException) {
+                    // Expected on close()/interrupt — this really does mean stop.
+                    return@Thread
+                } catch (e: Exception) {
+                    Log.e("OFFTRACE", "signaling: keepalive loop caught ${e.javaClass.simpleName}: ${e.message} - ${Log.getStackTraceString(e)}")
                 }
             }
-        }.also { it.start() }
+        }, "LocalSignalingKeepalive")
+        // Belt-and-suspenders, same as RoutingTable's writer thread — catches
+        // anything that somehow still escapes the try/catch above (e.g. an
+        // Error, not an Exception); the thread is already terminating by the
+        // time this fires, so it can only log, not resume the loop.
+        t.setUncaughtExceptionHandler { thread, e ->
+            Log.e("OFFTRACE", "CRASH-GUARD: ${thread.name} caught ${e.javaClass.simpleName}: ${e.message} - ${Log.getStackTraceString(e)}")
+        }
+        keepaliveThread = t
+        t.start()
     }
 
     private fun reportPeerGone(reason: String) {

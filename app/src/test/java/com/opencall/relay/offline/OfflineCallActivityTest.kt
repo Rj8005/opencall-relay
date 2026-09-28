@@ -588,6 +588,81 @@ class OfflineCallActivityTest {
         }
     }
 
+    // ── STABILITY AUDIT 1a: gridRebuildMustClearFirst — the crash-fix decision core ──
+    // Confirmed real-hardware crash: GridLayout.setColumnCount throws
+    // "columnCount must be >= max grid index" whenever a still-attached
+    // child holds a spec index from a wider grid than the count being set —
+    // i.e. whenever the grid SHAPE shrinks in either dimension. This
+    // exercises every (old participant count, new participant count) pair
+    // in 2..8 through the real gridDimensionsFor mapping, and confirms the
+    // decision always matches the actual shape comparison — never a false
+    // negative (which would still crash) and never a false positive (which
+    // would silently reintroduce the FIX 4 black-tile regression by
+    // detaching tiles on an ordinary grow).
+
+    @Test
+    fun `gridRebuildMustClearFirst matches an actual shape shrink for every participant-count pair in 2 through 8`() {
+        for (oldCount in 2..8) {
+            for (newCount in 2..8) {
+                val (oldRows, oldCols) = OfflineCallActivity.gridDimensionsFor(oldCount)
+                val (newRows, newCols) = OfflineCallActivity.gridDimensionsFor(newCount)
+                val expected = newRows < oldRows || newCols < oldCols
+                val actual = OfflineCallActivity.gridRebuildMustClearFirst(oldRows, oldCols, newRows, newCols)
+                assertEquals(
+                    "oldCount=$oldCount (${oldRows}x$oldCols) -> newCount=$newCount (${newRows}x$newCols): " +
+                        "expected mustClear=$expected",
+                    expected,
+                    actual
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `every real shrink transition that would crash GridLayout is caught`() {
+        // Concrete known shrinks from the gridDimensionsFor table (not every
+        // count decrease shrinks the SHAPE — e.g. 6 to 5 stays 2x3 — but
+        // every one of these genuinely reduces rows or cols and must clear).
+        val shrinkTransitions = listOf(
+            3 to 2,  // 2x2 -> 1x2 (rows 2->1)
+            4 to 2,  // 2x2 -> 1x2 (rows 2->1)
+            5 to 4,  // 2x3 -> 2x2 (cols 3->2)
+            6 to 4,  // 2x3 -> 2x2 (cols 3->2)
+            7 to 6,  // 3x3 -> 2x3 (rows 3->2)
+            8 to 6   // 3x3 -> 2x3 (rows 3->2)
+        )
+        shrinkTransitions.forEach { (oldCount, newCount) ->
+            val (oldRows, oldCols) = OfflineCallActivity.gridDimensionsFor(oldCount)
+            val (newRows, newCols) = OfflineCallActivity.gridDimensionsFor(newCount)
+            assertTrue(
+                "oldCount=$oldCount -> newCount=$newCount must require clearing first",
+                OfflineCallActivity.gridRebuildMustClearFirst(oldRows, oldCols, newRows, newCols)
+            )
+        }
+    }
+
+    @Test
+    fun `a grow never requires clearing — preserves FIX 4's no-detach optimization`() {
+        for (oldCount in 2..8) {
+            for (newCount in oldCount..8) {
+                val (oldRows, oldCols) = OfflineCallActivity.gridDimensionsFor(oldCount)
+                val (newRows, newCols) = OfflineCallActivity.gridDimensionsFor(newCount)
+                assertFalse(
+                    "oldCount=$oldCount -> newCount=$newCount (never smaller) must NOT require clearing",
+                    OfflineCallActivity.gridRebuildMustClearFirst(oldRows, oldCols, newRows, newCols)
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `an unchanged shape never requires clearing`() {
+        // 3 and 4 participants share 2x2; 5 and 6 share 2x3; 7 and 8 share 3x3.
+        assertFalse(OfflineCallActivity.gridRebuildMustClearFirst(2, 2, 2, 2))
+        assertFalse(OfflineCallActivity.gridRebuildMustClearFirst(2, 3, 2, 3))
+        assertFalse(OfflineCallActivity.gridRebuildMustClearFirst(3, 3, 3, 3))
+    }
+
     @Test
     fun `local tile is shrunk only at exactly 8 participants`() {
         assertEquals(1f, OfflineCallActivity.localTileWeightFor(7, nodeId = 1L, localNodeId = 1L))

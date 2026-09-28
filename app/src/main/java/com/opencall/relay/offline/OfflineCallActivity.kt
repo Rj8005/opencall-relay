@@ -188,6 +188,30 @@ class OfflineCallActivity : AppCompatActivity() {
             else -> 3 to 3
         }
 
+        /** STABILITY AUDIT 1a: GridLayout.setColumnCount/setRowCount throws
+         *  IllegalArgumentException("columnCount must be >= max grid index")
+         *  if any currently-attached child still holds a column/row spec
+         *  index from a WIDER grid than the count being set — exactly what
+         *  happens whenever participant count decreases and rebuildGroupCallGrid
+         *  shrinks (rows, cols) without first detaching the stale children
+         *  (confirmed real-hardware crash at rebuildGroupCallGrid:7538/7539).
+         *
+         *  True iff applying (newRows, newCols) to a grid currently sized
+         *  (oldRows, oldCols) is a shrink in either dimension — the only case
+         *  that can trip the invariant above; a grow (or same-size) is always
+         *  safe to apply directly, since every existing child's spec index is
+         *  already within the new, larger-or-equal bounds. Deliberately NOT
+         *  "always clear first" (which is what the focus-mode branch five
+         *  lines away does, safely, because focus mode always detaches every
+         *  OTHER tile by design): unconditionally clearing here would defeat
+         *  addTileToGrid's FIX 4 optimization (re-specing an already-parented
+         *  tile's LayoutParams in place instead of detach+re-add) on every
+         *  ordinary GROWTH reshape too, reintroducing the exact "3-device
+         *  black-tile bug" FIX 4 was written to prevent (see rebuildGroupCallGrid's
+         *  class doc) as a side effect of fixing the shrink crash. */
+        fun gridRebuildMustClearFirst(oldRows: Int, oldCols: Int, newRows: Int, newCols: Int): Boolean =
+            newRows < oldRows || newCols < oldCols
+
         /** OCP PHASE 5.3: at exactly 8 participants, 3x3 has one leftover
          *  cell — rather than an obviously blank gap, the LOCAL tile
          *  (always visible, never the most important tile to a viewer
@@ -5516,6 +5540,22 @@ class OfflineCallActivity : AppCompatActivity() {
 
     // ── Connection → local signaling → mesh transport ───────────────────────────
 
+    /** STABILITY AUDIT 1c: guards a Toast/AlertDialog raised from a transport
+     *  callback's runOnUiThread block. Those are queued from a background
+     *  thread (the media read loop, a WifiP2pManager callback) and can still
+     *  fire after this Activity has started finishing or been destroyed —
+     *  the user backing out mid-call, or the system recreating the Activity,
+     *  races exactly the kind of queued Handler message this guards. Raising
+     *  a Toast/AlertDialog against a dead window throws
+     *  WindowManager.BadTokenException, crashing the whole process. Only
+     *  wraps the six transport-callback sites that actually raise a
+     *  Toast/AlertDialog (finding 1c) — the ~30 runOnUiThread bodies at
+     *  5701-5933 are otherwise unchanged (see finding 1d; not fixed here). */
+    private fun runIfActive(action: () -> Unit) {
+        if (isFinishing || isDestroyed) return
+        action()
+    }
+
     private fun onConnectionChanged(info: WifiP2pInfo) {
         // FIX 4: this runs directly as a WifiP2pManager callback on the main thread —
         // any uncaught exception here kills the whole process. Never let one escape.
@@ -5761,11 +5801,13 @@ class OfflineCallActivity : AppCompatActivity() {
             runOnUiThread {
                 groupCallLocalCameraOn = false
                 updateGroupCallControlsBar()
-                Toast.makeText(
-                    this,
-                    "Too many cameras on (4 max) — ask someone to turn theirs off",
-                    Toast.LENGTH_LONG
-                ).show()
+                runIfActive {
+                    Toast.makeText(
+                        this,
+                        "Too many cameras on (4 max) — ask someone to turn theirs off",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         }
         // PHASE 8 STEP 2: a peer's video decoder failing — show "video
@@ -5794,14 +5836,14 @@ class OfflineCallActivity : AppCompatActivity() {
         transport.onCallEnded = { reason -> runOnUiThread { onCallEndedRemotely(reason) } }
         transport.onCallBusy = { peerName ->
             runOnUiThread {
-                Toast.makeText(this, "$peerName is busy", Toast.LENGTH_SHORT).show()
+                runIfActive { Toast.makeText(this, "$peerName is busy", Toast.LENGTH_SHORT).show() }
                 returnToRosterScreen()
             }
         }
         transport.onRosterUpdated = { members -> runOnUiThread { updateRosterUi(members) } }
         // PHASE 3B: group call wiring.
         transport.onGroupCallInvite = { _, fromName, mode, callId ->
-            runOnUiThread { showGroupCallInviteDialog(fromName, mode, callId) }
+            runOnUiThread { runIfActive { showGroupCallInviteDialog(fromName, mode, callId) } }
         }
         transport.onGroupCallStarted = { mode, _ -> runOnUiThread { enterGroupCallScreen(mode) } }
         transport.onGroupCallParticipants = { ids ->
@@ -5828,12 +5870,12 @@ class OfflineCallActivity : AppCompatActivity() {
         transport.onGroupCallEnded = { reason ->
             runOnUiThread {
                 if (reason == "no one answered") {
-                    Toast.makeText(this, "No one answered", Toast.LENGTH_SHORT).show()
+                    runIfActive { Toast.makeText(this, "No one answered", Toast.LENGTH_SHORT).show() }
                 }
                 exitGroupCallScreen(reason)
             }
         }
-        transport.onGroupCallRejected = { reason -> runOnUiThread { Toast.makeText(this, reason, Toast.LENGTH_LONG).show() } }
+        transport.onGroupCallRejected = { reason -> runOnUiThread { runIfActive { Toast.makeText(this, reason, Toast.LENGTH_LONG).show() } } }
         // PHASE 5A: SOS/FIND — independent of call state, so wired unconditionally
         // alongside the roster callback above rather than anywhere call-specific.
         transport.onSosEntry = { entry ->
@@ -5884,7 +5926,7 @@ class OfflineCallActivity : AppCompatActivity() {
         transport.onElectionResult = { winnerId, isSelf -> runOnUiThread { handleElectionResult(winnerId, isSelf) } }
         transport.onSplitBrainDetected = { runOnUiThread { handleSplitBrainStandDown() } }
         // PHASE 6 TRACK B3: cellular relay — "TAP TO SEND" confirmation.
-        transport.onRelayPromptReady = { prompt -> runOnUiThread { showRelayPrompt(transport, prompt) } }
+        transport.onRelayPromptReady = { prompt -> runOnUiThread { runIfActive { showRelayPrompt(transport, prompt) } } }
         // PHASE 6 TRACK B2: hands-free trigger countdown — the notification is
         // the reliable always-available surface (see SosTriggers' class doc);
         // this is just an in-app echo while the Activity happens to be visible.
@@ -7534,6 +7576,13 @@ class OfflineCallActivity : AppCompatActivity() {
         } else {
             val ids = groupCallParticipants
             val (rows, cols) = gridDimensionsFor(ids.size)
+            // STABILITY AUDIT 1a: see gridRebuildMustClearFirst's doc — only
+            // clear (removeAllViews(), same order the focus branch above
+            // uses) when actually shrinking; a grow keeps addTileToGrid's
+            // no-detach reflow-in-place path.
+            if (gridRebuildMustClearFirst(groupCallGrid.rowCount, groupCallGrid.columnCount, rows, cols)) {
+                groupCallGrid.removeAllViews()
+            }
             groupCallGrid.rowCount = rows
             groupCallGrid.columnCount = cols
             ids.forEachIndexed { i, id -> addTileToGrid(id, i / cols, i % cols, localTileWeightFor(ids.size, id, mediaTransport?.localNodeId)) }

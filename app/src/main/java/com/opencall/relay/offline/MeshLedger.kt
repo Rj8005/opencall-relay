@@ -276,7 +276,16 @@ class MeshLedger private constructor(context: Context) {
     private val ledgerDir = File(appContext.filesDir, LEDGER_DIR_NAME).apply { mkdirs() }
     private val tracks = ConcurrentHashMap<Long, Track>()
 
-    private val ioThread = HandlerThread("MeshLedgerIO").apply { start() }
+    // STABILITY AUDIT 3.1c: without an uncaught-exception handler, an
+    // exception during a flush/write silently kills this HandlerThread — the
+    // ledger simply stops persisting from then on, with no crash and no log
+    // to explain why. Same guard as RoutingTable's PeerLink writer thread.
+    private val ioThread = HandlerThread("MeshLedgerIO").apply {
+        setUncaughtExceptionHandler { thread, e ->
+            Log.e("OFFTRACE", "CRASH-GUARD: ${thread.name} caught ${e.javaClass.simpleName}: ${e.message} - ${Log.getStackTraceString(e)}")
+        }
+        start()
+    }
     private val ioHandler = Handler(ioThread.looper)
     @Volatile private var periodicFlushScheduled = false
     private val periodicFlush = object : Runnable {

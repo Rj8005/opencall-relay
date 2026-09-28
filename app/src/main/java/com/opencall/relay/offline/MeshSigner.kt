@@ -290,7 +290,15 @@ class MeshSigner(
 
     private val ledgerDir = File(context.filesDir, LEDGER_DIR_NAME).apply { mkdirs() }
     private val pubkeyFile = File(ledgerDir, PUBKEY_FILE_NAME)
-    private val ioThread = HandlerThread("MeshSignerIO").apply { start() }
+    // STABILITY AUDIT 3.1c: without an uncaught-exception handler, an
+    // exception on this thread silently kills it — same guard as
+    // RoutingTable's PeerLink writer thread.
+    private val ioThread = HandlerThread("MeshSignerIO").apply {
+        setUncaughtExceptionHandler { thread, e ->
+            Log.e("OFFTRACE", "CRASH-GUARD: ${thread.name} caught ${e.javaClass.simpleName}: ${e.message} - ${Log.getStackTraceString(e)}")
+        }
+        start()
+    }
     private val ioHandler = Handler(ioThread.looper)
 
     // PHASE 8 STEP 9: "SIG: verify ok" used to fire unconditionally on every
