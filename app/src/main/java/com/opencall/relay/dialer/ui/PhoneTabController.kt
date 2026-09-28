@@ -1,5 +1,7 @@
 package com.opencall.relay.dialer.ui
 
+import android.content.Context
+import android.content.Intent
 import android.telecom.PhoneAccountHandle
 import android.view.Gravity
 import android.view.View
@@ -16,6 +18,9 @@ import com.opencall.relay.dialer.data.ContactsRepository
 import com.opencall.relay.dialer.data.LocalOcpDirectory
 import com.opencall.relay.dialer.data.OcpAccountRef
 import com.opencall.relay.dialer.role.DialerPermissions
+import com.opencall.relay.dialer.role.DialerRoleExplainerActivity
+import com.opencall.relay.dialer.role.DialerRoleManager
+import com.opencall.relay.dialer.role.DialerRoleStateMachine
 import com.opencall.relay.dialer.route.CallRoute
 import com.opencall.relay.dialer.route.CallRouteRegistry
 import com.opencall.relay.dialer.route.CallTarget
@@ -33,20 +38,24 @@ import com.opencall.relay.dialer.telecom.EmergencyCallGuard
  * three permission launchers (they must be registered unconditionally
  * during the host's own initialization) and forwards results in here via
  * [handleCallPermissionResult]/[handleCallLogPermissionResult]/
- * [handleContactsPermissionResult].
+ * [handleContactsPermissionResult]. The same applies to the default-dialer
+ * role explainer's launcher ([handleRoleExplainerResult]) and to the
+ * host's onResume ([onHostResume]).
  */
 class PhoneTabController(
     private val activity: AppCompatActivity,
     private val contentFrame: FrameLayout,
     private val callPermissionLauncher: ActivityResultLauncher<String>,
     private val callLogPermissionLauncher: ActivityResultLauncher<String>,
-    private val contactsPermissionLauncher: ActivityResultLauncher<String>
+    private val contactsPermissionLauncher: ActivityResultLauncher<String>,
+    private val roleExplainerLauncher: ActivityResultLauncher<Intent>
 ) {
     private enum class InnerTab { KEYPAD, LOG, CONTACTS }
     private var innerTab = InnerTab.KEYPAD
 
     private val registry = CallRouteRegistry()
     private val simRoute = SimCallRoute(activity.applicationContext)
+    private val ocpRoute = com.opencall.relay.dialer.route.OcpCallRoute()
 
     private lateinit var dialDisplay: TextView
     private lateinit var t9ResultsList: LinearLayout
@@ -57,9 +66,22 @@ class PhoneTabController(
     private var ocpMatches: Map<String, OcpAccountRef> = emptyMap()
     private var ocpLookupStarted = false
 
+    // Default-dialer role: the banner shown while this app does NOT hold the
+    // role, and the state machine that labels each change (Granted/Denied/
+    // Revoked). Seeded with the real state at construction, so its first
+    // observation is a baseline, not a false "Revoked".
+    private val roleStateMachine = DialerRoleStateMachine().apply {
+        onObserved(DialerRoleManager.currentState(activity))
+    }
+    private var lastRoleEvent: DialerRoleStateMachine.Event = DialerRoleStateMachine.Event.NoChange
+    private var awaitingRoleResult = false
+    private var roleBanner: TextView? = null
+
     fun start() {
         registry.register(simRoute)
+        registry.register(ocpRoute) // PART B.2: always unavailable — see OcpCallRoute's own doc
         render()
+        maybePromptForRoleOnce()
     }
 
     /** 3.1's own "open the keypad with this number ready" entry point —
@@ -82,6 +104,82 @@ class PhoneTabController(
     fun handleCallLogPermissionResult(granted: Boolean) = render()
     fun handleContactsPermissionResult(granted: Boolean) = render()
 
+    // ── Default-dialer role ──────────────────────────────────────────────
+
+    /** Automatic prompt, at most once ever: the first time this tab is
+     *  shown AFTER onboarding. With Pillar 1 hidden, the host shows this tab
+     *  during onCreate on a fresh install while onboarding still covers it,
+     *  so that call must not count; [PREF_ROLE_PROMPTED] is written only once
+     *  `setup_complete` is true. It is written before the role check, so a
+     *  first open where the role is already held also uses up the one
+     *  automatic prompt. */
+    private fun maybePromptForRoleOnce() {
+        val prefs = activity.getSharedPreferences("opencall", Context.MODE_PRIVATE)
+        if (!prefs.getBoolean("setup_complete", false)) return
+        if (prefs.getBoolean(PREF_ROLE_PROMPTED, false)) return
+        prefs.edit().putBoolean(PREF_ROLE_PROMPTED, true).apply()
+        if (DialerRoleManager.isDefaultDialer(activity)) return
+        launchRoleExplainer()
+    }
+
+    private fun launchRoleExplainer() {
+        roleStateMachine.onRequestLaunched()
+        awaitingRoleResult = true
+        roleExplainerLauncher.launch(Intent(activity, DialerRoleExplainerActivity::class.java))
+    }
+
+    /** The explainer returns RESULT_OK only on Granted and RESULT_CANCELED
+     *  otherwise ("Not now", back, or the system prompt declined). Both codes
+     *  come from the explainer's own re-query of the role holder, so the
+     *  state machine here is fed that same ground truth (a fresh
+     *  [DialerRoleManager.currentState]) rather than [resultCode]; the code
+     *  and the re-query cannot disagree. */
+    @Suppress("UNUSED_PARAMETER")
+    fun handleRoleExplainerResult(resultCode: Int) {
+        awaitingRoleResult = false
+        onRoleEvent(roleStateMachine.onObserved(DialerRoleManager.currentState(activity)))
+    }
+
+    /** Host's onResume: catches the role being revoked in system Settings
+     *  while this app was in the background. Skipped while the explainer is
+     *  open, so an onResume that lands before the explainer's result can't
+     *  consume the machine's "request in flight" state and mislabel the
+     *  outcome. */
+    fun onHostResume() {
+        if (awaitingRoleResult) return
+        onRoleEvent(roleStateMachine.onObserved(DialerRoleManager.currentState(activity)))
+    }
+
+    private fun onRoleEvent(event: DialerRoleStateMachine.Event) {
+        if (event == DialerRoleStateMachine.Event.NoChange) return
+        lastRoleEvent = event
+        updateRoleBanner()
+    }
+
+    /** Hidden while the role is held; otherwise a passive banner. Tapping it
+     *  reopens the explainer on request, which is not the automatic prompt. */
+    private fun buildRoleBanner(density: Float): TextView = TextView(activity).apply {
+        textSize = 13f
+        setTextColor(colorOf(R.color.text_primary))
+        setBackgroundColor(colorOf(R.color.bg_card))
+        val pad = (12 * density).toInt()
+        setPadding(pad, pad, pad, pad)
+        setOnClickListener { launchRoleExplainer() }
+    }
+
+    private fun updateRoleBanner() {
+        val banner = roleBanner ?: return
+        if (roleStateMachine.currentlyDefault()) {
+            banner.visibility = View.GONE
+            return
+        }
+        banner.text = if (lastRoleEvent == DialerRoleStateMachine.Event.Revoked)
+            "OpenCall is no longer your default phone app. Tap to set it again."
+        else
+            "OpenCall isn't your default phone app. Tap to set it."
+        banner.visibility = View.VISIBLE
+    }
+
     private fun colorOf(id: Int) = ContextCompat.getColor(activity, id)
 
     // ── PART 3.4: inner Keypad/Log/Contacts sub-nav ──────────────────────
@@ -89,8 +187,12 @@ class PhoneTabController(
     private fun render() {
         contentFrame.removeAllViews()
         val density = activity.resources.displayMetrics.density
+        val banner = buildRoleBanner(density)
+        roleBanner = banner
+        updateRoleBanner()
         val column = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
+            addView(banner)
             addView(buildInnerTabBar(density))
             val body = when (innerTab) {
                 InnerTab.KEYPAD -> buildKeypadScreen(density)
@@ -352,6 +454,12 @@ class PhoneTabController(
 
     // ── dial — emergency bypass first, then the route registry ───────────
 
+    /** PART B.4: route-vs-route, not SIM-vs-SIM — queries every registered
+     *  route ([CallRouteRegistry.routesFor]), builds the picker's row model
+     *  ([CallPickerModel], pure/tested separately), and skips the sheet
+     *  entirely when exactly one row would be actionable — the single-SIM,
+     *  no-mesh case this app runs in today, so existing behaviour for that
+     *  case is unchanged: straight to [CallRouteRegistry.placeVia]. */
     private fun dial(rawNumber: String) {
         val number = rawNumber.trim()
         if (number.isBlank()) return
@@ -369,48 +477,125 @@ class PhoneTabController(
 
         val target = CallTarget(e164Number = number)
         val routes: List<Pair<CallRoute, com.opencall.relay.dialer.route.Reachability>> = registry.routesFor(target)
-        val simEntry = routes.firstOrNull { it.first.id == "sim" }
-        if (simEntry == null || simEntry.second.availability != com.opencall.relay.dialer.route.Availability.AVAILABLE) {
+        val simAvailable = routes.firstOrNull { it.first.id == "sim" }
+            ?.second?.availability == com.opencall.relay.dialer.route.Availability.AVAILABLE
+        // PART B.3 step 2 (once it lands): a real "mesh" route registering
+        // here is the ONLY change this function needs — the id it will use
+        // matches "sim"/"ocp"'s own convention. Until then routesFor never
+        // contains one, so this is always false and "Call nearby" never
+        // shows — see MeshCallRoute's own doc once it exists.
+        val meshAvailable = routes.firstOrNull { it.first.id == "mesh" }
+            ?.second?.availability == com.opencall.relay.dialer.route.Availability.AVAILABLE
+
+        if (!simAvailable && !meshAvailable) {
             Toast.makeText(activity, "Cannot place this call right now (no signal, airplane mode, or no SIM)", Toast.LENGTH_LONG).show()
             return
         }
-        val accounts = simRoute.callCapableAccounts()
-        val account = simRoute.resolveAccount(number)
-        if (accounts.size > 1 && account == null) {
-            showAccountPicker(number, accounts)
-            return
+
+        val accounts = if (simAvailable) simRoute.callCapableAccounts() else emptyList()
+        val simLabels = accounts.map { simRoute.labelFor(it) }
+        val rows = CallPickerModel.buildRows(simLabels, meshAvailable)
+
+        when (val single = CallPickerModel.singleActionableRoute(rows)) {
+            is CallPickerModel.Row.Sim -> placeSimCall(number, target)
+            is CallPickerModel.Row.Mesh -> placeMeshCall(target)
+            null -> showCallPicker(number, target, accounts, rows)
+            is CallPickerModel.Row.Ocp -> Unit // never actionable — CallPickerModel filters this out
         }
+    }
+
+    /** The exact call this function always made before B.4 — a single
+     *  callable SIM resolves its own account internally
+     *  ([SimCallRoute.resolveAccount]), so this is unchanged for the
+     *  single-SIM device this app runs on today. */
+    private fun placeSimCall(number: String, target: CallTarget) {
         val handle = registry.placeVia("sim", target)
         if (handle?.requestAccepted != true) {
             Toast.makeText(activity, handle?.failureReason ?: "Could not place call", Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun showAccountPicker(number: String, accounts: List<PhoneAccountHandle>) {
+    /** Unreachable today (see [dial]'s own doc) — wired for the moment a
+     *  real "mesh" route registers with [Availability.AVAILABLE]. */
+    private fun placeMeshCall(target: CallTarget) {
+        val handle = registry.placeVia("mesh", target)
+        if (handle?.requestAccepted != true) {
+            Toast.makeText(activity, handle?.failureReason ?: "Could not place call", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** PART B.4: one row per SIM, "Call with OpenCall" always greyed
+     *  (OcpCallRoute never accepts a call), "Call nearby" only if [rows]
+     *  contains it. Same dialog/card construction [showAccountPicker] used
+     *  (LinearLayout in an AlertDialog, no new dependency), same type scale/
+     *  colours as every other row in this file. */
+    private fun showCallPicker(
+        number: String,
+        target: CallTarget,
+        accounts: List<PhoneAccountHandle>,
+        rows: List<CallPickerModel.Row>
+    ) {
         val density = activity.resources.displayMetrics.density
         val dialogView = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding((24 * density).toInt(), (24 * density).toInt(), (24 * density).toInt(), (24 * density).toInt())
             addView(TextView(activity).apply {
-                text = "Call with which SIM?"
+                text = "Call with"
                 textSize = 16f
                 setTextColor(colorOf(R.color.text_primary))
             })
         }
         val dialog = androidx.appcompat.app.AlertDialog.Builder(activity).setView(dialogView).create()
-        accounts.forEach { account ->
-            dialogView.addView(android.widget.Button(activity).apply {
-                text = simRoute.labelFor(account)
-                setOnClickListener {
-                    simRoute.rememberAccountChoice(number, account)
-                    dialog.dismiss()
-                    val handle = simRoute.place(CallTarget(e164Number = number), account)
-                    if (!handle.requestAccepted) {
-                        Toast.makeText(activity, handle.failureReason ?: "Could not place call", Toast.LENGTH_LONG).show()
+
+        fun addRow(title: String, subtitle: String?, enabled: Boolean, onClick: () -> Unit) {
+            val row = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                isClickable = enabled
+                isFocusable = enabled
+                minimumHeight = (48 * density).toInt()
+                setPadding(0, (12 * density).toInt(), 0, (12 * density).toInt())
+                if (enabled) setOnClickListener { onClick() }
+            }
+            row.addView(TextView(activity).apply {
+                text = title
+                textSize = 16f
+                setTextColor(colorOf(if (enabled) R.color.text_primary else R.color.text_muted))
+            })
+            if (subtitle != null) {
+                row.addView(TextView(activity).apply {
+                    text = subtitle
+                    textSize = 12f
+                    setTextColor(colorOf(R.color.text_muted))
+                })
+            }
+            dialogView.addView(row)
+        }
+
+        rows.forEach { row ->
+            when (row) {
+                is CallPickerModel.Row.Sim -> {
+                    val account = accounts.getOrNull(row.accountIndex)
+                    addRow(row.label, subtitle = null, enabled = true) {
+                        if (account != null) simRoute.rememberAccountChoice(number, account)
+                        dialog.dismiss()
+                        val handle = simRoute.place(target, account)
+                        if (!handle.requestAccepted) {
+                            Toast.makeText(activity, handle.failureReason ?: "Could not place call", Toast.LENGTH_LONG).show()
+                        }
                     }
                 }
-            })
+                CallPickerModel.Row.Ocp -> addRow("Call with OpenCall", subtitle = "Not provisioned", enabled = false) {}
+                CallPickerModel.Row.Mesh -> addRow("Call nearby", subtitle = null, enabled = true) {
+                    dialog.dismiss()
+                    placeMeshCall(target)
+                }
+            }
         }
         dialog.show()
+    }
+
+    companion object {
+        /** "opencall" prefs key: the one automatic role prompt has been used. */
+        private const val PREF_ROLE_PROMPTED = "phone_tab_role_prompted"
     }
 }

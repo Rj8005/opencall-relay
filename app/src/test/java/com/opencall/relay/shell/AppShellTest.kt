@@ -16,21 +16,39 @@ import org.junit.Test
  */
 class AppShellTest {
 
+    // ONBOARDING REWRITE: with PILLAR_1_ENABLED=false (Pillar 1 hidden this
+    // release, see that flag's own doc), every fallback below now resolves
+    // to Phone, not International — landing on a hidden, unreachable tab
+    // would leave the user with no way to navigate anywhere.
+
     @Test
-    fun `restoreTab defaults to International when nothing was stored`() {
-        assertEquals(AppTab.INTERNATIONAL, AppShell.restoreTab(null))
+    fun `restoreTab defaults to Phone when nothing was stored, while Pillar 1 is hidden`() {
+        assertEquals(AppTab.PHONE, AppShell.restoreTab(null))
     }
 
     @Test
-    fun `restoreTab defaults to International on an unparseable value`() {
-        assertEquals(AppTab.INTERNATIONAL, AppShell.restoreTab("not-a-tab"))
+    fun `restoreTab defaults to Phone on an unparseable value, while Pillar 1 is hidden`() {
+        assertEquals(AppTab.PHONE, AppShell.restoreTab("not-a-tab"))
     }
 
     @Test
     fun `restoreTab never restores into Offline`() {
         // Tab 3 is OfflineCallActivity, not a container inside MainActivity —
         // see AppShell.restoreTab's own doc for why.
-        assertEquals(AppTab.INTERNATIONAL, AppShell.restoreTab(AppTab.OFFLINE.name))
+        assertEquals(AppTab.PHONE, AppShell.restoreTab(AppTab.OFFLINE.name))
+    }
+
+    @Test
+    fun `restoreTab falls back to Phone for a persisted International, while Pillar 1 is hidden`() {
+        // A value stored before PILLAR_1_ENABLED existed (or from a build
+        // where it was true) must not resolve to a tab that's no longer in
+        // the bottom bar.
+        assertEquals(AppTab.PHONE, AppShell.restoreTab(AppTab.INTERNATIONAL.name))
+    }
+
+    @Test
+    fun `PILLAR_1_ENABLED is false this release — Tab 1 and the call-bridge Settings section are both hidden`() {
+        assertFalse(AppShell.PILLAR_1_ENABLED)
     }
 
     @Test

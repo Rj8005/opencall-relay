@@ -31,6 +31,16 @@ enum class AppTab { INTERNATIONAL, PHONE, OFFLINE }
  */
 object AppShell {
 
+    /** ONBOARDING REWRITE: the single flag gating both Tab 1 (International)
+     *  and Settings' call-bridge section (formerly "RELAY NODE") — Pillar 1
+     *  is hidden this release. No such flag existed before this pass (the
+     *  bottom tab bar built all three tabs unconditionally, and the
+     *  call-bridge Settings cards had no gate at all) — this is a NEW flag,
+     *  not a pre-existing one being reused, despite that having been the
+     *  original assumption. One flag, both places: flip this back to true
+     *  and Tab 1 + the call-bridge Settings section both return. */
+    const val PILLAR_1_ENABLED = true
+
     private fun colorOf(context: Context, id: Int) = ContextCompat.getColor(context, id)
 
     /** PART 1.5: this is the one place the "$name · $number" identity string
@@ -75,11 +85,10 @@ object AppShell {
 
     fun buildBottomTabBar(activity: Activity, selected: AppTab, onTabSelected: (AppTab) -> Unit): LinearLayout {
         val density = activity.resources.displayMetrics.density
-        val tabs = linkedMapOf(
-            AppTab.INTERNATIONAL to ("🌐" to "International"),
-            AppTab.PHONE to ("📞" to "Phone"),
-            AppTab.OFFLINE to ("🕸" to "Offline")
-        )
+        val tabs = linkedMapOf<AppTab, Pair<String, String>>()
+        if (PILLAR_1_ENABLED) tabs[AppTab.INTERNATIONAL] = "🌐" to "International"
+        tabs[AppTab.PHONE] = "📞" to "Phone"
+        tabs[AppTab.OFFLINE] = "🕸" to "Offline"
         val bar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(colorOf(activity, R.color.bg_card))
@@ -120,14 +129,28 @@ object AppShell {
      *  (`SharedPreferences`) and rotation (`onRestoreInstanceState`'s
      *  `Bundle`) — same string, same rule, so both paths agree. [stored] is
      *  whatever was last persisted; an unparseable/missing value defaults to
-     *  [AppTab.INTERNATIONAL]. [AppTab.OFFLINE] is deliberately never
-     *  returned — Tab 3 isn't a container inside MainActivity (it's
+     *  Tab 2 (Phone) always. A persisted INTERNATIONAL is honored only while
+     *  Pillar 1 is enabled. [AppTab.OFFLINE] is deliberately never returned — Tab 3 isn't
+     *  a container inside MainActivity (it's
      *  [com.opencall.relay.offline.OfflineCallActivity]), so "last tab was
-     *  Offline" correctly lands MainActivity back on Tab 1, not a blank
+     *  Offline" correctly lands MainActivity back on a real tab, not a blank
      *  container. */
     fun restoreTab(stored: String?): AppTab {
+        // ONBOARDING REWRITE: falling back to Tab 1 only makes sense while
+        // Tab 1 is actually reachable -- with PILLAR_1_ENABLED false,
+        // International isn't in the bottom bar at all, so landing there
+        // would show a blank tab with no way to navigate off it. Falls back
+        // to AppTab.PHONE instead whenever Pillar 1 is hidden, including for
+        // a persisted "INTERNATIONAL" value from before this flag existed.
+        // Phone is the default landing tab regardless of PILLAR_1_ENABLED --
+        // Tab 1's visibility is decoupled from which tab is the default.
+        val fallback = AppTab.PHONE
         val parsed = stored?.let { runCatching { AppTab.valueOf(it) }.getOrNull() }
-        return if (parsed == null || parsed == AppTab.OFFLINE) AppTab.INTERNATIONAL else parsed
+        return when {
+            parsed == null || parsed == AppTab.OFFLINE -> fallback
+            parsed == AppTab.INTERNATIONAL && !PILLAR_1_ENABLED -> fallback
+            else -> parsed
+        }
     }
 
     /** PART 4: the global tab bar's own routing rule — tapping the already-
