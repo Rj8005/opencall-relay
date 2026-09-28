@@ -1381,6 +1381,7 @@ class OfflineMediaTransport(
         isCurrentlyGo = { isGroupOwner },
         visiblePeerCount = { visiblePeerCountForElection() },
         batteryPercent = { readBatteryPercentForElection() },
+        isCharging = { currentBatteryPercentAndCharging().second },
         onGoLost = { onGoLost?.invoke() },
         onElectionResult = { winnerId, isSelf -> onElectionResult?.invoke(winnerId, isSelf) },
         onSplitBrainDetected = { otherGoId -> onSplitBrainDetected?.invoke(otherGoId) }

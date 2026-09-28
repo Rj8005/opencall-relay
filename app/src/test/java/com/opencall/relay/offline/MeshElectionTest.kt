@@ -1,6 +1,7 @@
 package com.opencall.relay.offline
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** PHASE 6 TRACK E: pure-JVM tests for the deterministic election scoring —
@@ -48,5 +49,39 @@ class MeshElectionTest {
     fun `scoreFor clamps out-of-range inputs rather than producing nonsense`() {
         assertEquals(MeshElection.scoreFor(100, 0), MeshElection.scoreFor(150, -5))
         assertEquals(MeshElection.scoreFor(0, 0), MeshElection.scoreFor(-20, -1))
+    }
+
+    @Test
+    fun `charging is a bonus on top of the existing formula, not a replacement for it`() {
+        assertEquals(
+            MeshElection.scoreFor(batteryPercent = 90, peerCount = 1) + 400,
+            MeshElection.scoreFor(batteryPercent = 90, peerCount = 1, charging = true)
+        )
+    }
+
+    @Test
+    fun `charging defaults to false for existing 2-arg callers`() {
+        assertEquals(
+            MeshElection.scoreFor(batteryPercent = 60, peerCount = 3),
+            MeshElection.scoreFor(batteryPercent = 60, peerCount = 3, charging = false)
+        )
+    }
+
+    @Test
+    fun `a charging device can outrank a higher-battery uncharged device`() {
+        // node1: uncharged, 90% battery -> 9010. node2: charging, 70% battery -> 7000+10+400=7410.
+        // A 20-point battery gap is bigger than the 400-point bonus can close...
+        assertTrue(MeshElection.scoreFor(90, 1) > MeshElection.scoreFor(70, 1, charging = true))
+        // ...but a same-decile gap (battery contribution ties at 7000, since the
+        // formula only counts battery in 10%-wide steps) is closed by the bonus:
+        // 74% uncharged -> 7010; 70% charging -> 7410.
+        assertTrue(MeshElection.scoreFor(70, 1, charging = true) > MeshElection.scoreFor(74, 1))
+    }
+
+    @Test
+    fun `charging bonus alone never outweighs a large peer-count lead`() {
+        // node1: charging, 10% battery, 1 peer -> 1000+10+400=1410.
+        // node2: uncharged, 10% battery, 50 peers -> 1000+500=1500.
+        assertTrue(MeshElection.scoreFor(10, 50) > MeshElection.scoreFor(10, 1, charging = true))
     }
 }

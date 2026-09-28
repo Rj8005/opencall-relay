@@ -19,13 +19,21 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * DETERMINISTIC ELECTION — every node reaches the SAME answer with no
  * negotiation round-trip, because every node already has what it needs:
- *   score = (batteryPercent / 10) * 1000 + visiblePeerCount * 10
+ *   score = (batteryPercent / 10) * 1000 + visiblePeerCount * 10 [+ CHARGING_BONUS if charging]
  *   winner = highest score; ties broken by LOWEST nodeId
- * Every device broadcasts its own [batteryPercent, visiblePeerCount] every 10s
- * via TYPE_ELECTION_STATUS (see [handleElectionStatus]) — cheap (2 bytes),
- * continuous, so by the time a GO-lost event fires, every surviving node
- * already has a fresh-enough picture of every other node's inputs to compute
- * the identical winner independently.
+ * Every device broadcasts its own [batteryPercent, visiblePeerCount, charging]
+ * every 10s via TYPE_ELECTION_STATUS (see [handleElectionStatus]) — cheap (3
+ * bytes), continuous, so by the time a GO-lost event fires, every surviving
+ * node already has a fresh-enough picture of every other node's inputs to
+ * compute the identical winner independently.
+ *
+ * CHARGING BONUS: same +0.4-of-max-weight pattern OfflineMediaTransport's
+ * relayDelayMs already uses for charging-aware carry-relay scheduling (see
+ * that function's doc) — scaled onto this formula's 0..1000 battery range,
+ * a charging device gets a flat [CHARGING_BONUS] added to its score. Wire
+ * format is backward compatible: [handleElectionStatus] treats a 2-byte
+ * legacy payload (no charging byte) as charging=false, and this device
+ * still sends the full 3-byte payload regardless of what it receives.
  *
  * visiblePeerCount is (Wi-Fi Direct roster size - self) + (fresh BLE-only
  * presence sightings not already counted in the roster) — see
@@ -48,6 +56,10 @@ class MeshElection(
     private val isCurrentlyGo: () -> Boolean,
     private val visiblePeerCount: () -> Int,
     private val batteryPercent: () -> Int,
+    /** Reuses whatever source of truth the caller already has for charging
+     *  state — e.g. OfflineMediaTransport.currentBatteryPercentAndCharging()'s
+     *  second element — rather than this class reading BatteryManager itself. */
+    private val isCharging: () -> Boolean,
     /** Fired on the main thread once, when a CLIENT hasn't heard a GO heartbeat
      *  in 3 intervals (30s). Never fires on the device that IS the GO. */
     private val onGoLost: () -> Unit,
@@ -62,7 +74,7 @@ class MeshElection(
      *  localNodeId &gt; otherGoId. */
     private val onSplitBrainDetected: (otherGoId: Long) -> Unit
 ) {
-    private data class ScoreInput(val batteryPercent: Int, val peerCount: Int, val updatedAtMs: Long)
+    private data class ScoreInput(val batteryPercent: Int, val peerCount: Int, val charging: Boolean, val updatedAtMs: Long)
 
     companion object {
         private const val HEARTBEAT_INTERVAL_MS = 10_000L
@@ -70,10 +82,17 @@ class MeshElection(
         private const val WATCHDOG_CHECK_INTERVAL_MS = 5_000L
         private const val MISSED_HEARTBEATS_BEFORE_LOST = 3
         private const val GO_LOST_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * MISSED_HEARTBEATS_BEFORE_LOST
+        // 0.4 of the formula's max battery contribution (1000, at 100% battery) —
+        // same proportional weight relayDelayMs gives charging on its own 0..1
+        // scale. Enough to let a charging device outrank an uncharged one with
+        // somewhat higher battery, not enough to outrank a large peer-count lead.
+        private const val CHARGING_BONUS = 400
 
-        /** Pure, unit-testable scoring — no Android dependency. */
-        fun scoreFor(batteryPercent: Int, peerCount: Int): Int =
-            (batteryPercent.coerceIn(0, 100) / 10) * 1000 + peerCount.coerceAtLeast(0) * 10
+        /** Pure, unit-testable scoring — no Android dependency. Existing 2-arg
+         *  callers/tests are unaffected; [charging] defaults false. */
+        fun scoreFor(batteryPercent: Int, peerCount: Int, charging: Boolean = false): Int =
+            (batteryPercent.coerceIn(0, 100) / 10) * 1000 + peerCount.coerceAtLeast(0) * 10 +
+                (if (charging) CHARGING_BONUS else 0)
 
         /** Pure, unit-testable winner selection: highest score, ties broken by
          *  LOWEST nodeId. [candidates] is (nodeId, batteryPercent, peerCount). */
@@ -141,9 +160,10 @@ class MeshElection(
     private fun startStatusBroadcast() {
         val runnable = object : Runnable {
             override fun run() {
-                val buf = ByteBuffer.allocate(2)
+                val buf = ByteBuffer.allocate(3)
                 buf.put(batteryPercent().coerceIn(0, 100).toByte())
                 buf.put(visiblePeerCount().coerceIn(0, 255).toByte())
+                buf.put(if (isCharging()) 1.toByte() else 0.toByte())
                 sendFrame(MeshFrame.BROADCAST_ID, typeElectionStatus, buf.array())
                 mainHandler.postDelayed(this, STATUS_INTERVAL_MS)
             }
@@ -189,21 +209,27 @@ class MeshElection(
         if (payload.size < 2) return
         val battery = payload[0].toInt() and 0xFF
         val peerCount = payload[1].toInt() and 0xFF
-        scores[header.srcId] = ScoreInput(battery, peerCount, System.currentTimeMillis())
+        // Backward compatible: a legacy 2-byte payload (no charging byte) reads as false.
+        val charging = payload.size >= 3 && payload[2].toInt() != 0
+        scores[header.srcId] = ScoreInput(battery, peerCount, charging, System.currentTimeMillis())
     }
+
+    private data class Candidate(val nodeId: Long, val batteryPercent: Int, val peerCount: Int, val charging: Boolean)
 
     /** Runs the deterministic election NOW, using every score this device has
      *  heard (plus its own current inputs) — called once, right after
      *  [onGoLost] fires. Also caches the full ranking so [rankOf] can answer
      *  the staggered-reconnect delay for the caller. */
     fun runElection() {
-        val candidates = mutableListOf(Triple(localNodeId, batteryPercent(), visiblePeerCount()))
-        scores.forEach { (nodeId, s) -> candidates.add(Triple(nodeId, s.batteryPercent, s.peerCount)) }
+        val candidates = mutableListOf(Candidate(localNodeId, batteryPercent(), visiblePeerCount(), isCharging()))
+        scores.forEach { (nodeId, s) -> candidates.add(Candidate(nodeId, s.batteryPercent, s.peerCount, s.charging)) }
         val ranked = candidates
-            .sortedWith(compareByDescending<Triple<Long, Int, Int>> { scoreFor(it.second, it.third) }.thenBy { it.first })
-        lastElectionRanking = ranked.map { it.first }
-        val winner = ranked.first().first
-        val scoresStr = ranked.joinToString(", ") { "${MeshFrame.hex(it.first)}=${scoreFor(it.second, it.third)}" }
+            .sortedWith(compareByDescending<Candidate> { scoreFor(it.batteryPercent, it.peerCount, it.charging) }.thenBy { it.nodeId })
+        lastElectionRanking = ranked.map { it.nodeId }
+        val winner = ranked.first().nodeId
+        val scoresStr = ranked.joinToString(", ") {
+            "${MeshFrame.hex(it.nodeId)}=${scoreFor(it.batteryPercent, it.peerCount, it.charging)}${if (it.charging) "(chg)" else ""}"
+        }
         Log.d("OFFTRACE", "ELECT: scores=[$scoresStr] winner=${MeshFrame.hex(winner)} self=${winner == localNodeId}")
         onElectionResult(winner, winner == localNodeId)
     }
