@@ -2,7 +2,9 @@
 
 Repo: `E:\opencall-relay`. Package: `com.opencall.relay`. Kotlin, programmatic
 views only — no Compose. AGP 8.1.0, Kotlin 1.9.0, compileSdk/targetSdk 36,
-minSdk 26. JDK 17 (`org.gradle.java.home` in `gradle.properties`).
+minSdk 26. Requires JDK 17 — set via `org.gradle.java.home` in
+`gradle.properties` (pointed at the local Eclipse Adoptium JDK 17 install;
+update that path if the JDK moves or you're on a different machine).
 
 ## Hard rules
 

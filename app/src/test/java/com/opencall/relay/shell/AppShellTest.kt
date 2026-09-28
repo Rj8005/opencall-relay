@@ -16,18 +16,19 @@ import org.junit.Test
  */
 class AppShellTest {
 
-    // ONBOARDING REWRITE: with PILLAR_1_ENABLED=false (Pillar 1 hidden this
-    // release, see that flag's own doc), every fallback below now resolves
-    // to Phone, not International — landing on a hidden, unreachable tab
-    // would leave the user with no way to navigate anywhere.
+    // ONBOARDING REWRITE: PILLAR_1_ENABLED=true this release (Pillar 1 —
+    // International — is back, see that flag's own doc). Phone stays the
+    // default fallback regardless (restoreTab's fallback is decoupled from
+    // the flag), but a persisted INTERNATIONAL value is no longer bounced
+    // to Phone now that the tab is reachable again.
 
     @Test
-    fun `restoreTab defaults to Phone when nothing was stored, while Pillar 1 is hidden`() {
+    fun `restoreTab defaults to Phone when nothing was stored`() {
         assertEquals(AppTab.PHONE, AppShell.restoreTab(null))
     }
 
     @Test
-    fun `restoreTab defaults to Phone on an unparseable value, while Pillar 1 is hidden`() {
+    fun `restoreTab defaults to Phone on an unparseable value`() {
         assertEquals(AppTab.PHONE, AppShell.restoreTab("not-a-tab"))
     }
 
@@ -39,16 +40,15 @@ class AppShellTest {
     }
 
     @Test
-    fun `restoreTab falls back to Phone for a persisted International, while Pillar 1 is hidden`() {
-        // A value stored before PILLAR_1_ENABLED existed (or from a build
-        // where it was true) must not resolve to a tab that's no longer in
-        // the bottom bar.
-        assertEquals(AppTab.PHONE, AppShell.restoreTab(AppTab.INTERNATIONAL.name))
+    fun `restoreTab restores a persisted International now that Pillar 1 is enabled`() {
+        // With PILLAR_1_ENABLED=true, International is a reachable tab again —
+        // a persisted value for it round-trips instead of being bounced to Phone.
+        assertEquals(AppTab.INTERNATIONAL, AppShell.restoreTab(AppTab.INTERNATIONAL.name))
     }
 
     @Test
-    fun `PILLAR_1_ENABLED is false this release — Tab 1 and the call-bridge Settings section are both hidden`() {
-        assertFalse(AppShell.PILLAR_1_ENABLED)
+    fun `PILLAR_1_ENABLED is true this release — Tab 1 and the call-bridge Settings section are both shown`() {
+        assertTrue(AppShell.PILLAR_1_ENABLED)
     }
 
     @Test

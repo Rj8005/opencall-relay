@@ -35,7 +35,7 @@ class OnboardingFlowTest {
     }
 
     @Test
-    fun `landing tab after onboarding is Phone while Pillar 1 is hidden`() {
+    fun `landing tab after onboarding is Phone, independent of the Pillar 1 flag`() {
         // Both completion paths (finishing screen 3's "Start", and "Skip"
         // from any screen) funnel through the SAME markComplete() ->
         // onFinished() call in OnboardingFlow, which MainActivity wires to
@@ -43,7 +43,7 @@ class OnboardingFlowTest {
         // this one function is correct proves both paths land in the same
         // place, without needing two separate Activity-level tests.
         assertEquals(AppTab.PHONE, OnboardingFlow.landingTabAfterOnboarding())
-        assertFalse("Pillar 1 must actually be hidden for Phone to be the right landing tab", AppShell.PILLAR_1_ENABLED)
+        assertTrue("Pillar 1 is enabled this release — landing tab is Phone regardless (see landingTabAfterOnboarding's own doc)", AppShell.PILLAR_1_ENABLED)
     }
 
     @Test
