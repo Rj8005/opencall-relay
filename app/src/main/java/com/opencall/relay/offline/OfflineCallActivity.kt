@@ -3050,7 +3050,29 @@ class OfflineCallActivity : AppCompatActivity() {
             titleText = "Party status",
             titleBg = TopoPalette.bgRaised(currentTopoMode()), // TOPO 1.4: was raw Color.DKGRAY
             onCloseSilenceAll = null
-        ) { partyStatusOverlayBody = it }
+        ) { body ->
+            // B1/Step 3 (diagnostic follow-up): relocated here from the SOS/
+            // Group Alert overlay — a user looks for group/roster data here,
+            // not behind the emergency control. Added as a STATIC row on
+            // [body] itself, never on the nested list below — renderPartyStatus
+            // clears/rebuilds that nested container per-peer (including a
+            // full removeAllViews() on the "no position data yet" empty
+            // state), which would silently wipe a button added directly to it.
+            body.addView(settingsButtonRow(
+                "Export SOS timeline + last-known positions",
+                "Export"
+            ) {
+                val report = IncidentExporter.buildReport(applicationContext)
+                startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "OpenCall Relay — Incident Report")
+                    putExtra(Intent.EXTRA_TEXT, report)
+                }, "Share incident report via"))
+            })
+            val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            body.addView(list, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            partyStatusOverlayBody = list
+        }
         sosSectionOverlay = buildSosSectionOverlay()
         overlayRoot.addView(
             sosOverlay,
@@ -3301,23 +3323,10 @@ class OfflineCallActivity : AppCompatActivity() {
             body.addView(settingsInfoLine(
                 "OpenCall's Group Alert supplements, but does NOT replace, a personal locator beacon (PLB) or satellite messenger. Carry one on any serious trip."
             ))
-            // B1 (diagnostic follow-up): plain-text SOS timeline + last-known
-            // positions, from durably-persisted data (IncidentLog/MeshLedger)
-            // — see IncidentExporter's own doc. Shared via the standard share
-            // sheet rather than saved directly, so no new storage permission
-            // or file-picker plumbing is needed.
-            body.addView(settingsSectionHeader("Incident report"))
-            body.addView(settingsButtonRow(
-                "Export SOS timeline + last-known positions",
-                "Export"
-            ) {
-                val report = IncidentExporter.buildReport(applicationContext)
-                startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                    type = "text/plain"
-                    putExtra(Intent.EXTRA_SUBJECT, "OpenCall Relay — Incident Report")
-                    putExtra(Intent.EXTRA_TEXT, report)
-                }, "Share incident report via"))
-            })
+            // Step 3 (diagnostic follow-up): Incident report export MOVED to
+            // partyStatusOverlay — see that overlay's own build site. A user
+            // looks for group/roster data there, not behind the emergency
+            // control this overlay is.
 
             // B5 (diagnostic follow-up): push-to-talk voice notes — a
             // fallback broadcast channel independent of an active call.
