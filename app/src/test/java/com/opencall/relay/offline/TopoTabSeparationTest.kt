@@ -25,9 +25,13 @@ class TopoTabSeparationTest {
     private val MESSAGES_VIEW_FIELDS = setOf(
         "messagesListBody", "messagesThreadView", "messagesThreadNameText",
         "messagesChatListView", "messagesChatAdapter", "messagesComposerInput",
-        // Step 4 (diagnostic follow-up): voice notes moved here from the SOS
-        // overlay — genuinely Messages-owned now, not shared with the call screen.
-        "voiceNoteHoldButton", "voiceNotesListBody"
+        // Step 2 (diagnostic follow-up): voice notes now live inside
+        // messagesThreadView itself (composerRow, next to Send) — this is
+        // the only voice-note-specific view field left; playback renders
+        // through the SAME chatMessages/ChatAdapter data both this file's
+        // registries already treat as shared-data/separate-views (see
+        // messagesChatAdapter vs chatAdapter below), not a new overlap.
+        "voiceNoteHoldButton"
     )
     private val CALL_SCREEN_VIEW_FIELDS = setOf(
         "callScreen", "videoFrame", "hangupButton", "callTimerText", "peerNameText",

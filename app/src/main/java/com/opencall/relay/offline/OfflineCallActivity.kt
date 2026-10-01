@@ -867,9 +867,10 @@ class OfflineCallActivity : AppCompatActivity() {
     // only one voice note ever plays at a time.
     private val voiceNoteRecorder: VoiceNoteRecorder by lazy { VoiceNoteRecorder(applicationContext) }
     private var voiceNotePlayer: android.media.MediaPlayer? = null
-    private var voiceNotePlayingRow: LinearLayout? = null
+    // Step 2 (diagnostic follow-up): identifies the playing entry by
+    // ChatEntry.id, not a row View — see toggleVoiceNoteEntryPlayback's doc.
+    private var playingChatEntryId: Long? = null
     private lateinit var voiceNoteHoldButton: Button
-    private lateinit var voiceNotesListBody: LinearLayout
 
     // PHASE 6 TRACK E: self-healing GO re-election state — see handleGoLost/
     // handleElectionResult/becomeNewGoAfterElection/waitForInviteAfterElection.
@@ -958,7 +959,23 @@ class OfflineCallActivity : AppCompatActivity() {
     // the honest answer, not a placeholder — a UI label that changed
     // per-message would be fabricating a distinction this app's transport
     // layer doesn't have.
-    private data class ChatEntry(val text: String, val fromMe: Boolean, val transport: String = TRANSPORT_WIFI_DIRECT)
+    /** Step 2 (diagnostic follow-up): voiceNoteAudio/voiceNoteDurationMs/
+     *  voiceNoteSenderLabel are null for an ordinary text entry — when set,
+     *  ChatAdapter.getView renders a Play/Stop + duration row instead of
+     *  entry.text (text still carries a sensible fallback label). [id] is
+     *  a local-only identity for tracking which entry is currently playing
+     *  — ListView recycles row Views on notifyDataSetChanged, so a View
+     *  reference can't survive as playback state; see
+     *  toggleVoiceNoteEntryPlayback's doc. Never sent over the wire. */
+    private data class ChatEntry(
+        val text: String,
+        val fromMe: Boolean,
+        val transport: String = TRANSPORT_WIFI_DIRECT,
+        val voiceNoteAudio: ByteArray? = null,
+        val voiceNoteDurationMs: Int? = null,
+        val voiceNoteSenderLabel: String? = null,
+        val id: Long = System.nanoTime()
+    )
     private val chatMessages = mutableListOf<ChatEntry>()
     private lateinit var chatAdapter: ChatAdapter
     private lateinit var chatListView: ListView
@@ -3355,82 +3372,27 @@ class OfflineCallActivity : AppCompatActivity() {
         }
     }
 
-    /** Step 4 (diagnostic follow-up): push-to-talk voice notes — a fallback
-     *  broadcast channel independent of an active call. MOVED here (from
-     *  the SOS/Group Alert overlay, where it shipped by mistake) — Messages
-     *  is where a user actually looks for a voice-message feature. Inserted
-     *  BEFORE messagesListBody is added, as a static sibling — never inside
-     *  messagesListBody itself, which refreshMessagesScreen() clears via
-     *  removeAllViews() and rebuilds per-thread (same hazard Step 3's
-     *  partyStatusOverlayBody had). */
-    private fun buildVoiceNotesSection(): View {
-        val density = resources.displayMetrics.density
-        val section = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        section.addView(settingsSectionHeader("Voice notes"))
-        section.addView(settingsInfoLine(
-            "Hold the button to record, release to send to everyone nearby. Max ${OfflineMediaTransport.VOICE_NOTE_MAX_DURATION_MS / 1000}s."
-        ))
-        voiceNoteHoldButton = Button(this).apply {
-            text = "Hold to talk"
-            setOnTouchListener { _, event ->
-                when (event.actionMasked) {
-                    android.view.MotionEvent.ACTION_DOWN -> {
-                        val started = voiceNoteRecorder.start { result ->
-                            runOnUiThread {
-                                voiceNoteHoldButton.text = "Hold to talk"
-                                mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
-                            }
-                        }
-                        voiceNoteHoldButton.text = if (started) "Recording… release to send" else "Hold to talk"
-                        if (!started) {
-                            Toast.makeText(this@OfflineCallActivity, "Couldn't start recording", Toast.LENGTH_SHORT).show()
-                        }
-                        true
-                    }
-                    android.view.MotionEvent.ACTION_UP -> {
-                        voiceNoteHoldButton.text = "Hold to talk"
-                        voiceNoteRecorder.stop()?.let { result ->
-                            mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
-                        }
-                        true
-                    }
-                    android.view.MotionEvent.ACTION_CANCEL -> {
-                        voiceNoteHoldButton.text = "Hold to talk"
-                        voiceNoteRecorder.cancel()
-                        true
-                    }
-                    else -> false
-                }
-            }
-        }
-        section.addView(
-            voiceNoteHoldButton,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (56 * density).toInt()).apply {
-                setMargins(0, (8 * density).toInt(), 0, (8 * density).toInt())
-            }
-        )
-        voiceNotesListBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        section.addView(voiceNotesListBody)
-        // Step 4: populate from whatever this session already received —
-        // unlike the old (eager-built) SOS overlay, buildMessagesScreen is
-        // reached via addLazySection (built on first scroll-into-view, see
-        // lazyMessagesScreen's call site), so a note that arrived before
-        // this screen was ever built must not simply be missing until the
-        // NEXT one shows up — mediaTransport.voiceNotes is exactly the
-        // "pull current state" snapshot for this, same contract as sosEntries.
-        mediaTransport?.voiceNotes?.forEach { appendVoiceNoteRow(it) }
-        return section
-    }
-
-    /** Wired to OfflineMediaTransport.onVoiceNoteReceived — appends a row to
-     *  the voice notes list if it's been built yet (Messages is reached via
-     *  addLazySection, so this can genuinely still be uninitialized — see
-     *  buildVoiceNotesSection's doc for why a LATER screen build re-reads
-     *  the full snapshot rather than losing anything received in the
-     *  meantime). */
+    /** Step 2 (diagnostic follow-up): wired to
+     *  OfflineMediaTransport.onVoiceNoteReceived — appends into chatMessages,
+     *  the SAME list/render path text messages use (ChatAdapter.getView's
+     *  voiceNoteAudio branch), not a separate list. Mirrors
+     *  onTransportChatMessage's existing pattern exactly: appended
+     *  unconditionally (chatMessages already has no per-thread filtering —
+     *  see that function's own doc) plus a thread-preview update. Voice
+     *  notes are broadcast-only (see sendVoiceNote's doc), so this is
+     *  always the Group thread's preview. */
     private fun onVoiceNoteReceived(note: OfflineMediaTransport.VoiceNote) {
-        if (!::voiceNotesListBody.isInitialized) return
-        appendVoiceNoteRow(note)
+        val who = nameForGroupParticipant(note.srcId)
+        val durationLabel = formatVoiceNoteDuration(note.durationMs)
+        val carried = if (note.carrierId != null) " (carried, ${note.hopCount ?: 0}h)" else ""
+        appendChatMessage(
+            text = "[Group] $who sent a voice note",
+            fromMe = false,
+            voiceNoteAudio = note.audioBytes,
+            voiceNoteDurationMs = note.durationMs,
+            voiceNoteSenderLabel = "[Group] $who$carried"
+        )
+        recordThreadPreview(MeshFrame.BROADCAST_ID, "🎤 Voice note ($durationLabel)", fromMe = false)
     }
 
     private fun formatVoiceNoteDuration(durationMs: Int): String {
@@ -3438,45 +3400,26 @@ class OfflineCallActivity : AppCompatActivity() {
         return "0:%02d".format(totalSec)
     }
 
-    private fun appendVoiceNoteRow(note: OfflineMediaTransport.VoiceNote) {
-        val density = resources.displayMetrics.density
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = (48 * density).toInt()
-        }
-        val who = nameForGroupParticipant(note.srcId)
-        val carried = if (note.carrierId != null) " (carried, ${note.hopCount ?: 0}h)" else ""
-        row.addView(TextView(this).apply {
-            text = "$who — ${formatVoiceNoteDuration(note.durationMs)}$carried"
-            textSize = 16f
-            setTextColor(TopoPalette.fg(nightModeEnabled))
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        })
-        row.addView(Button(this).apply {
-            text = "Play"
-            setOnClickListener { toggleVoiceNotePlayback(note, row, this) }
-        })
-        voiceNotesListBody.addView(row, 0) // newest first
-    }
-
-    /** Only one voice note plays at a time — starting a new one (or
-     *  tapping the currently-playing row's button again, to stop it)
-     *  always stops whatever was playing first. */
-    private fun toggleVoiceNotePlayback(note: OfflineMediaTransport.VoiceNote, row: LinearLayout, button: Button) {
-        val wasThisRow = voiceNotePlayingRow == row
+    /** Only one voice note plays at a time, identified by ChatEntry.id (not
+     *  a View reference — ListView recycles/rebuilds row Views on every
+     *  notifyDataSetChanged, so a row-based reference from the old
+     *  SOS-overlay list design doesn't survive here). Tapping the
+     *  currently-playing entry's button again stops it. */
+    private fun toggleVoiceNoteEntryPlayback(entry: ChatEntry) {
+        val wasThisEntry = playingChatEntryId == entry.id
         stopVoiceNotePlayback()
-        if (wasThisRow) return
+        if (wasThisEntry) return
+        val audio = entry.voiceNoteAudio ?: return
         val player = android.media.MediaPlayer()
         try {
-            player.setDataSource(VoiceNoteDataSource(note.audioBytes))
+            player.setDataSource(VoiceNoteDataSource(audio))
             player.setOnCompletionListener { stopVoiceNotePlayback() }
             player.setOnErrorListener { _, _, _ -> stopVoiceNotePlayback(); true }
             player.prepare()
             player.start()
             voiceNotePlayer = player
-            voiceNotePlayingRow = row
-            button.text = "Stop"
+            playingChatEntryId = entry.id
+            refreshChatAdapters()
         } catch (e: Exception) {
             Log.w("OFFTRACE", "VOICENOTE: playback failed: ${e.javaClass.simpleName}:${e.message}")
             try { player.release() } catch (_: Exception) {}
@@ -3490,12 +3433,19 @@ class OfflineCallActivity : AppCompatActivity() {
             try { p.release() } catch (_: Exception) {}
         }
         voiceNotePlayer = null
-        voiceNotePlayingRow = null
-        if (!::voiceNotesListBody.isInitialized) return
-        for (i in 0 until voiceNotesListBody.childCount) {
-            val r = voiceNotesListBody.getChildAt(i) as? LinearLayout ?: continue
-            (r.getChildAt(1) as? Button)?.text = "Play"
+        if (playingChatEntryId != null) {
+            playingChatEntryId = null
+            refreshChatAdapters()
         }
+    }
+
+    /** chatMessages/chatAdapter are shared between the live in-call chat
+     *  panel (chatListView) and the Messages thread view
+     *  (messagesChatListView) — see appendChatMessage's own doc for the
+     *  precedent this mirrors exactly. */
+    private fun refreshChatAdapters() {
+        if (::chatAdapter.isInitialized) chatAdapter.notifyDataSetChanged()
+        if (::messagesChatAdapter.isInitialized) messagesChatAdapter.notifyDataSetChanged()
     }
 
     /** Plays straight from the in-memory recording — no temp file, no
@@ -3809,9 +3759,9 @@ class OfflineCallActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding((16 * density).toInt(), (16 * density).toInt(), (16 * density).toInt(), 0)
             setBackgroundColor(TopoPalette.bgBase(currentTopoMode()))
-            // Step 4 (diagnostic follow-up): added BEFORE messagesListBody,
-            // as a static sibling — see buildVoiceNotesSection's own doc.
-            addView(buildVoiceNotesSection())
+            // Step 2 (diagnostic follow-up): voice notes MOVED into
+            // messagesThreadView itself (buildMessagesThreadView) — this is
+            // the thread LIST, which openMessageThread() never shows.
             messagesListBody = LinearLayout(this@OfflineCallActivity).apply { orientation = LinearLayout.VERTICAL }
             addView(messagesListBody)
         }
@@ -3889,10 +3839,63 @@ class OfflineCallActivity : AppCompatActivity() {
                 if (sendChatText(messagesComposerInput.text?.toString()?.trim().orEmpty())) messagesComposerInput.setText("")
             }
         }
+        // Step 2 (diagnostic follow-up): hold-to-talk, next to Send — see
+        // this function's own doc for why it lives here now, not a separate
+        // section. Visibility toggled by openMessageThread (GONE by default
+        // here, before any thread is open): sendVoiceNote is broadcast-only
+        // (see its own doc — no 1:1 targeting), so this only makes sense on
+        // the Group thread, not a 1:1 one.
+        voiceNoteHoldButton = Button(this).apply {
+            text = "🎤"
+            visibility = View.GONE
+            setOnTouchListener { _, event ->
+                when (event.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        val started = voiceNoteRecorder.start { result ->
+                            runOnUiThread {
+                                voiceNoteHoldButton.text = "🎤"
+                                mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
+                                appendChatMessage(
+                                    text = "Voice note",
+                                    fromMe = true,
+                                    voiceNoteAudio = result.audioBytes,
+                                    voiceNoteDurationMs = result.durationMs
+                                )
+                            }
+                        }
+                        voiceNoteHoldButton.text = if (started) "●" else "🎤"
+                        if (!started) {
+                            Toast.makeText(this@OfflineCallActivity, "Couldn't start recording", Toast.LENGTH_SHORT).show()
+                        }
+                        true
+                    }
+                    android.view.MotionEvent.ACTION_UP -> {
+                        voiceNoteHoldButton.text = "🎤"
+                        voiceNoteRecorder.stop()?.let { result ->
+                            mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
+                            appendChatMessage(
+                                text = "Voice note",
+                                fromMe = true,
+                                voiceNoteAudio = result.audioBytes,
+                                voiceNoteDurationMs = result.durationMs
+                            )
+                        }
+                        true
+                    }
+                    android.view.MotionEvent.ACTION_CANCEL -> {
+                        voiceNoteHoldButton.text = "🎤"
+                        voiceNoteRecorder.cancel()
+                        true
+                    }
+                    else -> false
+                }
+            }
+        }
         val composerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding((8 * density).toInt(), (4 * density).toInt(), (8 * density).toInt(), (4 * density).toInt())
             addView(messagesComposerInput, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(voiceNoteHoldButton)
             addView(sendBtn)
         }
         messagesThreadView.addView(composerRow)
@@ -5544,7 +5547,36 @@ class OfflineCallActivity : AppCompatActivity() {
                 // respectively so contrast holds in every mode.
                 setPadding((10 * density).toInt(), (6 * density).toInt(), (10 * density).toInt(), (6 * density).toInt())
                 setBackgroundColor(if (entry.fromMe) TopoPalette.accent(mode) else TopoPalette.bgRaised(mode))
-                addView(TextView(this@OfflineCallActivity).apply { text = entry.text; setTextColor(bubbleFg) })
+                // Step 2 (diagnostic follow-up): a voice-note entry renders
+                // Play/Stop + duration (+ sender label if received) instead
+                // of entry.text — same bubble, same ListView/adapter, just a
+                // different content row. entry.text still carries a sensible
+                // fallback label (unused by this branch, but kept for any
+                // other reader of chatMessages, e.g. a future export).
+                if (entry.voiceNoteAudio != null) {
+                    if (entry.voiceNoteSenderLabel != null) {
+                        addView(TextView(this@OfflineCallActivity).apply {
+                            text = entry.voiceNoteSenderLabel
+                            textSize = 12f
+                            setTextColor(bubbleFg)
+                        })
+                    }
+                    addView(LinearLayout(this@OfflineCallActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        addView(Button(this@OfflineCallActivity).apply {
+                            text = if (playingChatEntryId == entry.id) "Stop" else "Play"
+                            setOnClickListener { toggleVoiceNoteEntryPlayback(entry) }
+                        })
+                        addView(TextView(this@OfflineCallActivity).apply {
+                            text = "🎤 ${formatVoiceNoteDuration(entry.voiceNoteDurationMs ?: 0)}"
+                            setTextColor(bubbleFg)
+                            setPadding((8 * density).toInt(), 0, 0, 0)
+                        })
+                    })
+                } else {
+                    addView(TextView(this@OfflineCallActivity).apply { text = entry.text; setTextColor(bubbleFg) })
+                }
                 // TOPO 3.2: transport badge — see ChatEntry.transport's doc
                 // for why this is always "Wi-Fi Direct" in this app today,
                 // not a guess.
@@ -5568,8 +5600,14 @@ class OfflineCallActivity : AppCompatActivity() {
         }
     }
 
-    private fun appendChatMessage(text: String, fromMe: Boolean) {
-        chatMessages.add(ChatEntry(text, fromMe))
+    private fun appendChatMessage(
+        text: String,
+        fromMe: Boolean,
+        voiceNoteAudio: ByteArray? = null,
+        voiceNoteDurationMs: Int? = null,
+        voiceNoteSenderLabel: String? = null
+    ) {
+        chatMessages.add(ChatEntry(text, fromMe, voiceNoteAudio = voiceNoteAudio, voiceNoteDurationMs = voiceNoteDurationMs, voiceNoteSenderLabel = voiceNoteSenderLabel))
         chatAdapter.notifyDataSetChanged()
         chatListView.post { if (chatAdapter.count > 0) chatListView.setSelection(chatAdapter.count - 1) }
         // TOPO PART B1: Messages tab's OWN ListView/adapter instance (never
@@ -5670,6 +5708,11 @@ class OfflineCallActivity : AppCompatActivity() {
         }
         messagesThreadNameText.text = name
         threadPreviews[threadKey]?.unread = 0
+        // Step 2 (diagnostic follow-up): voice notes are broadcast-only
+        // (sendVoiceNote has no 1:1 targeting) — only the Group thread.
+        if (::voiceNoteHoldButton.isInitialized) {
+            voiceNoteHoldButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
+        }
         messagesListBody.visibility = View.GONE
         messagesThreadView.visibility = View.VISIBLE
         updateForegroundState() // PART 1 (batch A): messagesThreadView is now a full-bleed root sibling
