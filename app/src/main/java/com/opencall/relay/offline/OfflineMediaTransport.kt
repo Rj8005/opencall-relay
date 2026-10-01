@@ -2582,6 +2582,19 @@ class OfflineMediaTransport(
         return treeParentOf.values.contains(nodeId)
     }
 
+    /** Signal Deck (diagnostic follow-up): true iff [nodeId] is reached over
+     *  ONE hop from this device — either [nodeId] is MY direct child in the
+     *  relay tree, or [nodeId] is my own parent (the node I dial directly).
+     *  Everyone else is reached via a relay (treeParentOf, mirrored to
+     *  every node and populated on every join regardless of mesh size —
+     *  see isArticulationPoint's identical doc — already IS a topology
+     *  graph; this reads it rather than tracking a separate "direct link"
+     *  flag per peer). On a flat/default mesh (everyone maps straight to
+     *  the GO) this is simply "am I the GO, or is nodeId the GO" — the
+     *  general form subsumes that case without a separate branch. */
+    fun isDirectlyConnected(nodeId: Long): Boolean =
+        treeParentOf[nodeId] == localNodeId || treeParentOf[localNodeId] == nodeId
+
     /** Atomically starts (or, if [callId] matches, idempotently rejoins) group-call
      *  state unless a DIFFERENT call — 1:1 or group — is already active. */
     private fun tryBeginGroupCall(callId: Long, mode: GroupCallMode, initiatorId: Long): Boolean {

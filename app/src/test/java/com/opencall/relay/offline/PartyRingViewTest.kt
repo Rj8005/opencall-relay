@@ -128,6 +128,24 @@ class PartyRingViewTest {
         assertEquals(PartyRingView.RenderMode.POINT, PartyRingView.renderModeFor(MeshLedger.PeerState.STALE))
     }
 
+    // ── Signal Deck (diagnostic follow-up): dotRoleFor ───────────────────
+
+    @Test
+    fun `a direct, non-weakening peer is DIRECT`() {
+        assertEquals(PartyRingView.DotRole.DIRECT, PartyRingView.dotRoleFor(weakening = false, isDirect = true))
+    }
+
+    @Test
+    fun `a relayed, non-weakening peer is RELAY`() {
+        assertEquals(PartyRingView.DotRole.RELAY, PartyRingView.dotRoleFor(weakening = false, isDirect = false))
+    }
+
+    @Test
+    fun `a weakening signal is WEAKENING regardless of direct or relay`() {
+        assertEquals(PartyRingView.DotRole.WEAKENING, PartyRingView.dotRoleFor(weakening = true, isDirect = true))
+        assertEquals(PartyRingView.DotRole.WEAKENING, PartyRingView.dotRoleFor(weakening = true, isDirect = false))
+    }
+
     // ── PHASE 1.5d: cached range labels recompute exactly on dMax change ──
 
     @Test

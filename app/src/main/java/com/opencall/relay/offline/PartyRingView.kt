@@ -62,7 +62,12 @@ class PartyRingView @JvmOverloads constructor(
         val name: String,
         val vector: MeshLedger.PeerVector,
         val isArticulation: Boolean,
-        val rssiTrend: MeshLedger.Trend? = null
+        val rssiTrend: MeshLedger.Trend? = null,
+        /** Signal Deck (diagnostic follow-up): true = one hop from this
+         *  device (OfflineMediaTransport.isDirectlyConnected); false =
+         *  reached via a relay. Defaults true so every existing caller/test
+         *  that never set this keeps today's (teal) behavior unchanged. */
+        val isDirect: Boolean = true
     )
 
     companion object {
@@ -155,7 +160,23 @@ class PartyRingView @JvmOverloads constructor(
             MeshLedger.PeerState.LOST -> RenderMode.LOST_CONE
             MeshLedger.PeerState.LIVE, MeshLedger.PeerState.STALE -> RenderMode.POINT
         }
+
+        /** Signal Deck (diagnostic follow-up): which dot color role a
+         *  LIVE/STALE peer draws with — extracted for direct unit testing,
+         *  same "pure companion" pattern as [renderModeFor]. A weakening
+         *  signal takes priority over plain relay status (a more urgent
+         *  signal to the viewer than "this is a relay hop"). */
+        fun dotRoleFor(weakening: Boolean, isDirect: Boolean): DotRole = when {
+            weakening -> DotRole.WEAKENING
+            !isDirect -> DotRole.RELAY
+            else -> DotRole.DIRECT
+        }
     }
+
+    /** See [dotRoleFor]'s doc for why this lives here, at the class level,
+     *  rather than inside the companion object above (same reasoning as
+     *  [RenderMode]). */
+    enum class DotRole { DIRECT, RELAY, WEAKENING }
 
     /** See [renderModeFor]'s doc for why this lives here, at the class
      *  level, rather than inside the companion object above. */
@@ -220,6 +241,11 @@ class PartyRingView @JvmOverloads constructor(
         strokeWidth = 3f
     }
     private val weakeningPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(0xff, 0xb3, 0x00); style = Paint.Style.FILL } // amber
+    // Signal Deck (diagnostic follow-up): relay-hop peers — dimmer than
+    // weakeningPaint's full-brightness amber (same hue, lower alpha) so a
+    // genuinely weakening LIVE signal still reads as more urgent than a
+    // merely-relayed-but-otherwise-healthy one.
+    private val relayPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(160, 0xff, 0xb3, 0x00); style = Paint.Style.FILL }
     private val lostPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.argb(220, 200, 200, 200)
         style = Paint.Style.STROKE
@@ -272,6 +298,10 @@ class PartyRingView @JvmOverloads constructor(
     private var lastAzimuthInvalidateAtMs = 0L
     private var lastUiLogAtMs = 0L
     private var frozen = false // STEP 5 battery cliff: ring stops rotating entirely
+    // Signal Deck (diagnostic follow-up): "You" / "You · GO" drawn below the
+    // centre dot — plain state, no invalidate-throttling needed (changes at
+    // most once per GO-election, nowhere near setAzimuth's 10Hz rate).
+    private var selfLabel: String = ""
 
     var onMarkerTapped: ((nodeId: Long) -> Unit)? = null
     var onMarkerLongPressed: ((nodeId: Long) -> Unit)? = null
@@ -363,6 +393,16 @@ class PartyRingView @JvmOverloads constructor(
         invalidate()
     }
 
+    /** Signal Deck (diagnostic follow-up): "You" or "You · GO" — the
+     *  Activity decides the GO wording (same "never invent text the
+     *  Activity didn't already build" rule this view applies to peer
+     *  labels, see class doc), this just draws whatever it's handed. */
+    fun setSelfLabel(label: String) {
+        if (selfLabel == label) return
+        selfLabel = label
+        invalidate()
+    }
+
     /** Self-throttled to 10Hz — the Activity can call this at the compass's
      *  full sensor rate without flooding invalidate(). [accurate]=false (or
      *  no compass at all) locks the ring north-up per STEP 2's rule; the
@@ -396,7 +436,7 @@ class PartyRingView @JvmOverloads constructor(
         // intentional exemption northTickLockedPaint (the tick line) already had.
         val paints = listOf(
             ringLabelPaint, rimLabelPaint, centreDotPaint, livePaint, stalePaint,
-            staleRingPaint, weakeningPaint, nameLabelPaint, bridgeGlyphPaint, northTickTextPaint
+            staleRingPaint, weakeningPaint, relayPaint, nameLabelPaint, bridgeGlyphPaint, northTickTextPaint
         )
         if (enabled) {
             ringPaint.color = dimRed
@@ -415,6 +455,7 @@ class PartyRingView @JvmOverloads constructor(
             stalePaint.color = Color.rgb(0x1d, 0x9e, 0x75)
             staleRingPaint.color = Color.rgb(0x1d, 0x9e, 0x75)
             weakeningPaint.color = Color.rgb(0xff, 0xb3, 0x00)
+            relayPaint.color = Color.argb(160, 0xff, 0xb3, 0x00)
             lostPaint.color = Color.argb(220, 200, 200, 200)
             conePaint.color = Color.argb(60, 200, 200, 200)
             bleArcPaint.color = Color.argb(200, 100, 180, 255)
@@ -487,6 +528,7 @@ class PartyRingView @JvmOverloads constructor(
     private fun drawCentre(canvas: Canvas, cx: Float, cy: Float) {
         canvas.drawCircle(cx, cy, 14f, centreDotPaint)
         if (meIsCutVertex) drawBridgeGlyph(canvas, cx, cy, 24f)
+        if (selfLabel.isNotEmpty()) canvas.drawText(selfLabel, cx, cy + 34f, nameLabelPaint)
     }
 
     private fun drawPeers(canvas: Canvas, cx: Float, cy: Float, rMax: Float, rotationDeg: Float) {
@@ -521,13 +563,28 @@ class PartyRingView @JvmOverloads constructor(
         scratchPos[1] = cy - r * cos(rad).toFloat()
     }
 
+    private fun paintForDotRole(role: DotRole): Paint = when (role) {
+        DotRole.WEAKENING -> weakeningPaint
+        DotRole.RELAY -> relayPaint
+        DotRole.DIRECT -> livePaint
+    }
+
     private fun drawLiveOrStalePeer(canvas: Canvas, cx: Float, cy: Float, rMax: Float, rotationDeg: Float, p: RingPeer) {
-        if (p.vector.bearingTrue.isNaN()) return // no bearing to plot — never guess (see STEP 2's hard rule via distance floor)
+        val weakening = p.vector.state == MeshLedger.PeerState.LIVE && p.rssiTrend == MeshLedger.Trend.FARTHER
+        val dotPaint = paintForDotRole(dotRoleFor(weakening, p.isDirect))
+        if (p.vector.bearingTrue.isNaN()) {
+            // Signal Deck (diagnostic follow-up): no bearing to plot — never
+            // guess (see STEP 2's hard rule via distance floor) — but this
+            // is a genuinely connected peer (LIVE/STALE), not an unknown
+            // one, so it still gets a mark: the same rim-arc fallback
+            // UNKNOWN/BLE_ONLY use, in this peer's own color rather than
+            // vanishing from the ring entirely (the previous behavior).
+            drawRimArcPeer(canvas, cx, cy, rMax, p, dotPaint)
+            return
+        }
         peerScreenPos(cx, cy, rMax, rotationDeg, p.vector.bearingTrue, p.vector.distM)
         val x = scratchPos[0]
         val y = scratchPos[1]
-        val weakening = p.vector.state == MeshLedger.PeerState.LIVE && p.rssiTrend == MeshLedger.Trend.FARTHER
-        val dotPaint = if (weakening) weakeningPaint else livePaint
         recordHitTestPosition(p.nodeId, x, y)
         canvas.drawCircle(x, y, 12f, dotPaint)
         if (p.vector.state == MeshLedger.PeerState.STALE) {
@@ -587,15 +644,24 @@ class PartyRingView @JvmOverloads constructor(
      *  only honest rendering for either state: "somewhere out there," not
      *  "over there." Never omitted — a peer this app knows about (roster
      *  member or BLE sighting) always gets a mark, even with zero position
-     *  data. */
-    private fun drawRimArcPeer(canvas: Canvas, cx: Float, cy: Float, rMax: Float, p: RingPeer) {
+     *  data.
+     *
+     *  Signal Deck (diagnostic follow-up): also reused by
+     *  [drawLiveOrStalePeer] for a LIVE/STALE peer whose bearing is NaN
+     *  (the accuracy-floor suppression diagnosed earlier — a real,
+     *  connected peer, just not one this device can currently point at) —
+     *  [arcPaint] lets that caller draw in the peer's own
+     *  direct/relay/weakening color instead of this function's own default
+     *  (generic "unknown direction") blue, so a connected-but-unpointed
+     *  peer still reads as connected, not as a BLE-only sighting. */
+    private fun drawRimArcPeer(canvas: Canvas, cx: Float, cy: Float, rMax: Float, p: RingPeer, arcPaint: Paint = bleArcPaint) {
         val r = rMax - 4f
         bleArcRect.set(cx - r, cy - r, cx + r, cy + r)
         // Spread multiple BLE-only peers around the rim deterministically by
         // nodeId so they don't all stack on the same arc.
         val slot = (p.nodeId.hashCode().mod(12))
         val startAngle = -90f + slot * 30f
-        canvas.drawArc(bleArcRect, startAngle, 20f, false, bleArcPaint)
+        canvas.drawArc(bleArcRect, startAngle, 20f, false, arcPaint)
         val labelY = cy - r - 10f - slot * 2f
         canvas.drawText(p.name, cx, labelY, nameLabelPaint)
         // Approximate hit-test anchor at the arc's midpoint — a BLE_ONLY

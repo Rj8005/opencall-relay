@@ -264,10 +264,14 @@ class OfflineCallActivity : AppCompatActivity() {
             vectorLookup: (Long) -> MeshLedger.PeerVector?,
             nameFor: (Long) -> String,
             isArticulation: (Long) -> Boolean,
-            rssiTrend: (Long) -> MeshLedger.Trend?
+            rssiTrend: (Long) -> MeshLedger.Trend?,
+            // Signal Deck (diagnostic follow-up): defaults to "always direct"
+            // so every existing caller/test that never set this keeps
+            // today's (teal) behavior unchanged — see RingPeer.isDirect's doc.
+            isDirect: (Long) -> Boolean = { true }
         ): List<PartyRingView.RingPeer> = nodeIds.mapNotNull { nodeId ->
             val v = vectorLookup(nodeId) ?: return@mapNotNull null
-            PartyRingView.RingPeer(nodeId, nameFor(nodeId), v, isArticulation(nodeId), rssiTrend(nodeId))
+            PartyRingView.RingPeer(nodeId, nameFor(nodeId), v, isArticulation(nodeId), rssiTrend(nodeId), isDirect(nodeId))
         }
 
         // PHASE 2.3: DISPLAY-only short ID. Excludes I, O, 0, 1 — the four
@@ -705,9 +709,14 @@ class OfflineCallActivity : AppCompatActivity() {
     private lateinit var groupCallVoiceButton: Button
     private lateinit var groupCallVideoButton: Button
     private lateinit var groupCallReasonText: TextView
-    private lateinit var ringSummaryButton: Button
     private lateinit var groupMembersHeader: TextView
-    private var ringExpanded = false
+    // Signal Deck (diagnostic follow-up): the always-visible ring card's
+    // own text — replaces ringSummaryButton/ringExpanded (deleted, no
+    // collapse state left to track).
+    private lateinit var signalDeckDimLabel: TextView
+    private lateinit var signalDeckGroupNameText: TextView
+    private lateinit var signalDeckStatusText: TextView
+    private lateinit var themeToggleButton: Button
 
     // PHASE 5A: SOS / FIND-over-mesh — roster screen only, no new Activity/screen.
     private lateinit var sosButton: Button
@@ -719,7 +728,10 @@ class OfflineCallActivity : AppCompatActivity() {
     private lateinit var slideToSosView: SlideToSosView
     private lateinit var phraseGrid: GridLayout
     private lateinit var carryChip: TextView
-    private lateinit var nightModeButton: Button
+    // Signal Deck (diagnostic follow-up): nightModeButton DELETED — replaced
+    // by the top-right circular icon (buildThemeToggleIcon), see Step 2's
+    // commit. Theme toggle state/persistence (nightModeEnabled/setNightMode)
+    // is unchanged, only this button is gone.
     private lateinit var batteryCliffBanner: TextView
     private var nightModeEnabled = false
     private var inBatteryCliff = false
@@ -2622,37 +2634,48 @@ class OfflineCallActivity : AppCompatActivity() {
         inviteListAdapter = NearbyDeviceAdapter()
         inviteListView.adapter = inviteListAdapter
         inviteListView.visibility = View.GONE
-        // ── PHASE 3 item 1: identity strip ───────────────────────────────────
         val ringDensity = resources.displayMetrics.density
-        val identityStrip = LinearLayout(this).apply {
+
+        // ── Signal Deck (diagnostic follow-up) top bar: replaces the old
+        // identity strip (short ID/name/edit — still reachable via
+        // Settings' own "Display name" row, see showDisplayNameDialog's
+        // other call site) with a dim label + bold group name, and a
+        // top-right circular theme-toggle icon. identityShortIdText/
+        // identityNameText are intentionally not constructed here anymore
+        // — updateIdentityStrip's own ::isInitialized guard makes that a
+        // safe no-op, not a crash, for its one remaining call site.
+        val signalDeckTopBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = (56 * ringDensity).toInt()
+            minimumHeight = (48 * ringDensity).toInt()
         }
-        identityShortIdText = TextView(this).apply {
-            textSize = 18f
-            typeface = android.graphics.Typeface.MONOSPACE
-            setTextColor(TopoPalette.fg(nightModeEnabled))
-        }
-        identityNameText = TextView(this).apply {
-            textSize = 18f
-            setTextColor(TopoPalette.fg(nightModeEnabled))
-            setPadding((12 * ringDensity).toInt(), 0, 0, 0)
+        val signalDeckTopBarLabels = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        identityStrip.addView(identityShortIdText)
-        identityStrip.addView(identityNameText)
-        identityStrip.addView(Button(this).apply {
-            text = "✎"
-            minWidth = (56 * ringDensity).toInt()
-            setOnClickListener { showDisplayNameDialog() }
-        })
-        groupScreen.addView(identityStrip)
+        signalDeckDimLabel = TextView(this).apply {
+            text = "OCP · MESH ACTIVE"
+            textSize = 11f
+            setTextColor(TopoPalette.textMuted(currentTopoMode()))
+        }
+        signalDeckGroupNameText = TextView(this).apply {
+            textSize = 18f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(TopoPalette.fg(nightModeEnabled))
+        }
+        signalDeckTopBarLabels.addView(signalDeckDimLabel)
+        signalDeckTopBarLabels.addView(signalDeckGroupNameText)
+        signalDeckTopBar.addView(signalDeckTopBarLabels)
+        signalDeckTopBar.addView(buildThemeToggleIcon())
+        groupScreen.addView(signalDeckTopBar)
 
         // ── PHASE 3 item 3: group call bar — PRIMARY action, reaches the SAME
         // mediaTransport.startGroupCall() call showStartGroupCallDialog()
         // already makes (no new call path). Disabled with a reason string at
-        // 0 connected peers.
+        // 0 connected peers. Signal Deck: voice is an outline button, video
+        // is filled amber (TopoPalette.accent) — video is the heavier-weight
+        // action on this screen, same "filled = primary" convention the new
+        // "Bring someone in" card's rows don't need but a two-choice row does.
         val groupCallBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             minimumHeight = (64 * ringDensity).toInt()
@@ -2665,37 +2688,81 @@ class OfflineCallActivity : AppCompatActivity() {
             text = "Video call"
             setOnClickListener { mediaTransport?.startGroupCall(OfflineMediaTransport.GroupCallMode.VIDEO) }
         }
-        groupCallBar.addView(groupCallVoiceButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+        applyCallButtonStyles()
+        groupCallBar.addView(groupCallVoiceButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f).apply {
+            marginEnd = (8 * ringDensity).toInt()
+        })
         groupCallBar.addView(groupCallVideoButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
         groupCallReasonText = settingsInfoLine("")
         groupScreen.addView(groupCallBar)
         groupScreen.addView(groupCallReasonText)
+        // Not in the new card list, but not explicitly asked to be removed
+        // either (only "Quick phrase" was) — a single slim row rather than
+        // the old two-button actionRow, since Messages has its own
+        // dedicated tab/screen now (see Step 4) and this is just a
+        // shortcut into it.
+        groupScreen.addView(Button(this).apply {
+            text = "Message"
+            setOnClickListener { openGroupChat() }
+        })
 
-        // ── PHASE 3 item 4: ring card — collapsed by default, one summary
-        // line, expands on tap. Phase 1.6 fixes (allocations/labels/UNKNOWN
-        // rim arc/N-tick legibility) already live in PartyRingView itself.
+        // ── Signal Deck (diagnostic follow-up) party ring card — ALWAYS
+        // visible now (no ringSummaryButton collapse/expand): the NaN-
+        // bearing fallback added to PartyRingView.drawLiveOrStalePeer means
+        // a connected peer with no resolved bearing still draws (as a rim
+        // arc in its own color) instead of vanishing, so there's no longer
+        // a "nothing useful to show" case worth hiding behind a tap. The
+        // whole card is tappable to open the full partyStatusOverlay — same
+        // destination the old separate "Party status" button opened (see
+        // that button's own doc; it's still constructed, just not shown,
+        // for setNightMode's color-update call site).
+        //
+        // Background: TopoPalette.bgRaised, not TopoBackgroundDrawable's
+        // contour texture — checked first per the task's own instruction;
+        // that texture is already the Activity root's background (see
+        // topoBackground/applyTopoMode), so reapplying it to this card
+        // would double the contour pattern rather than add one, and this
+        // view has no exposed hook to reuse just its fill without its
+        // Paths anyway (see that class's own "one root-level Drawable...
+        // not per-view" doc).
         batteryCliffBanner = TextView(this).apply {
             textSize = 18f
             setTextColor(Color.WHITE)
             setPadding(16, 12, 16, 12)
             visibility = View.GONE
         }
-        nightModeButton = Button(this).apply {
-            text = "Night mode: off"
-            setOnClickListener { setNightMode(!nightModeEnabled) }
+        groupScreen.addView(batteryCliffBanner)
+        val ringCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(TopoPalette.bgRaised(currentTopoMode()))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                renderPartyStatus()
+                partyStatusOverlay.visibility = View.VISIBLE
+            }
+        }
+        signalDeckStatusText = TextView(this).apply {
+            textSize = 14f
+            setTextColor(TopoPalette.textSecondary(currentTopoMode()))
+            setPadding((12 * ringDensity).toInt(), (10 * ringDensity).toInt(), (12 * ringDensity).toInt(), (6 * ringDensity).toInt())
         }
         partyRingView = PartyRingView(this).apply {
             onMarkerTapped = { nodeId -> showPeerDetailForRing(nodeId) }
             onMarkerLongPressed = { nodeId -> sendPhraseTo(nodeId) }
-            visibility = View.GONE // collapsed by default
         }
-        ringSummaryButton = Button(this).apply {
-            setOnClickListener {
-                if (!isEnabled) return@setOnClickListener
-                ringExpanded = !ringExpanded
-                updateRingCardState()
+        ringCard.addView(signalDeckStatusText)
+        ringCard.addView(
+            partyRingView,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (280 * ringDensity).toInt())
+        )
+        groupScreen.addView(
+            ringCard,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = (8 * ringDensity).toInt()
+                bottomMargin = (8 * ringDensity).toInt()
             }
-        }
+        )
         carryChip = TextView(this).apply {
             textSize = 16f
             setTextColor(Color.WHITE)
@@ -2704,74 +2771,46 @@ class OfflineCallActivity : AppCompatActivity() {
             visibility = View.GONE
             setOnClickListener { showCarryQueueDialog() }
         }
-        groupScreen.addView(batteryCliffBanner)
-        groupScreen.addView(nightModeButton)
-        groupScreen.addView(ringSummaryButton)
-        groupScreen.addView(
-            partyRingView,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (300 * ringDensity).toInt())
-        )
         groupScreen.addView(carryChip)
         updateRingCardState()
 
-        // ── PHASE 3 item 6: action row — replaces the always-visible phrase
-        // grid (which used to occupy 4 rows of Home directly) with a compact
-        // "Quick phrase" entry point into the SAME PhraseCode set/sendPhrase
-        // call (showQuickPhraseDialog); "Message" opens the existing group
-        // chat overlay (openGroupChat, unchanged).
-        val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        actionRow.addView(Button(this).apply {
-            text = "Message"
-            setOnClickListener { openGroupChat() }
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        actionRow.addView(Button(this).apply {
-            text = "Quick phrase"
-            setOnClickListener { showQuickPhraseDialog() }
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        groupScreen.addView(actionRow)
-
-        // TOPO PHASE 2.3: slideToSosView MOVED into sosSectionOverlay — see
-        // that build site for the same LinearLayout.LayoutParams(MATCH_PARENT,
-        // 64dp) sizing, unchanged.
-
-        // ── PHASE 3 item 8: Invite/QR — NEW, never existed on this screen.
-        val inviteQrRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        inviteQrRow.addView(Button(this).apply {
-            text = "Invite"
-            setOnClickListener { showMidCallInviteDialog() }
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        inviteQrRow.addView(Button(this).apply {
-            text = "Show my QR code"
-            setOnClickListener { showInviteQrDialog() }
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        inviteQrRow.addView(Button(this).apply {
-            text = "Scan QR code"
-            setOnClickListener { showScanQrDialog() }
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        groupScreen.addView(inviteQrRow)
+        // ── Signal Deck (diagnostic follow-up): ONE consolidated "bring
+        // someone in" card, replacing the old inviteQrRow (Invite/Show my
+        // QR code/Scan QR code) AND searchScreen's separate "Scan a code"
+        // entry point — three rows, same underlying actions as before,
+        // just one card instead of five overlapping buttons across two
+        // screens. "Your code" uses fetchGroupInfoThenShowHostQr (the
+        // live-polling "who's joined" screen, see its own doc for why
+        // showHostQrScreen itself is never called directly) rather than
+        // the older, simpler showInviteQrDialog — per the task's explicit
+        // naming of showHostQrScreen as the target.
+        groupScreen.addView(settingsSectionHeader("Bring someone in"))
+        val bringSomeoneInCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(TopoPalette.bgRaised(currentTopoMode()))
+        }
+        bringSomeoneInCard.addView(buildBringSomeoneInRow("⬚", "Your code", "Show a QR code for others to scan") { fetchGroupInfoThenShowHostQr() })
+        bringSomeoneInCard.addView(buildSignalDeckDivider())
+        bringSomeoneInCard.addView(buildBringSomeoneInRow("⌕", "Scan a code", "Scan someone else's invite code") { showScanQrDialog() })
+        bringSomeoneInCard.addView(buildSignalDeckDivider())
+        bringSomeoneInCard.addView(buildBringSomeoneInRow("↗", "Share invite link", "Send a link via any app") { shareInviteLink() })
+        groupScreen.addView(bringSomeoneInCard)
 
         // TOPO PHASE 2.3: sosButton/slideToSosView/sosSettingsButton/
         // ssidBroadcastButton/sosAlertsText MOVED into sosSectionOverlay
         // (built below, opened by the always-visible top-right SOS button)
-        // — not duplicated here. partyStatusButton stays: it covers every
-        // known ledger member, not just active SOS senders (see its own
-        // doc), a broader concern than the SOS section.
-        groupScreen.addView(partyStatusButton)
+        // — not duplicated here. partyStatusButton itself is still
+        // constructed (setNightMode's colour-update call site still
+        // references it) but no longer shown — tapping the ring card above
+        // reaches the same partyStatusOverlay now.
 
-        // ── PHASE 3 item 5: member list header ("Group members (N)" + an
-        // Invite on the right — same showMidCallInviteDialog as the item-8 row
-        // above, not a second implementation) ─────────────────────────────
+        // ── PHASE 3 item 5: member list header — Signal Deck: no longer
+        // paired with its own "Invite" button (the "Bring someone in" card
+        // above already covers invite; showMidCallInviteDialog, the
+        // per-nearby-device picker, stays reachable from the "Nearby —
+        // invite" list below, which is a live list, not a button). ──────
         groupMembersHeader = TextView(this).apply { textSize = 16f; setPadding(0, 24, 0, 0) }
-        val memberListHeaderRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        memberListHeaderRow.addView(groupMembersHeader, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        memberListHeaderRow.addView(Button(this).apply {
-            text = "Invite"
-            setOnClickListener { showMidCallInviteDialog() }
-        })
-        groupScreen.addView(memberListHeaderRow)
+        groupScreen.addView(groupMembersHeader)
         groupScreen.addView(rosterListView)
         groupScreen.addView(inviteHeader)
         groupScreen.addView(inviteListView)
@@ -4579,6 +4618,119 @@ class OfflineCallActivity : AppCompatActivity() {
             textSize = 14f
             setTextColor(TopoPalette.mutedFg(nightModeEnabled))
             setPadding(0, (4 * density).toInt(), 0, (8 * density).toInt())
+        }
+    }
+
+    // ── Signal Deck (diagnostic follow-up) shared row builders ──────────────
+
+    /** 40dp circular icon button, sun/moon swapped by [nightModeEnabled] —
+     *  Step 2's own top bar; built here (not AppShell) because it's wired
+     *  directly to this Activity's existing setNightMode/nightModeEnabled,
+     *  which other screens don't have a notion of yet (see the diagnostic
+     *  report's Step 5 flag) — reusing this build site, not duplicating
+     *  it, is Step 5's job once that's resolved. */
+    private fun buildThemeToggleIcon(): Button {
+        val density = resources.displayMetrics.density
+        themeToggleButton = Button(this).apply {
+            textSize = 18f
+            setPadding(0, 0, 0, 0)
+            setOnClickListener { setNightMode(!nightModeEnabled) }
+        }
+        themeToggleButton.layoutParams = LinearLayout.LayoutParams((40 * density).toInt(), (40 * density).toInt())
+        applyThemeToggleIcon()
+        return themeToggleButton
+    }
+
+    private fun applyThemeToggleIcon() {
+        if (!::themeToggleButton.isInitialized) return
+        val mode = currentTopoMode()
+        themeToggleButton.text = if (nightModeEnabled) "☀" else "🌙" // tap to SWITCH TO the mode shown
+        themeToggleButton.setTextColor(TopoPalette.fg(nightModeEnabled))
+        themeToggleButton.background = android.graphics.drawable.GradientDrawable().apply {
+            shape = android.graphics.drawable.GradientDrawable.OVAL
+            setColor(TopoPalette.bgRaised(mode))
+        }
+    }
+
+    /** "icon + title + subtitle + chevron" row, per the Signal Deck task
+     *  spec — a new shape, distinct from [settingsButtonRow] (which pairs
+     *  a label with its own trailing BUTTON, not a chevron-as-affordance
+     *  whole-row tap target). */
+    private fun buildBringSomeoneInRow(icon: String, title: String, subtitle: String, onClick: () -> Unit): View {
+        val density = resources.displayMetrics.density
+        val mode = currentTopoMode()
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = (64 * density).toInt()
+            setPadding((16 * density).toInt(), 0, (16 * density).toInt(), 0)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { onClick() }
+        }
+        row.addView(TextView(this).apply {
+            text = icon
+            textSize = 22f
+            setTextColor(TopoPalette.accent(mode))
+            minWidth = (40 * density).toInt()
+        })
+        val labels = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setPadding((12 * density).toInt(), 0, 0, 0)
+        }
+        labels.addView(TextView(this).apply {
+            text = title
+            textSize = 16f
+            setTextColor(TopoPalette.textPrimary(mode))
+        })
+        labels.addView(TextView(this).apply {
+            text = subtitle
+            textSize = 13f
+            setTextColor(TopoPalette.textSecondary(mode))
+        })
+        row.addView(labels)
+        row.addView(TextView(this).apply {
+            text = "›"
+            textSize = 20f
+            setTextColor(TopoPalette.textMuted(mode))
+        })
+        return row
+    }
+
+    private fun buildSignalDeckDivider(): View {
+        val density = resources.displayMetrics.density
+        return View(this).apply {
+            setBackgroundColor(TopoPalette.contour(currentTopoMode()))
+        }.also { it.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (1 * density).toInt()) }
+    }
+
+    /** Same share-text/intent [settingsButtonRow]'s existing "Share an
+     *  invite link" Settings row already uses — one implementation, two
+     *  entry points, not a second copy. */
+    private fun shareInviteLink() {
+        val text = "Join me on OpenCall mesh — my id is ${localShortId()}"
+        startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, text)
+        }, "Share via"))
+    }
+
+    /** Voice = outline, Video = filled amber (TopoPalette.accent) — video
+     *  is the heavier-weight action on this row. Re-applied by setNightMode
+     *  (mode changes recolour both) and called once at construction. */
+    private fun applyCallButtonStyles() {
+        if (!::groupCallVoiceButton.isInitialized) return
+        val mode = currentTopoMode()
+        val density = resources.displayMetrics.density
+        groupCallVoiceButton.setTextColor(TopoPalette.accent(mode))
+        groupCallVoiceButton.background = android.graphics.drawable.GradientDrawable().apply {
+            setColor(Color.TRANSPARENT)
+            setStroke((2 * density).toInt(), TopoPalette.accent(mode))
+        }
+        groupCallVideoButton.setTextColor(TopoPalette.onAccent(mode))
+        groupCallVideoButton.background = android.graphics.drawable.GradientDrawable().apply {
+            setColor(TopoPalette.accent(mode))
         }
     }
 
@@ -6617,9 +6769,11 @@ class OfflineCallActivity : AppCompatActivity() {
             vectorLookup = ::computePeerVector,
             nameFor = ::nameForGroupParticipant,
             isArticulation = { id -> transport.isArticulationPoint(id) },
-            rssiTrend = { id -> transport.ledger.blePresenceFor(id)?.trend }
+            rssiTrend = { id -> transport.ledger.blePresenceFor(id)?.trend },
+            isDirect = { id -> transport.isDirectlyConnected(id) }
         )
         partyRingView.setPeers(ringPeers, transport.isArticulationPoint(transport.localNodeId))
+        partyRingView.setSelfLabel(if (isLocalGroupOwner) "You · GO" else "You")
     }
 
     /** OFFLINE UI STEP 4: "N waiting to be carried" — the WHOLE store-and-
@@ -6643,18 +6797,25 @@ class OfflineCallActivity : AppCompatActivity() {
     // PartyRow.lastBearingTrue, set by refreshPartyRowTexts from
     // peerVectorAndText); UNKNOWN/BLE_ONLY/LOST-with-no-prior-fix peers never
     // set it, so this is a real proxy, not a guess.
-    private fun anyPeerHasFix(): Boolean = partyRows.values.any { !it.lastBearingTrue.isNaN() }
-
+    /** Signal Deck (diagnostic follow-up): "N nearby · battery% · charging"
+     *  — real device/mesh state, not placeholder text. N is partyRows.size
+     *  (every known peer, same source feedPartyRing itself uses — matches
+     *  what the ring actually draws). Battery/charging read the same
+     *  ACTION_BATTERY_CHANGED sticky broadcast evaluateBatteryCliff already
+     *  uses, not a second mechanism. Also refreshes the top bar's group
+     *  name (hostedGroupNetworkName is only non-null while HOSTING — a
+     *  client without it shown as plain "Offline mesh" is a real, known
+     *  simplification, not an attempt at a client-side SSID lookup). */
     private fun updateRingCardState() {
-        if (!::ringSummaryButton.isInitialized) return
-        val hasFix = anyPeerHasFix()
-        if (!hasFix) ringExpanded = false
-        ringSummaryButton.isEnabled = hasFix
-        partyRingView.visibility = if (ringExpanded && hasFix) View.VISIBLE else View.GONE
-        ringSummaryButton.text = when {
-            !hasFix -> "${partyStatusLine()} — no position data yet"
-            ringExpanded -> "${partyStatusLine()} — tap to collapse"
-            else -> "${partyStatusLine()} — tap to expand"
+        if (!::signalDeckStatusText.isInitialized) return
+        val n = partyRows.size
+        val pct = readBatteryPercent()
+        val status = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val charging = (status?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
+        val battWord = if (pct != null) "$pct%${if (charging) " charging" else ""}" else "battery unknown"
+        signalDeckStatusText.text = "$n nearby · $battWord"
+        if (::signalDeckGroupNameText.isInitialized) {
+            signalDeckGroupNameText.text = hostedGroupNetworkName ?: "Offline mesh"
         }
     }
 
@@ -6675,14 +6836,11 @@ class OfflineCallActivity : AppCompatActivity() {
         identityNameText.text = OfflineIdentity.displayName(applicationContext)
     }
 
-    // ── PHASE 3 item 6: Quick phrase — replaces the always-visible grid ──────
-    /** PHASE 5.1: ~70 phrases no longer fit one flat list — grouped into a
-     *  category picker first (Everyday/Outdoor/Emergency), then that
-     *  category's phrases. Shared by both entry points (Quick phrase on
-     *  Home, and per-member long-press via sendPhraseTo) via [onPhraseChosen]. */
-    private fun showQuickPhraseDialog() {
-        showPhraseCategoryDialog { phrase -> onPhraseChosen(phrase, targetNodeId = null) }
-    }
+    // Signal Deck (diagnostic follow-up): showQuickPhraseDialog() DELETED —
+    // its only caller (the Home "Quick phrase" button) is gone. The
+    // category-picker machinery it called into (showPhraseCategoryDialog/
+    // onPhraseChosen) stays — still used by the per-member long-press entry
+    // point (sendPhraseTo), unaffected by this removal.
 
     private fun onPhraseChosen(phrase: OfflineMediaTransport.PhraseCode, targetNodeId: Long?) {
         if (phrase == OfflineMediaTransport.PhraseCode.NEED_HELP && targetNodeId == null) {
@@ -7003,6 +7161,13 @@ class OfflineCallActivity : AppCompatActivity() {
         // (which picks the right drawable/fill for the CURRENT sosActive
         // state) rather than unconditionally overwriting the background.
         applyGroupAlertBarStyle(sosActive)
+        // Signal Deck (diagnostic follow-up): top bar / ring status text +
+        // the theme icon + call-row styling, all mode-dependent.
+        applyThemeToggleIcon()
+        applyCallButtonStyles()
+        if (::signalDeckDimLabel.isInitialized) signalDeckDimLabel.setTextColor(TopoPalette.textMuted(mode))
+        if (::signalDeckGroupNameText.isInitialized) signalDeckGroupNameText.setTextColor(TopoPalette.fg(nightModeEnabled))
+        if (::signalDeckStatusText.isInitialized) signalDeckStatusText.setTextColor(TopoPalette.textSecondary(mode))
     }
 
     /** OFFLINE UI STEP 5: single toggle, no picker, persisted via the same
@@ -7016,7 +7181,7 @@ class OfflineCallActivity : AppCompatActivity() {
     private fun setNightMode(enabled: Boolean) {
         nightModeEnabled = enabled
         getSharedPreferences("opencall", MODE_PRIVATE).edit().putBoolean("night_mode", enabled).apply()
-        nightModeButton.text = if (enabled) "Night mode: on" else "Night mode: off"
+        applyThemeToggleIcon()
         applyTopoMode() // TOPO 1.2: recolours the contour background too, including its contours
         if (::partyRingView.isInitialized) partyRingView.setNightMode(enabled)
         val bg = TopoPalette.cardBg(enabled)
