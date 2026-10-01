@@ -3008,12 +3008,32 @@ class OfflineCallActivity : AppCompatActivity() {
             messagesThreadView,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0).apply { weight = 1f }
         )
+        // fix (crash): messagesListBody (built inside buildMessagesScreen,
+        // via lazyMessagesScreen) used to only exist once the Messages
+        // placeholder below scrolled into view — openMessageThread() (now
+        // reachable directly from the roster's "Group chat" row, see that
+        // fix) touches messagesListBody unconditionally with no
+        // isInitialized guard, so a tap before ever scrolling there crashed
+        // with UninitializedPropertyAccessException. Built eagerly here
+        // instead, same treatment buildMessagesThreadView already gets just
+        // above — NOT restoring the lazy-scroll trigger as the ONLY path (that
+        // was the original discoverability bug this whole fix chain started
+        // from). lazyMessagesScreen() is idempotent (caches messagesScreenView),
+        // so addLazySection below still registers its own placeholder/trigger
+        // safely — if that ever fires, it just gets back this same
+        // already-built instance.
+        lazyMessagesScreen()
 
         // PART 1.2 (batch A): nearbyFrame (searchScreen/groupScreen, eager —
         // exactly as eager as they always were) plus Messages/Calls, each
         // scroll-triggered lazy (see addLazySection) — replacing
         // contentFrame+bottomNav. Groups/Settings are no longer sections at
         // all (PART 1.3/1.4) — see openGroupsOverlay/openOfflineSettingsOverlay.
+        // Messages' own content is no longer actually deferred by this (see
+        // the eager lazyMessagesScreen() call just above) — addLazySection
+        // is kept here only so its placeholder sizing/swap-in behavior for
+        // Messages stays identical to Calls', not because construction still
+        // waits on it.
         scrollBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scrollBody.addView(nearbyFrame)
         addLazySection(scrollBody) { lazyMessagesScreen() }
