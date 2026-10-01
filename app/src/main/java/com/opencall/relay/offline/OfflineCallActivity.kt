@@ -3214,6 +3214,11 @@ class OfflineCallActivity : AppCompatActivity() {
                                 // release must not also cancel what it just armed.
                                 armedThisGesture = false
                             } else {
+                                // Explicit confirmation this is a deliberate
+                                // cancel tap, not the rebroadcast loop simply
+                                // not firing — distinguishable in a log from
+                                // every other "SOS: ..." line.
+                                Log.d("OFFTRACE", "SOS: cancelled by=${MeshFrame.hex(mediaTransport?.localNodeId ?: 0L)}")
                                 mediaTransport?.stopSos()
                                 sosActive = false
                                 updateSosButtonUi()
