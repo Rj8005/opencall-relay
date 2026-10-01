@@ -668,6 +668,24 @@ class OfflineMediaTransportTest {
         assertEquals(99.toByte(), decoded!!.codecId)
     }
 
+    @Test
+    fun `MAX_VOICE_NOTE_PAYLOAD_BYTES actually covers a worst-case recording at the recorder's real bitrate`() {
+        // fix (real bug): the cap this guards against regressing — every
+        // voice note sent so far was silently dropped on receive because
+        // this never existed (fell to the 1024B else branch in
+        // maxPayloadFor). Worst case: VoiceNoteRecorder's 32000bps AAC for
+        // the full VOICE_NOTE_MAX_DURATION_MS, plus the 5-byte
+        // [codecId][durationMs] envelope header — comfortably under the cap,
+        // with real margin for container overhead.
+        val bitrateBytesPerSec = 32000 / 8
+        val worstCaseAudioBytes = bitrateBytesPerSec * (OfflineMediaTransport.VOICE_NOTE_MAX_DURATION_MS / 1000)
+        val worstCasePayloadBytes = 5 + worstCaseAudioBytes
+        assertTrue(
+            "worst-case voice note payload ($worstCasePayloadBytes bytes) must fit under the cap",
+            worstCasePayloadBytes < OfflineMediaTransport.MAX_VOICE_NOTE_PAYLOAD_BYTES
+        )
+    }
+
     // NOTE on 2.5's "no window exists where raw is suppressed AND
     // goMixLive is false": isGoMixReplacingBroadcastAudio (private,
     // OfflineMediaTransport.kt) is now `return goMixLive.get()` for

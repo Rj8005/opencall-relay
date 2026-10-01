@@ -569,9 +569,23 @@ class OfflineMediaTransport(
         const val VOICE_NOTE_CARRY_EXPIRY_MINS = 24 * 60
         // Recording-side cap (enforced by VoiceNoteRecorder, not this class) —
         // documented here too since it bounds this payload's realistic max
-        // size: ~30s of mono AAC at a modest bitrate is well under any
-        // practical mesh-frame size concern.
+        // size for MAX_VOICE_NOTE_PAYLOAD_BYTES below.
         const val VOICE_NOTE_MAX_DURATION_MS = 30_000
+        // fix (real bug, every voice note sent so far was silently dropped
+        // on receive): TYPE_VOICE_NOTE was never added to maxPayloadFor's
+        // when, so it fell to the `else -> MAX_CONTROL_PAYLOAD_BYTES` branch
+        // (1024B, ~1092B signed) — the OLD comment above this block claiming
+        // "well under any practical mesh-frame size concern" was never
+        // actually checked against that. Worst case at VoiceNoteRecorder's
+        // real settings (32000 bps = 4000 B/s, 30s): 4000*30 = 120,000 bytes
+        // raw AAC. 144*1024=147,456 bytes — about 27KB of margin for
+        // MPEG_4 container overhead (moov/mdat/ftyp atoms) and encoder
+        // bitrate variance — comfortably under MAX_VIDEO_PAYLOAD_BYTES (256KB), the
+        // largest existing precedent, confirming the wire framing itself
+        // (MeshFrame's 4B BE length prefix, not a 16-bit field — up to ~2GB
+        // in principle) was never the real constraint; this is purely an
+        // application-policy cap, same as every other MAX_*_PAYLOAD_BYTES.
+        const val MAX_VOICE_NOTE_PAYLOAD_BYTES = 144 * 1024
 
         // OCP PHASE 3.1 (AUTHORISED WIRE ADDITION #1): timestamped video/audio
         // — next free numbers after TYPE_VOICE_NOTE(36, reserved but not yet
@@ -827,8 +841,16 @@ class OfflineMediaTransport(
 
         private const val MAX_CHAT_PAYLOAD_BYTES = 4096
         // Envelope header (42B, see MeshCarrier.ENVELOPE_HEADER_SIZE) + the
-        // largest inner payload this mesh currently carries (a chat message).
-        private const val MAX_STORE_FWD_PAYLOAD_BYTES = 42 + MAX_CHAT_PAYLOAD_BYTES
+        // largest inner payload this mesh currently carries. fix: was sized
+        // for a chat message (4096B) — a CARRIED voice note (TYPE_STORE_FWD
+        // is the outer frame's type for anything traveling via MeshCarrier,
+        // so it's THIS constant, not MAX_VOICE_NOTE_PAYLOAD_BYTES, that
+        // gated a carried voice note's receive-side bounds check) would
+        // have been silently dropped here too, even after fixing the direct
+        // TYPE_VOICE_NOTE case above. Voice notes (~144KB cap) are now the
+        // largest thing this mesh ever carries, by a wide margin over every
+        // other carried type (SOS/chat/phrase) — sized for that.
+        private const val MAX_STORE_FWD_PAYLOAD_BYTES = 42 + MAX_VOICE_NOTE_PAYLOAD_BYTES
         // PHASE 7A STEP 5: matches the display-name validation limit exactly
         // (see OfflineCallActivity's showDisplayNameDialog) — this wire-level
         // truncation is a defensive floor, not the primary enforcement point.
@@ -5490,6 +5512,9 @@ class OfflineMediaTransport(
     private fun maxPayloadFor(type: Byte): Int {
         val base = when (type) {
             TYPE_CHAT -> MAX_CHAT_PAYLOAD_BYTES
+            // fix: was missing entirely (fell to the else branch, 1024B) —
+            // see MAX_VOICE_NOTE_PAYLOAD_BYTES's own doc for the derivation.
+            TYPE_VOICE_NOTE -> MAX_VOICE_NOTE_PAYLOAD_BYTES
             TYPE_FRAME -> MAX_VIDEO_PAYLOAD_BYTES
             TYPE_AUDIO -> MAX_AUDIO_PAYLOAD_BYTES
             // OCP PHASE 3.1: same cap as their legacy counterpart, +8 for the
