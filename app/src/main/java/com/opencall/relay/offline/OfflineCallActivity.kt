@@ -7873,6 +7873,14 @@ class OfflineCallActivity : AppCompatActivity() {
         openThreadKey = null
         errorText.visibility = View.GONE
         callScreen.visibility = View.GONE
+        // fix: searchScreen/groupScreen overlap — this was the one
+        // asymmetric transition in the file (every other groupScreen=VISIBLE
+        // site already pairs it with searchScreen=GONE; see e.g. the group-
+        // joined and group-call-ended transitions). A call can only be
+        // reached once a group has formed, so searchScreen should already
+        // be GONE here in practice — this is defensive, closing the one gap
+        // rather than relying on that always holding.
+        searchScreen.visibility = View.GONE
         groupScreen.visibility = View.VISIBLE
         updateForegroundState()
     }
