@@ -4993,7 +4993,13 @@ class OfflineCallActivity : AppCompatActivity() {
             setNightMode(resolvedNight)
         }
         body.addView(themeBtn)
-        body.addView(settingsToggleRow("Night mode", "night_mode", false) { enabled -> setNightMode(enabled) })
+        // Step 5 (diagnostic follow-up): the separate "Night mode" toggle row
+        // DELETED — redundant with themeBtn above (both ultimately drive the
+        // same setNightMode()/night_mode pref) and with the Offline mesh
+        // screen's own top-right icon (Step 2). themeBtn stays: its
+        // "Match system" option is real, distinct capability the plain
+        // toggle never had — not literally the "Night mode toggle" this
+        // step asked to remove.
 
         // Communication
         body.addView(settingsSectionHeader("Communication"))
