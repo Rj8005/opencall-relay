@@ -2697,14 +2697,10 @@ class OfflineCallActivity : AppCompatActivity() {
         groupScreen.addView(groupCallBar)
         groupScreen.addView(groupCallReasonText)
         // Not in the new card list, but not explicitly asked to be removed
-        // either (only "Quick phrase" was) — a single slim row rather than
-        // the old two-button actionRow, since Messages has its own
-        // dedicated tab/screen now (see Step 4) and this is just a
-        // shortcut into it.
-        groupScreen.addView(Button(this).apply {
-            text = "Message"
-            setOnClickListener { openGroupChat() }
-        })
+        // either (only "Quick phrase" was) — DELETED: confirmed redundant
+        // with the roster's own synthetic "Group chat (N member(s))" row
+        // (renderRosterList, position 0), which predates this change and
+        // reaches the same destination. No reachability lost.
 
         // ── Signal Deck (diagnostic follow-up) party ring card — ALWAYS
         // visible now (no ringSummaryButton collapse/expand): the NaN-
