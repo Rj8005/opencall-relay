@@ -24,7 +24,10 @@ class TopoTabSeparationTest {
     // rather than the overlap going unnoticed.
     private val MESSAGES_VIEW_FIELDS = setOf(
         "messagesListBody", "messagesThreadView", "messagesThreadNameText",
-        "messagesChatListView", "messagesChatAdapter", "messagesComposerInput"
+        "messagesChatListView", "messagesChatAdapter", "messagesComposerInput",
+        // Step 4 (diagnostic follow-up): voice notes moved here from the SOS
+        // overlay — genuinely Messages-owned now, not shared with the call screen.
+        "voiceNoteHoldButton", "voiceNotesListBody"
     )
     private val CALL_SCREEN_VIEW_FIELDS = setOf(
         "callScreen", "videoFrame", "hangupButton", "callTimerText", "peerNameText",

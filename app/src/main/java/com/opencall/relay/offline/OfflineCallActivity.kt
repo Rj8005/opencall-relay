@@ -3327,67 +3327,86 @@ class OfflineCallActivity : AppCompatActivity() {
             // partyStatusOverlay — see that overlay's own build site. A user
             // looks for group/roster data there, not behind the emergency
             // control this overlay is.
-
-            // B5 (diagnostic follow-up): push-to-talk voice notes — a
-            // fallback broadcast channel independent of an active call.
-            // Placed here (SOS/Group Alert overlay) rather than a new
-            // top-level surface: "walkie-talkie fallback" is squarely an
-            // emergency-adjacent use case, and this overlay is already the
-            // one reachable regardless of what else is happening on screen.
-            body.addView(settingsSectionHeader("Voice notes"))
-            body.addView(settingsInfoLine(
-                "Hold the button to record, release to send to everyone nearby. Max ${OfflineMediaTransport.VOICE_NOTE_MAX_DURATION_MS / 1000}s."
-            ))
-            voiceNoteHoldButton = Button(this).apply {
-                text = "Hold to talk"
-                setOnTouchListener { _, event ->
-                    when (event.actionMasked) {
-                        android.view.MotionEvent.ACTION_DOWN -> {
-                            val started = voiceNoteRecorder.start { result ->
-                                runOnUiThread {
-                                    voiceNoteHoldButton.text = "Hold to talk"
-                                    mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
-                                }
-                            }
-                            voiceNoteHoldButton.text = if (started) "Recording… release to send" else "Hold to talk"
-                            if (!started) {
-                                Toast.makeText(this@OfflineCallActivity, "Couldn't start recording", Toast.LENGTH_SHORT).show()
-                            }
-                            true
-                        }
-                        android.view.MotionEvent.ACTION_UP -> {
-                            voiceNoteHoldButton.text = "Hold to talk"
-                            voiceNoteRecorder.stop()?.let { result ->
-                                mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
-                            }
-                            true
-                        }
-                        android.view.MotionEvent.ACTION_CANCEL -> {
-                            voiceNoteHoldButton.text = "Hold to talk"
-                            voiceNoteRecorder.cancel()
-                            true
-                        }
-                        else -> false
-                    }
-                }
-            }
-            body.addView(
-                voiceNoteHoldButton,
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (56 * density).toInt()).apply {
-                    setMargins(0, (8 * density).toInt(), 0, (8 * density).toInt())
-                }
-            )
-            voiceNotesListBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-            body.addView(voiceNotesListBody)
+            // Step 4 (diagnostic follow-up): Voice notes MOVED to the
+            // Messages screen (buildMessagesScreen) — a voice message is a
+            // normal communication feature with no business living behind
+            // the emergency control; see that build site.
         }
     }
 
+    /** Step 4 (diagnostic follow-up): push-to-talk voice notes — a fallback
+     *  broadcast channel independent of an active call. MOVED here (from
+     *  the SOS/Group Alert overlay, where it shipped by mistake) — Messages
+     *  is where a user actually looks for a voice-message feature. Inserted
+     *  BEFORE messagesListBody is added, as a static sibling — never inside
+     *  messagesListBody itself, which refreshMessagesScreen() clears via
+     *  removeAllViews() and rebuilds per-thread (same hazard Step 3's
+     *  partyStatusOverlayBody had). */
+    private fun buildVoiceNotesSection(): View {
+        val density = resources.displayMetrics.density
+        val section = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        section.addView(settingsSectionHeader("Voice notes"))
+        section.addView(settingsInfoLine(
+            "Hold the button to record, release to send to everyone nearby. Max ${OfflineMediaTransport.VOICE_NOTE_MAX_DURATION_MS / 1000}s."
+        ))
+        voiceNoteHoldButton = Button(this).apply {
+            text = "Hold to talk"
+            setOnTouchListener { _, event ->
+                when (event.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        val started = voiceNoteRecorder.start { result ->
+                            runOnUiThread {
+                                voiceNoteHoldButton.text = "Hold to talk"
+                                mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
+                            }
+                        }
+                        voiceNoteHoldButton.text = if (started) "Recording… release to send" else "Hold to talk"
+                        if (!started) {
+                            Toast.makeText(this@OfflineCallActivity, "Couldn't start recording", Toast.LENGTH_SHORT).show()
+                        }
+                        true
+                    }
+                    android.view.MotionEvent.ACTION_UP -> {
+                        voiceNoteHoldButton.text = "Hold to talk"
+                        voiceNoteRecorder.stop()?.let { result ->
+                            mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
+                        }
+                        true
+                    }
+                    android.view.MotionEvent.ACTION_CANCEL -> {
+                        voiceNoteHoldButton.text = "Hold to talk"
+                        voiceNoteRecorder.cancel()
+                        true
+                    }
+                    else -> false
+                }
+            }
+        }
+        section.addView(
+            voiceNoteHoldButton,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (56 * density).toInt()).apply {
+                setMargins(0, (8 * density).toInt(), 0, (8 * density).toInt())
+            }
+        )
+        voiceNotesListBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        section.addView(voiceNotesListBody)
+        // Step 4: populate from whatever this session already received —
+        // unlike the old (eager-built) SOS overlay, buildMessagesScreen is
+        // reached via addLazySection (built on first scroll-into-view, see
+        // lazyMessagesScreen's call site), so a note that arrived before
+        // this screen was ever built must not simply be missing until the
+        // NEXT one shows up — mediaTransport.voiceNotes is exactly the
+        // "pull current state" snapshot for this, same contract as sosEntries.
+        mediaTransport?.voiceNotes?.forEach { appendVoiceNoteRow(it) }
+        return section
+    }
+
     /** Wired to OfflineMediaTransport.onVoiceNoteReceived — appends a row to
-     *  the (already-built, possibly not currently visible) voice notes list.
-     *  A no-op before the SOS overlay has ever been built is impossible in
-     *  practice (buildSosSectionOverlay runs eagerly during initial UI
-     *  construction, unlike the lazy Groups/Settings overlays — see its own
-     *  call site), but the isInitialized guard is cheap insurance regardless. */
+     *  the voice notes list if it's been built yet (Messages is reached via
+     *  addLazySection, so this can genuinely still be uninitialized — see
+     *  buildVoiceNotesSection's doc for why a LATER screen build re-reads
+     *  the full snapshot rather than losing anything received in the
+     *  meantime). */
     private fun onVoiceNoteReceived(note: OfflineMediaTransport.VoiceNote) {
         if (!::voiceNotesListBody.isInitialized) return
         appendVoiceNoteRow(note)
@@ -3769,6 +3788,9 @@ class OfflineCallActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding((16 * density).toInt(), (16 * density).toInt(), (16 * density).toInt(), 0)
             setBackgroundColor(TopoPalette.bgBase(currentTopoMode()))
+            // Step 4 (diagnostic follow-up): added BEFORE messagesListBody,
+            // as a static sibling — see buildVoiceNotesSection's own doc.
+            addView(buildVoiceNotesSection())
             messagesListBody = LinearLayout(this@OfflineCallActivity).apply { orientation = LinearLayout.VERTICAL }
             addView(messagesListBody)
         }
