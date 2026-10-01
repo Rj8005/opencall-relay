@@ -3110,15 +3110,19 @@ class OfflineCallActivity : AppCompatActivity() {
         val bar = TextView(this)
         groupAlertBar = bar
         var downAtElapsedMs = 0L
-        var fired = false
+        // True once THIS press-and-hold gesture has already fired armGroupAlert()
+        // (sosActive flips to true mid-hold, before the finger lifts) — its own
+        // release must NOT also be read as the separate "tap while active to
+        // cancel" gesture below, or arming would immediately self-cancel.
+        var armedThisGesture = false
         val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
         val tick = object : Runnable {
             override fun run() {
+                if (sosActive) return // became active some other way mid-hold — nothing left to fire
                 val held = android.os.SystemClock.elapsedRealtime() - downAtElapsedMs
                 if (SlideToSos.shouldFire(held)) {
-                    fired = true
-                    bar.text = "Hold 3s for group alert"
-                    armGroupAlert()
+                    armedThisGesture = true
+                    armGroupAlert() // also calls updateSosButtonUi(), which refreshes this bar's text/background
                     return
                 }
                 mainHandler.postDelayed(this, 50L)
@@ -3128,34 +3132,94 @@ class OfflineCallActivity : AppCompatActivity() {
             text = "Hold 3s for group alert"
             gravity = Gravity.CENTER
             textSize = 14f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(TopoPalette.danger(currentTopoMode()))
             minHeight = (52 * density).toInt()
+            // fix: restore cancel path for active group alert — idle/active
+            // styling now lives in updateSosButtonUi, the single place that
+            // already tracks sosActive transitions from every path (this
+            // gesture, a reconnect re-arm, a mode change) — applied once more
+            // here so the bar starts in the right state if built while
+            // already active (e.g. after a GO-election reconnect re-arm).
+            applyGroupAlertBarStyle(sosActive)
             setOnTouchListener { _, event ->
-                when (event.action) {
-                    android.view.MotionEvent.ACTION_DOWN -> {
-                        downAtElapsedMs = android.os.SystemClock.elapsedRealtime()
-                        fired = false
-                        text = "Hold…"
-                        mainHandler.postDelayed(tick, 50L)
-                        true
-                    }
-                    android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
-                        mainHandler.removeCallbacks(tick)
-                        val wasTap = !fired && event.action == android.view.MotionEvent.ACTION_UP
-                        if (!fired) text = "Hold 3s for group alert"
-                        if (wasTap) {
-                            // Never fires anything — only shows the section. See doc above.
-                            sosSectionOverlay.visibility = View.VISIBLE
-                            renderSosAlerts() // refresh the active-SOS list the moment the section opens
+                if (sosActive) {
+                    // Active state: cancel is a PLAIN TAP, no hold required —
+                    // cancelling must be easy, unlike arming (deliberately
+                    // hard, 3s hold, see SlideToSos's own doc).
+                    when (event.action) {
+                        android.view.MotionEvent.ACTION_UP -> {
+                            if (armedThisGesture) {
+                                // This exact press is the SAME gesture that just
+                                // armed the alert (tick fired mid-hold) — its
+                                // release must not also cancel what it just armed.
+                                armedThisGesture = false
+                            } else {
+                                mediaTransport?.stopSos()
+                                sosActive = false
+                                updateSosButtonUi()
+                            }
+                            true
                         }
-                        true
+                        android.view.MotionEvent.ACTION_CANCEL -> {
+                            armedThisGesture = false
+                            true
+                        }
+                        else -> true // swallow DOWN so this branch owns the gesture start to finish
                     }
-                    else -> false
+                } else {
+                    when (event.action) {
+                        android.view.MotionEvent.ACTION_DOWN -> {
+                            downAtElapsedMs = android.os.SystemClock.elapsedRealtime()
+                            armedThisGesture = false
+                            text = "Hold…"
+                            mainHandler.postDelayed(tick, 50L)
+                            true
+                        }
+                        android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                            mainHandler.removeCallbacks(tick)
+                            val wasTap = !armedThisGesture && event.action == android.view.MotionEvent.ACTION_UP
+                            if (!armedThisGesture) text = "Hold 3s for group alert"
+                            if (wasTap) {
+                                // Never fires anything — only shows the section. See doc above.
+                                sosSectionOverlay.visibility = View.VISIBLE
+                                renderSosAlerts() // refresh the active-SOS list the moment the section opens
+                            }
+                            true
+                        }
+                        else -> false
+                    }
                 }
             }
         }
         return bar
+    }
+
+    /** fix: restore cancel path for active group alert — idle: outlined red
+     *  ("Hold 3s for group alert"); active: filled red ("Alert active · tap
+     *  to cancel"). Called from [buildGroupAlertBar] (initial state) and
+     *  [updateSosButtonUi] (every subsequent sosActive transition, from
+     *  whichever path caused it — this gesture, a reconnect re-arm, or a
+     *  mode/theme change), so the two views can never fall out of sync,
+     *  same guarantee this file's existing sosButton/groupAlertBar comment
+     *  already documents. No-op if the bar hasn't been built yet (Settings/
+     *  other screens construct this Activity's chrome before the Offline
+     *  tab's own views in some code paths). */
+    private fun applyGroupAlertBarStyle(active: Boolean) {
+        if (!::groupAlertBar.isInitialized) return
+        val mode = currentTopoMode()
+        if (active) {
+            groupAlertBar.text = "Alert active · tap to cancel"
+            groupAlertBar.setTextColor(TopoPalette.onAccent(mode))
+            groupAlertBar.setBackgroundColor(TopoPalette.danger(mode))
+        } else {
+            groupAlertBar.text = "Hold 3s for group alert"
+            groupAlertBar.setTextColor(TopoPalette.danger(mode))
+            val density = resources.displayMetrics.density
+            groupAlertBar.background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                setColor(TopoPalette.dangerBg(mode))
+                setStroke((2 * density).toInt(), TopoPalette.danger(mode))
+            }
+        }
     }
 
     /** TOPO PHASE 2.3: everything SOS-related, moved (not rebuilt) into one
@@ -6352,6 +6416,7 @@ class OfflineCallActivity : AppCompatActivity() {
         // regardless of which path (this device's own gesture, or SOS
         // being cleared/re-armed some other way) changed sosActive.
         sosButton.isEnabled = sosActive
+        applyGroupAlertBarStyle(sosActive)
     }
 
     /** PHASE 5A: renders every currently-active incoming SOS plus every FIND_RESP
@@ -6932,13 +6997,12 @@ class OfflineCallActivity : AppCompatActivity() {
         val mode = currentTopoMode()
         topoBackground.setMode(mode)
         if (::slideToSosView.isInitialized) slideToSosView.setMode(mode)
-        // PART 3.1/3.2 (batch B): groupAlertBar replaces the old floating
-        // circle — same "recolour on mode change" treatment, plain
-        // setBackgroundColor since it's a real rectangular bar now, not an
-        // oval needing a GradientDrawable.
-        if (::groupAlertBar.isInitialized) {
-            groupAlertBar.setBackgroundColor(TopoPalette.danger(mode))
-        }
+        // fix: restore cancel path for active group alert — idle state is
+        // now an outline (GradientDrawable), not a plain setBackgroundColor
+        // fill, so a mode change must go through applyGroupAlertBarStyle
+        // (which picks the right drawable/fill for the CURRENT sosActive
+        // state) rather than unconditionally overwriting the background.
+        applyGroupAlertBarStyle(sosActive)
     }
 
     /** OFFLINE UI STEP 5: single toggle, no picker, persisted via the same
