@@ -564,28 +564,146 @@ class OfflineMediaTransport(
         // it to someone who reconnects LATER, never re-delivers to someone
         // who already got the live copy. No separate content-level dedupe
         // needed on receive, same reasoning as TYPE_PHRASE/TYPE_CHAT.
+        // Step 3 (diagnostic follow-up): RETIRED — the eager-push voice-note
+        // protocol (sendVoiceNote/handleVoiceNoteFrame) is replaced by the
+        // generic TYPE_ATTACHMENT_META/REQUEST/DATA protocol below, kind=VOICE.
+        // Number 36 stays reserved/undocumented-as-free (not reused) rather
+        // than deleted outright, matching this codebase's own precedent for
+        // a retired-but-once-live type number. VOICE_NOTE_CODEC_AAC_MP4/
+        // VOICE_NOTE_MAX_DURATION_MS stay — still real constants, now used
+        // by the generic path (VoiceNoteRecorder's own recording format and
+        // duration cap didn't change, only how the result is sent).
         const val TYPE_VOICE_NOTE: Byte = 36
         const val VOICE_NOTE_CODEC_AAC_MP4: Byte = 1
-        const val VOICE_NOTE_CARRY_EXPIRY_MINS = 24 * 60
-        // Recording-side cap (enforced by VoiceNoteRecorder, not this class) —
-        // documented here too since it bounds this payload's realistic max
-        // size for MAX_VOICE_NOTE_PAYLOAD_BYTES below.
         const val VOICE_NOTE_MAX_DURATION_MS = 30_000
-        // fix (real bug, every voice note sent so far was silently dropped
-        // on receive): TYPE_VOICE_NOTE was never added to maxPayloadFor's
-        // when, so it fell to the `else -> MAX_CONTROL_PAYLOAD_BYTES` branch
-        // (1024B, ~1092B signed) — the OLD comment above this block claiming
-        // "well under any practical mesh-frame size concern" was never
-        // actually checked against that. Worst case at VoiceNoteRecorder's
-        // real settings (32000 bps = 4000 B/s, 30s): 4000*30 = 120,000 bytes
-        // raw AAC. 144*1024=147,456 bytes — about 27KB of margin for
-        // MPEG_4 container overhead (moov/mdat/ftyp atoms) and encoder
-        // bitrate variance — comfortably under MAX_VIDEO_PAYLOAD_BYTES (256KB), the
-        // largest existing precedent, confirming the wire framing itself
-        // (MeshFrame's 4B BE length prefix, not a 16-bit field — up to ~2GB
-        // in principle) was never the real constraint; this is purely an
-        // application-policy cap, same as every other MAX_*_PAYLOAD_BYTES.
-        const val MAX_VOICE_NOTE_PAYLOAD_BYTES = 144 * 1024
+        // fix (real bug, since fixed in Step 1 — see git history — now
+        // superseded by MAX_ATTACHMENT_BODY_BYTES below, kept only as the
+        // worst-case-size derivation MAX_ATTACHMENT_BODY_BYTES must still
+        // satisfy for a voice note specifically): worst case at
+        // VoiceNoteRecorder's real settings (32000bps=4000B/s, 30s):
+        // 4000*30 = 120,000 bytes raw AAC.
+        private const val VOICE_NOTE_WORST_CASE_BYTES = 120_000
+
+        // ── Step 3 (diagnostic follow-up): generic metadata-first attachment
+        // protocol — TYPE_ATTACHMENT_META is pushed eagerly (small: kind +
+        // size + a kind-specific detail blob), same dual live+carrier.put
+        // delivery sendPhrase/the old sendVoiceNote already used. The
+        // receiver sees a placeholder with a Download action; only on tap
+        // does TYPE_ATTACHMENT_REQUEST go out (receiver -> original sender,
+        // unicast), answered by TYPE_ATTACHMENT_DATA (sender -> requester
+        // ONLY, unicast, never broadcast). This mesh's bandwidth is already
+        // shared with calls/SOS/position relay (see relayDelayMs's existing
+        // charging/battery-gated deferral) — eagerly pushing a full photo/
+        // document body to every member of a group who may never open it is
+        // a real efficiency cost here, not just UX mimicry of a messaging
+        // app. LOCATION/CONTACT are the one exception: tiny, sent inline in
+        // META itself (latE7/lonE7 or name+phone), no request/response round
+        // trip for a few bytes — see AttachmentKind's own doc.
+        const val TYPE_ATTACHMENT_META: Byte = 41
+        const val TYPE_ATTACHMENT_REQUEST: Byte = 42
+        const val TYPE_ATTACHMENT_DATA: Byte = 43
+        const val ATTACHMENT_META_CARRY_EXPIRY_MINS = 24 * 60
+        // Body cap shared by every fetch-gated kind (VOICE/IMAGE/DOCUMENT) —
+        // must cover VOICE_NOTE_WORST_CASE_BYTES (120,000B) with margin AND
+        // match the 256KB video-precedent cap Steps 4/5 use for image/doc
+        // picker rejection. 256KB is the larger of the two requirements, so
+        // it's the one that governs; confirmed >= VOICE_NOTE_WORST_CASE_BYTES
+        // by MeshSignerTest-style assertion below (OfflineMediaTransportTest).
+        const val MAX_ATTACHMENT_BODY_BYTES = 256 * 1024
+        // msgId(16B) + bodySize(4B) prefix the REQUEST/DATA frames don't
+        // otherwise need documented elsewhere, so spelled out here once.
+        private const val MAX_ATTACHMENT_DATA_PAYLOAD_BYTES = 16 + MAX_ATTACHMENT_BODY_BYTES
+        // Generous ceiling for META's kind-specific detail blob — longest
+        // realistic case is CONTACT or IMAGE/DOCUMENT filename, both
+        // variable-length UTF-8 strings; 512B is far more than any sane
+        // filename/contact name needs, with margin.
+        private const val MAX_ATTACHMENT_META_PAYLOAD_BYTES = 16 + 1 + 4 + 2 + 512
+
+        private fun uuidToBytes(id: String): ByteArray {
+            val u = java.util.UUID.fromString(id)
+            return ByteBuffer.allocate(16).putLong(u.mostSignificantBits).putLong(u.leastSignificantBits).array()
+        }
+
+        private fun bytesToUuid(bytes: ByteArray): String {
+            val buf = ByteBuffer.wrap(bytes)
+            return java.util.UUID(buf.long, buf.long).toString()
+        }
+
+        private fun putUtf8(buf: ByteBuffer, s: String) {
+            val bytes = s.toByteArray(Charsets.UTF_8)
+            buf.putShort(bytes.size.toShort())
+            buf.put(bytes)
+        }
+
+        /** Null if [buf] doesn't have a full [2B len][len bytes] string left. */
+        private fun getUtf8(buf: ByteBuffer): String? {
+            if (buf.remaining() < 2) return null
+            val len = buf.short.toInt() and 0xFFFF
+            if (buf.remaining() < len) return null
+            val bytes = ByteArray(len).also { buf.get(it) }
+            return bytes.toString(Charsets.UTF_8)
+        }
+
+        /** Step 3: pure encode/decode for TYPE_ATTACHMENT_META — same "pure
+         *  companion, directly unit-testable" pattern as MeshLocation.encode/
+         *  decode. */
+        fun encodeAttachmentMeta(meta: AttachmentMeta): ByteArray {
+            val detail = ByteBuffer.allocate(MAX_ATTACHMENT_META_PAYLOAD_BYTES).apply {
+                when (meta.kind) {
+                    AttachmentKind.VOICE -> putInt(meta.durationMs ?: 0)
+                    AttachmentKind.IMAGE, AttachmentKind.DOCUMENT -> {
+                        putUtf8(this, meta.filename ?: "")
+                        putUtf8(this, meta.mimeType ?: "")
+                    }
+                    AttachmentKind.LOCATION -> {
+                        putInt(meta.latE7 ?: 0)
+                        putInt(meta.lonE7 ?: 0)
+                    }
+                    AttachmentKind.CONTACT -> {
+                        putUtf8(this, meta.contactName ?: "")
+                        putUtf8(this, meta.contactPhone ?: "")
+                    }
+                }
+            }.let { it.array().copyOf(it.position()) }
+            return ByteBuffer.allocate(16 + 1 + 4 + 2 + detail.size).apply {
+                put(uuidToBytes(meta.msgId))
+                put(meta.kind.wireId)
+                putInt(meta.bodySize)
+                putShort(detail.size.toShort())
+                put(detail)
+            }.array()
+        }
+
+        fun decodeAttachmentMeta(payload: ByteArray): AttachmentMeta? {
+            if (payload.size < 16 + 1 + 4 + 2) return null
+            val buf = ByteBuffer.wrap(payload)
+            val msgId = bytesToUuid(ByteArray(16).also { buf.get(it) })
+            val kind = AttachmentKind.fromWireId(buf.get()) ?: return null
+            val bodySize = buf.int
+            val detailLen = buf.short.toInt() and 0xFFFF
+            if (buf.remaining() < detailLen) return null
+            val detail = ByteBuffer.wrap(ByteArray(detailLen).also { buf.get(it) })
+            return when (kind) {
+                AttachmentKind.VOICE -> {
+                    if (detail.remaining() < 4) return null
+                    AttachmentMeta(msgId, kind, bodySize, durationMs = detail.int)
+                }
+                AttachmentKind.IMAGE, AttachmentKind.DOCUMENT -> {
+                    val fn = getUtf8(detail) ?: return null
+                    val mt = getUtf8(detail) ?: return null
+                    AttachmentMeta(msgId, kind, bodySize, filename = fn, mimeType = mt)
+                }
+                AttachmentKind.LOCATION -> {
+                    if (detail.remaining() < 8) return null
+                    AttachmentMeta(msgId, kind, bodySize, latE7 = detail.int, lonE7 = detail.int)
+                }
+                AttachmentKind.CONTACT -> {
+                    val nm = getUtf8(detail) ?: return null
+                    val ph = getUtf8(detail) ?: return null
+                    AttachmentMeta(msgId, kind, bodySize, contactName = nm, contactPhone = ph)
+                }
+            }
+        }
 
         // OCP PHASE 3.1 (AUTHORISED WIRE ADDITION #1): timestamped video/audio
         // — next free numbers after TYPE_VOICE_NOTE(36, reserved but not yet
@@ -687,33 +805,11 @@ class OfflineMediaTransport(
         fun deriveTileBudget(probedDecoders: Int): Int = (probedDecoders - 1).coerceIn(TILE_BUDGET_MIN, TILE_BUDGET_CEILING)
         fun deriveMaxLiveCameras(probedDecoders: Int): Int = (probedDecoders - 1).coerceIn(MIN_LIVE_CAMERAS, MAX_GROUP_PARTICIPANTS)
 
-        /** B5: pure encode/decode for TYPE_VOICE_NOTE's payload — see that
-         *  constant's wire doc for the exact layout. Extracted for direct
-         *  unit testing without a constructed transport, same "pure
-         *  companion" pattern as MeshLocation.encode/decode. */
-        fun encodeVoiceNotePayload(codecId: Byte, durationMs: Int, audioBytes: ByteArray): ByteArray =
-            ByteBuffer.allocate(1 + 4 + audioBytes.size).apply {
-                put(codecId)
-                putInt(durationMs)
-                put(audioBytes)
-            }.array()
-
-        data class DecodedVoiceNote(val codecId: Byte, val durationMs: Int, val audioBytes: ByteArray)
-
-        /** Null for a payload too short to even hold the fixed header (5
-         *  bytes) — an unrecognized [DecodedVoiceNote.codecId] in an
-         *  otherwise well-formed payload is NOT null here; the caller
-         *  decides whether to reject an unknown codec (see
-         *  handleVoiceNoteFrame), same "decode succeeds, dispatch decides"
-         *  split MeshLocation.decode uses. */
-        fun decodeVoiceNotePayload(payload: ByteArray): DecodedVoiceNote? {
-            if (payload.size < 5) return null
-            val buf = ByteBuffer.wrap(payload)
-            val codecId = buf.get()
-            val durationMs = buf.int
-            val audioBytes = ByteArray(payload.size - 5).also { buf.get(it) }
-            return DecodedVoiceNote(codecId, durationMs, audioBytes)
-        }
+        // Step 3 (diagnostic follow-up): encodeVoiceNotePayload/
+        // decodeVoiceNotePayload/DecodedVoiceNote DELETED — the
+        // TYPE_VOICE_NOTE wire format they encoded is retired (see that
+        // constant's doc); voice notes now ride the generic
+        // encodeAttachmentMeta/decodeAttachmentMeta path, kind=VOICE.
 
         /** OCP PHASE 5.1: splits [visiblePeersRanked] (everyone this device
          *  intends to decode SOMETHING for — pin-first, then speaker, then
@@ -841,16 +937,16 @@ class OfflineMediaTransport(
 
         private const val MAX_CHAT_PAYLOAD_BYTES = 4096
         // Envelope header (42B, see MeshCarrier.ENVELOPE_HEADER_SIZE) + the
-        // largest inner payload this mesh currently carries. fix: was sized
-        // for a chat message (4096B) — a CARRIED voice note (TYPE_STORE_FWD
-        // is the outer frame's type for anything traveling via MeshCarrier,
-        // so it's THIS constant, not MAX_VOICE_NOTE_PAYLOAD_BYTES, that
-        // gated a carried voice note's receive-side bounds check) would
-        // have been silently dropped here too, even after fixing the direct
-        // TYPE_VOICE_NOTE case above. Voice notes (~144KB cap) are now the
-        // largest thing this mesh ever carries, by a wide margin over every
-        // other carried type (SOS/chat/phrase) — sized for that.
-        private const val MAX_STORE_FWD_PAYLOAD_BYTES = 42 + MAX_VOICE_NOTE_PAYLOAD_BYTES
+        // largest inner payload this mesh currently carries. Step 3: back to
+        // a chat message (4096B) being the largest CARRIED type — the old
+        // eager-push voice notes (Step 1's ~144KB fix) are retired, and the
+        // new attachment protocol deliberately never carries a body:
+        // TYPE_ATTACHMENT_META (small, see its own cap) is the only
+        // attachment-related type MeshCarrier ever queues; TYPE_ATTACHMENT_
+        // DATA/REQUEST are unicast, on-demand, store-and-forward never
+        // applies to them (see TYPE_ATTACHMENT_META's class doc for why
+        // that's a deliberate bandwidth choice, not an oversight).
+        private const val MAX_STORE_FWD_PAYLOAD_BYTES = 42 + MAX_CHAT_PAYLOAD_BYTES
         // PHASE 7A STEP 5: matches the display-name validation limit exactly
         // (see OfflineCallActivity's showDisplayNameDialog) — this wire-level
         // truncation is a defensive floor, not the primary enforcement point.
@@ -1073,6 +1169,42 @@ class OfflineMediaTransport(
         // CAP_FRAME_AGE, or hasn't sent media since resolving).
         private const val AGE_MS_NOT_YET_IMPLEMENTED = -1L
     }
+
+    /** Step 3: what an attachment IS — VOICE/IMAGE/DOCUMENT are
+     *  fetch-gated (META only advertises them; the body is a separate,
+     *  on-demand TYPE_ATTACHMENT_DATA fetch). LOCATION/CONTACT are
+     *  small enough to travel complete inside META itself — [isInline]
+     *  is the single place that distinction is encoded, so a sender/
+     *  receiver never has to re-derive it ad hoc. Declared here, at class
+     *  level rather than inside the companion object, for the same reason
+     *  [RelayDedupeCache] is: a type nested inside a companion object is
+     *  only reachable from outside as Outer.Companion.Nested, not the
+     *  shorter Outer.Nested this class's own call sites need. */
+    enum class AttachmentKind(val wireId: Byte, val isInline: Boolean) {
+        VOICE(1, false), IMAGE(2, false), DOCUMENT(3, false),
+        LOCATION(4, true), CONTACT(5, true);
+        companion object {
+            fun fromWireId(id: Byte): AttachmentKind? = values().firstOrNull { it.wireId == id }
+        }
+    }
+
+    /** Step 3: everything TYPE_ATTACHMENT_META carries — fields outside
+     *  [kind]'s own relevance are simply null (e.g. [durationMs] for an
+     *  IMAGE). [bodySize] is 0 for an inline kind (nothing to fetch).
+     *  Declared at class level alongside [AttachmentKind] for the same
+     *  Outer.Companion.Nested reason. */
+    data class AttachmentMeta(
+        val msgId: String,
+        val kind: AttachmentKind,
+        val bodySize: Int,
+        val durationMs: Int? = null,
+        val filename: String? = null,
+        val mimeType: String? = null,
+        val latE7: Int? = null,
+        val lonE7: Int? = null,
+        val contactName: String? = null,
+        val contactPhone: String? = null
+    )
 
     /** Pure, off-device-testable — the exact seen/dupCount/bounds/TTL logic
      *  scheduleAllowlistedForward uses, extracted into its own plain class
@@ -2411,93 +2543,186 @@ class OfflineMediaTransport(
      *  message" — see handlePhraseFrame's doc. */
     var onPhraseReceived: ((fromNodeId: Long, code: Int, seq: Long, carrierId: Long?, hopCount: Int?) -> Unit)? = null
 
-    // ── B5 (diagnostic follow-up): push-to-talk voice notes ─────────────────
+    // ── Step 3 (diagnostic follow-up): generic metadata-first attachments ───
 
-    /** One received voice note — [audioBytes] is the raw AAC/MPEG_4 file
-     *  content exactly as recorded (see VoiceNoteRecorder), ready to hand
-     *  straight to a MediaPlayer via a temp file or MediaDataSource. No
-     *  msgId here (unlike MeshCarrier's own Queued envelope) — a LIVE
-     *  delivery never carries one (see TYPE_VOICE_NOTE's wire doc: the
-     *  payload deliberately doesn't embed it, matching TYPE_PHRASE's
-     *  leaner shape), so this class doesn't pretend to have one either. */
-    data class VoiceNote(
-        val srcId: Long,
-        val durationMs: Int,
-        val audioBytes: ByteArray,
+    private val attachmentStore = AttachmentStore.get(context)
+
+    /** What's known about one attachment on THIS device — either because
+     *  this device sent it (in which case [senderNodeId] == localNodeId and
+     *  the body is on disk from the moment [sendAttachment] returns) or
+     *  because a TYPE_ATTACHMENT_META arrived for it. [carrierId]/[hopCount]
+     *  non-null only for a carried META delivery, same contract as every
+     *  other carried-type state class in this file. Fetch state itself
+     *  isn't tracked here — [AttachmentStore.has] is the single source of
+     *  truth for "is the body available," so this class can't fall out of
+     *  sync with the disk. */
+    data class AttachmentState(
+        val meta: AttachmentMeta,
+        val senderNodeId: Long,
         val receivedAtMs: Long,
         val carrierId: Long?,
         val hopCount: Int?
     )
 
-    // Bounded so a long session's worth of received voice notes can't grow
-    // this in-memory list (and its raw audio bytes) unboundedly — oldest
-    // dropped first, same shape as MeshSosManager's dedupe cache eviction.
-    private val MAX_VOICE_NOTES_RETAINED = 30
-    private val voiceNotesInternal = mutableListOf<VoiceNote>()
-    private val voiceNotesLock = Any()
+    // Bounded so a long session's worth of known attachments can't grow this
+    // unboundedly — oldest dropped first, same shape as the voice-note list
+    // this replaces. Only metadata, never a body — bodies live on disk via
+    // attachmentStore, not here.
+    private val MAX_ATTACHMENTS_RETAINED = 100
+    private val attachmentsKnownInternal = LinkedHashMap<String, AttachmentState>()
+    private val attachmentsLock = Any()
 
-    /** Snapshot of every voice note received this session, oldest first —
-     *  read fresh by the inbox UI when it opens, same "pull current state,
-     *  don't require having been subscribed since session start" contract
-     *  as [sosEntries]. */
-    val voiceNotes: List<VoiceNote> get() = synchronized(voiceNotesLock) { voiceNotesInternal.toList() }
+    /** Snapshot of every attachment known this session (sent or received),
+     *  oldest first — same "pull current state" contract [voiceNotes] used
+     *  to have. */
+    val attachmentsKnown: List<AttachmentState> get() = synchronized(attachmentsLock) { attachmentsKnownInternal.values.toList() }
 
-    /** Fired on the main thread whenever a new voice note is received
-     *  (live or carried — [VoiceNote.carrierId] tells which). */
-    var onVoiceNoteReceived: ((VoiceNote) -> Unit)? = null
+    /** Fired on the main thread whenever a new attachment becomes known
+     *  (live or carried META — [AttachmentState.carrierId] tells which).
+     *  For an inline kind (LOCATION/CONTACT) this IS the complete message;
+     *  for a fetch-gated kind it's a placeholder until [onAttachmentDataReceived]. */
+    var onAttachmentMetaReceived: ((AttachmentState) -> Unit)? = null
 
-    /** Records-and-sends entry point is [VoiceNoteRecorder] (mic capture);
-     *  this is the send-over-the-mesh half, called once recording stops
-     *  with the finished file's bytes. Broadcast only (no 1:1 targeting,
-     *  matching "push-to-talk voice-note BROADCAST" — unlike [sendPhrase],
-     *  which supports both). Exactly [sendPhrase]'s existing broadcast
-     *  pattern: live now, carried for anyone who reconnects later, current
-     *  roster pre-marked as already-delivered so they're never double-sent. */
-    fun sendVoiceNote(audioBytes: ByteArray, durationMs: Int) {
+    /** Fired on the main thread once a requested body is fetched and
+     *  written to disk — [bytes] is also what AttachmentStore.read(msgId)
+     *  would now return; handed over directly so the UI doesn't need a
+     *  redundant disk read on the main thread. */
+    var onAttachmentDataReceived: ((msgId: String, bytes: ByteArray) -> Unit)? = null
+
+    /** Broadcast only (no 1:1 targeting) — matches the retired
+     *  sendVoiceNote's own scope exactly, same reasoning (see
+     *  TYPE_ATTACHMENT_META's class doc). Exactly sendPhrase's existing
+     *  broadcast pattern: live META now, carried for anyone who reconnects
+     *  later, current roster pre-marked as already-delivered. For a
+     *  fetch-gated kind, [bodyBytes] is persisted to disk BEFORE the META
+     *  ever goes out, so this device can answer a request the moment one
+     *  arrives, even across a process restart. Returns the new msgId, or
+     *  null if nothing was sent (not connected). */
+    fun sendAttachment(
+        kind: AttachmentKind,
+        bodyBytes: ByteArray,
+        durationMs: Int? = null,
+        filename: String? = null,
+        mimeType: String? = null,
+        latE7: Int? = null,
+        lonE7: Int? = null,
+        contactName: String? = null,
+        contactPhone: String? = null
+    ): String? {
         if (!running.get() || !alive.get()) {
-            logW("MEDIA: voice note send dropped — not connected")
-            return
+            logW("MEDIA: attachment send dropped — not connected")
+            return null
         }
-        val handler = chatHandler ?: return
-        val payload = encodeVoiceNotePayload(VOICE_NOTE_CODEC_AAC_MP4, durationMs, audioBytes)
+        val handler = chatHandler ?: return null
         val msgId = MeshCarrier.newMsgId()
+        if (!kind.isInline) {
+            attachmentStore.write(msgId, bodyBytes)
+        }
+        val meta = AttachmentMeta(
+            msgId, kind, if (kind.isInline) 0 else bodyBytes.size,
+            durationMs, filename, mimeType, latE7, lonE7, contactName, contactPhone
+        )
+        val metaPayload = encodeAttachmentMeta(meta)
+        // This device's own send is recorded the same way a receive is, so
+        // sendAttachment's own caller (the UI) can read it back from
+        // attachmentsKnown/AttachmentStore exactly like anyone else's.
+        synchronized(attachmentsLock) {
+            attachmentsKnownInternal[msgId] = AttachmentState(meta, localNodeId, System.currentTimeMillis(), null, null)
+            while (attachmentsKnownInternal.size > MAX_ATTACHMENTS_RETAINED) {
+                attachmentsKnownInternal.remove(attachmentsKnownInternal.keys.first())
+            }
+        }
         handler.post {
-            writeFrame(MeshFrame.BROADCAST_ID, TYPE_VOICE_NOTE, payload)
-            Log.d("OFFTRACE", "VOICENOTE: send durationMs=$durationMs bytes=${audioBytes.size}")
+            writeFrame(MeshFrame.BROADCAST_ID, TYPE_ATTACHMENT_META, metaPayload)
+            Log.d("OFFTRACE", "ATTACH: send kind=$kind msgId=$msgId bodyBytes=${bodyBytes.size}")
             val alreadyPresent = routingTable.roster().map { it.nodeId }.toSet()
             carrier.put(
-                msgId, localNodeId, MeshFrame.BROADCAST_ID, TYPE_VOICE_NOTE, payload,
-                expiryMins = VOICE_NOTE_CARRY_EXPIRY_MINS,
+                msgId, localNodeId, MeshFrame.BROADCAST_ID, TYPE_ATTACHMENT_META, metaPayload,
+                expiryMins = ATTACHMENT_META_CARRY_EXPIRY_MINS,
                 alreadyDeliveredTo = alreadyPresent
             )
         }
+        return msgId
     }
 
-    /** [carrierInfo] non-null only for a store-and-forward delivery — same
-     *  contract as [handlePhraseFrame]'s identical parameter. */
-    private fun handleVoiceNoteFrame(header: MeshFrame.Header, payload: ByteArray, carrierInfo: Pair<Long, Int>?) {
-        val decoded = decodeVoiceNotePayload(payload) ?: run {
-            logW("MEDIA: malformed VOICE_NOTE len=${payload.size} — ignoring")
+    /** UI calls this on an explicit Download tap — never automatically.
+     *  [fromNodeId] is the original sender (AttachmentState.senderNodeId),
+     *  addressed directly; the mesh's existing relay/routing handles
+     *  getting it there whether that's a direct link or via the GO, same
+     *  as any other unicast type. No-op (logged) for an inline kind, which
+     *  never has anything to fetch. */
+    fun requestAttachment(msgId: String, fromNodeId: Long) {
+        if (!running.get() || !alive.get()) {
+            logW("MEDIA: attachment request dropped — not connected")
             return
         }
-        if (decoded.codecId != VOICE_NOTE_CODEC_AAC_MP4) {
-            logW("MEDIA: VOICE_NOTE unknown codecId=${decoded.codecId} — ignoring (future codec this build doesn't understand)")
+        val handler = chatHandler ?: return
+        handler.post {
+            writeFrame(fromNodeId, TYPE_ATTACHMENT_REQUEST, uuidToBytes(msgId))
+            Log.d("OFFTRACE", "ATTACH: request msgId=$msgId from=${MeshFrame.hex(fromNodeId)}")
+        }
+    }
+
+    /** [carrierInfo] non-null only for a carried delivery, same contract as
+     *  [handlePhraseFrame]'s identical parameter. */
+    private fun handleAttachmentMetaFrame(header: MeshFrame.Header, payload: ByteArray, carrierInfo: Pair<Long, Int>?) {
+        val meta = decodeAttachmentMeta(payload) ?: run {
+            logW("MEDIA: malformed ATTACHMENT_META len=${payload.size} — ignoring")
             return
         }
-        val durationMs = decoded.durationMs
-        val audioBytes = decoded.audioBytes
         val (carrierId, hopCount) = carrierInfo ?: (null to null)
         Log.d(
             "OFFTRACE",
-            "VOICENOTE: recv from=${MeshFrame.hex(header.srcId)} durationMs=$durationMs bytes=${audioBytes.size} " +
-                "hops=${hopCount ?: 0}"
+            "ATTACH: recv META kind=${meta.kind} msgId=${meta.msgId} from=${MeshFrame.hex(header.srcId)} " +
+                "bodySize=${meta.bodySize} hops=${hopCount ?: 0}"
         )
-        val note = VoiceNote(header.srcId, durationMs, audioBytes, System.currentTimeMillis(), carrierId, hopCount)
-        synchronized(voiceNotesLock) {
-            voiceNotesInternal.add(note)
-            while (voiceNotesInternal.size > MAX_VOICE_NOTES_RETAINED) voiceNotesInternal.removeAt(0)
+        val state = AttachmentState(meta, header.srcId, System.currentTimeMillis(), carrierId, hopCount)
+        synchronized(attachmentsLock) {
+            attachmentsKnownInternal[meta.msgId] = state
+            while (attachmentsKnownInternal.size > MAX_ATTACHMENTS_RETAINED) {
+                attachmentsKnownInternal.remove(attachmentsKnownInternal.keys.first())
+            }
         }
-        mainHandler.post { onVoiceNoteReceived?.invoke(note) }
+        mainHandler.post { onAttachmentMetaReceived?.invoke(state) }
+    }
+
+    /** Only the original sender can answer this (the body was written to
+     *  disk by [sendAttachment], never by a receiver) — an unknown/expired
+     *  msgId (store evicted it, or this device was never the sender) is
+     *  silently ignored, not an error: the requester simply never gets a
+     *  TYPE_ATTACHMENT_DATA back and its UI stays in the Download state. */
+    private fun handleAttachmentRequestFrame(header: MeshFrame.Header, payload: ByteArray) {
+        if (payload.size < 16) {
+            logW("MEDIA: malformed ATTACHMENT_REQUEST len=${payload.size} — ignoring")
+            return
+        }
+        val msgId = bytesToUuid(payload.copyOf(16))
+        val body = attachmentStore.read(msgId) ?: run {
+            Log.d("OFFTRACE", "ATTACH: request for unknown/unavailable msgId=$msgId from=${MeshFrame.hex(header.srcId)} — ignoring")
+            return
+        }
+        val dataPayload = ByteBuffer.allocate(16 + body.size).apply {
+            put(uuidToBytes(msgId))
+            put(body)
+        }.array()
+        writeFrame(header.srcId, TYPE_ATTACHMENT_DATA, dataPayload)
+        Log.d("OFFTRACE", "ATTACH: answered request msgId=$msgId to=${MeshFrame.hex(header.srcId)} bytes=${body.size}")
+    }
+
+    /** Always a direct, unicast answer to THIS device's own earlier
+     *  [requestAttachment] — never carried, never broadcast (see
+     *  TYPE_ATTACHMENT_META's class doc for why pushing a full body to
+     *  everyone defeats the point of gating it in the first place). */
+    private fun handleAttachmentDataFrame(header: MeshFrame.Header, payload: ByteArray) {
+        if (payload.size < 16) {
+            logW("MEDIA: malformed ATTACHMENT_DATA len=${payload.size} — ignoring")
+            return
+        }
+        val msgId = bytesToUuid(payload.copyOf(16))
+        val body = payload.copyOfRange(16, payload.size)
+        attachmentStore.write(msgId, body)
+        Log.d("OFFTRACE", "ATTACH: recv DATA msgId=$msgId from=${MeshFrame.hex(header.srcId)} bytes=${body.size}")
+        mainHandler.post { onAttachmentDataReceived?.invoke(msgId, body) }
     }
 
     /** PHASE 3: initiator API — places a 1:1 call to a specific roster member (found
@@ -5184,7 +5409,14 @@ class OfflineMediaTransport(
             }
             TYPE_CHAT -> handleChatFrame(header, payload)
             TYPE_PHRASE -> handlePhraseFrame(header, payload, carrierInfo)
-            TYPE_VOICE_NOTE -> handleVoiceNoteFrame(header, payload, carrierInfo)
+            // TYPE_VOICE_NOTE(36) retired — see its own doc. Step 3:
+            // TYPE_ATTACHMENT_REQUEST/DATA are always unicast (never
+            // broadcast), so this dispatch only ever runs for the actual
+            // addressee — same as every other unicast type here, no special
+            // handling needed beyond the dispatch entry itself.
+            TYPE_ATTACHMENT_META -> handleAttachmentMetaFrame(header, payload, carrierInfo)
+            TYPE_ATTACHMENT_REQUEST -> handleAttachmentRequestFrame(header, payload)
+            TYPE_ATTACHMENT_DATA -> handleAttachmentDataFrame(header, payload)
             TYPE_MODE -> handleModeFrame(header, payload)
             TYPE_AUDIO_CODEC -> {
                 val gc = groupCall
@@ -5512,9 +5744,18 @@ class OfflineMediaTransport(
     private fun maxPayloadFor(type: Byte): Int {
         val base = when (type) {
             TYPE_CHAT -> MAX_CHAT_PAYLOAD_BYTES
-            // fix: was missing entirely (fell to the else branch, 1024B) —
-            // see MAX_VOICE_NOTE_PAYLOAD_BYTES's own doc for the derivation.
-            TYPE_VOICE_NOTE -> MAX_VOICE_NOTE_PAYLOAD_BYTES
+            // TYPE_VOICE_NOTE(36) deliberately absent — retired (Step 3),
+            // falls to the else branch below; nothing sends it anymore, and
+            // a stray/legacy frame of that type should be bounded
+            // conservatively like any other unrecognized type, not
+            // privileged with a large cap it no longer needs.
+            // Step 3: explicit entries for all three, even though
+            // TYPE_ATTACHMENT_REQUEST's real size (16B) would fit the else
+            // branch's default anyway — Step 1's bug was exactly a type
+            // silently relying on that fallback; never repeating that here.
+            TYPE_ATTACHMENT_META -> MAX_ATTACHMENT_META_PAYLOAD_BYTES
+            TYPE_ATTACHMENT_REQUEST -> MAX_CONTROL_PAYLOAD_BYTES
+            TYPE_ATTACHMENT_DATA -> MAX_ATTACHMENT_DATA_PAYLOAD_BYTES
             TYPE_FRAME -> MAX_VIDEO_PAYLOAD_BYTES
             TYPE_AUDIO -> MAX_AUDIO_PAYLOAD_BYTES
             // OCP PHASE 3.1: same cap as their legacy counterpart, +8 for the

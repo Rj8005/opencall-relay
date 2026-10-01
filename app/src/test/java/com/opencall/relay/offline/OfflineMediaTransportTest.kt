@@ -631,58 +631,117 @@ class OfflineMediaTransportTest {
         assertEquals("unknown", OfflineMediaTransport.thermalStatusString(-1))
     }
 
-    // ── B5: TYPE_VOICE_NOTE payload encode/decode ───────────────────────────
+    // ── Step 3: TYPE_ATTACHMENT_META encode/decode ──────────────────────────
 
     @Test
-    fun `voice note payload round-trips codec, duration, and audio bytes exactly`() {
-        val audio = byteArrayOf(1, 2, 3, 4, 5, -1, -128, 127)
-        val payload = OfflineMediaTransport.encodeVoiceNotePayload(OfflineMediaTransport.VOICE_NOTE_CODEC_AAC_MP4, 4200, audio)
-        val decoded = OfflineMediaTransport.decodeVoiceNotePayload(payload)
-        assertNotNull(decoded)
-        assertEquals(OfflineMediaTransport.VOICE_NOTE_CODEC_AAC_MP4, decoded!!.codecId)
-        assertEquals(4200, decoded.durationMs)
-        assertArrayEquals(audio, decoded.audioBytes)
+    fun `attachment meta round-trips a VOICE entry exactly`() {
+        val meta = OfflineMediaTransport.AttachmentMeta(
+            msgId = java.util.UUID.randomUUID().toString(),
+            kind = OfflineMediaTransport.AttachmentKind.VOICE,
+            bodySize = 123456,
+            durationMs = 4200
+        )
+        val decoded = OfflineMediaTransport.decodeAttachmentMeta(OfflineMediaTransport.encodeAttachmentMeta(meta))
+        assertEquals(meta, decoded)
     }
 
     @Test
-    fun `voice note payload round-trips an empty audio recording`() {
-        val payload = OfflineMediaTransport.encodeVoiceNotePayload(OfflineMediaTransport.VOICE_NOTE_CODEC_AAC_MP4, 0, ByteArray(0))
-        val decoded = OfflineMediaTransport.decodeVoiceNotePayload(payload)
-        assertNotNull(decoded)
-        assertEquals(0, decoded!!.audioBytes.size)
+    fun `attachment meta round-trips an IMAGE entry's filename and mimeType exactly`() {
+        val meta = OfflineMediaTransport.AttachmentMeta(
+            msgId = java.util.UUID.randomUUID().toString(),
+            kind = OfflineMediaTransport.AttachmentKind.IMAGE,
+            bodySize = 200_000,
+            filename = "summit-view.jpg",
+            mimeType = "image/jpeg"
+        )
+        val decoded = OfflineMediaTransport.decodeAttachmentMeta(OfflineMediaTransport.encodeAttachmentMeta(meta))
+        assertEquals(meta, decoded)
     }
 
     @Test
-    fun `voice note payload decode returns null for anything shorter than the fixed header`() {
-        assertNull(OfflineMediaTransport.decodeVoiceNotePayload(ByteArray(4)))
-        assertNull(OfflineMediaTransport.decodeVoiceNotePayload(ByteArray(0)))
+    fun `attachment meta round-trips a DOCUMENT entry exactly`() {
+        val meta = OfflineMediaTransport.AttachmentMeta(
+            msgId = java.util.UUID.randomUUID().toString(),
+            kind = OfflineMediaTransport.AttachmentKind.DOCUMENT,
+            bodySize = 50_000,
+            filename = "route-plan.pdf",
+            mimeType = "application/pdf"
+        )
+        val decoded = OfflineMediaTransport.decodeAttachmentMeta(OfflineMediaTransport.encodeAttachmentMeta(meta))
+        assertEquals(meta, decoded)
     }
 
     @Test
-    fun `voice note payload decode succeeds even for an unrecognized codecId — dispatch decides, not decode`() {
-        // Mirrors MeshLocation.decode's split: decode is purely structural,
-        // rejecting an unknown codec is handleVoiceNoteFrame's call.
-        val payload = OfflineMediaTransport.encodeVoiceNotePayload(99, 1000, byteArrayOf(9))
-        val decoded = OfflineMediaTransport.decodeVoiceNotePayload(payload)
-        assertNotNull(decoded)
-        assertEquals(99.toByte(), decoded!!.codecId)
+    fun `attachment meta round-trips a LOCATION entry with bodySize 0 — inline, no fetch`() {
+        val meta = OfflineMediaTransport.AttachmentMeta(
+            msgId = java.util.UUID.randomUUID().toString(),
+            kind = OfflineMediaTransport.AttachmentKind.LOCATION,
+            bodySize = 0,
+            latE7 = 457_000_000,
+            lonE7 = -1_220_000_000
+        )
+        val decoded = OfflineMediaTransport.decodeAttachmentMeta(OfflineMediaTransport.encodeAttachmentMeta(meta))
+        assertEquals(meta, decoded)
+        assertTrue(OfflineMediaTransport.AttachmentKind.LOCATION.isInline)
     }
 
     @Test
-    fun `MAX_VOICE_NOTE_PAYLOAD_BYTES actually covers a worst-case recording at the recorder's real bitrate`() {
-        // fix (real bug): the cap this guards against regressing — every
-        // voice note sent so far was silently dropped on receive because
-        // this never existed (fell to the 1024B else branch in
-        // maxPayloadFor). Worst case: VoiceNoteRecorder's 32000bps AAC for
-        // the full VOICE_NOTE_MAX_DURATION_MS, plus the 5-byte
-        // [codecId][durationMs] envelope header — comfortably under the cap,
-        // with real margin for container overhead.
+    fun `attachment meta round-trips a CONTACT entry with bodySize 0 — inline, no fetch`() {
+        val meta = OfflineMediaTransport.AttachmentMeta(
+            msgId = java.util.UUID.randomUUID().toString(),
+            kind = OfflineMediaTransport.AttachmentKind.CONTACT,
+            bodySize = 0,
+            contactName = "Alice Smith",
+            contactPhone = "+15551234567"
+        )
+        val decoded = OfflineMediaTransport.decodeAttachmentMeta(OfflineMediaTransport.encodeAttachmentMeta(meta))
+        assertEquals(meta, decoded)
+        assertTrue(OfflineMediaTransport.AttachmentKind.CONTACT.isInline)
+    }
+
+    @Test
+    fun `VOICE and IMAGE and DOCUMENT are fetch-gated, not inline`() {
+        assertFalse(OfflineMediaTransport.AttachmentKind.VOICE.isInline)
+        assertFalse(OfflineMediaTransport.AttachmentKind.IMAGE.isInline)
+        assertFalse(OfflineMediaTransport.AttachmentKind.DOCUMENT.isInline)
+    }
+
+    @Test
+    fun `attachment meta decode returns null for anything shorter than the fixed header`() {
+        assertNull(OfflineMediaTransport.decodeAttachmentMeta(ByteArray(10)))
+        assertNull(OfflineMediaTransport.decodeAttachmentMeta(ByteArray(0)))
+    }
+
+    @Test
+    fun `attachment meta decode returns null for an unrecognized kind`() {
+        // Unlike the old voice-note decode (which deferred codec rejection
+        // to the caller), an unknown AttachmentKind IS a decode failure here
+        // — every other field's shape depends on knowing which kind it is,
+        // so there's no safe partial decode to hand back.
+        val msgId = java.util.UUID.randomUUID()
+        val buf = java.nio.ByteBuffer.allocate(16 + 1 + 4 + 2)
+        buf.putLong(msgId.mostSignificantBits)
+        buf.putLong(msgId.leastSignificantBits)
+        buf.put(99.toByte()) // not a real AttachmentKind wireId
+        buf.putInt(0)
+        buf.putShort(0)
+        assertNull(OfflineMediaTransport.decodeAttachmentMeta(buf.array()))
+    }
+
+    @Test
+    fun `MAX_ATTACHMENT_BODY_BYTES actually covers a worst-case voice recording at the recorder's real bitrate`() {
+        // fix (real bug, Step 1): the cap this guards against regressing —
+        // every voice note sent before Step 1 was silently dropped on
+        // receive because no cap existed for it at all (fell to the 1024B
+        // else branch in maxPayloadFor). Worst case: VoiceNoteRecorder's
+        // 32000bps AAC for the full VOICE_NOTE_MAX_DURATION_MS — comfortably
+        // under the shared attachment body cap, with real margin for
+        // container overhead.
         val bitrateBytesPerSec = 32000 / 8
         val worstCaseAudioBytes = bitrateBytesPerSec * (OfflineMediaTransport.VOICE_NOTE_MAX_DURATION_MS / 1000)
-        val worstCasePayloadBytes = 5 + worstCaseAudioBytes
         assertTrue(
-            "worst-case voice note payload ($worstCasePayloadBytes bytes) must fit under the cap",
-            worstCasePayloadBytes < OfflineMediaTransport.MAX_VOICE_NOTE_PAYLOAD_BYTES
+            "worst-case voice note body ($worstCaseAudioBytes bytes) must fit under the shared attachment cap",
+            worstCaseAudioBytes < OfflineMediaTransport.MAX_ATTACHMENT_BODY_BYTES
         )
     }
 

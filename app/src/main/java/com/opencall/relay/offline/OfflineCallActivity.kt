@@ -959,21 +959,19 @@ class OfflineCallActivity : AppCompatActivity() {
     // the honest answer, not a placeholder — a UI label that changed
     // per-message would be fabricating a distinction this app's transport
     // layer doesn't have.
-    /** Step 2 (diagnostic follow-up): voiceNoteAudio/voiceNoteDurationMs/
-     *  voiceNoteSenderLabel are null for an ordinary text entry — when set,
-     *  ChatAdapter.getView renders a Play/Stop + duration row instead of
-     *  entry.text (text still carries a sensible fallback label). [id] is
-     *  a local-only identity for tracking which entry is currently playing
-     *  — ListView recycles row Views on notifyDataSetChanged, so a View
-     *  reference can't survive as playback state; see
-     *  toggleVoiceNoteEntryPlayback's doc. Never sent over the wire. */
+    /** Step 3 (diagnostic follow-up): [attachment] is null for an ordinary
+     *  text entry — when set, ChatAdapter.getView renders a kind-specific
+     *  row (Play/Download/etc., via AttachmentRef's own fetch state)
+     *  instead of entry.text (text still carries a sensible fallback
+     *  label). [id] is a local-only identity for tracking which entry is
+     *  currently playing — ListView recycles row Views on
+     *  notifyDataSetChanged, so a View reference can't survive as playback
+     *  state; see toggleAttachmentPlayback's doc. Never sent over the wire. */
     private data class ChatEntry(
         val text: String,
         val fromMe: Boolean,
         val transport: String = TRANSPORT_WIFI_DIRECT,
-        val voiceNoteAudio: ByteArray? = null,
-        val voiceNoteDurationMs: Int? = null,
-        val voiceNoteSenderLabel: String? = null,
+        val attachment: AttachmentRef? = null,
         val id: Long = System.nanoTime()
     )
     private val chatMessages = mutableListOf<ChatEntry>()
@@ -3372,27 +3370,94 @@ class OfflineCallActivity : AppCompatActivity() {
         }
     }
 
-    /** Step 2 (diagnostic follow-up): wired to
-     *  OfflineMediaTransport.onVoiceNoteReceived — appends into chatMessages,
-     *  the SAME list/render path text messages use (ChatAdapter.getView's
-     *  voiceNoteAudio branch), not a separate list. Mirrors
-     *  onTransportChatMessage's existing pattern exactly: appended
-     *  unconditionally (chatMessages already has no per-thread filtering —
-     *  see that function's own doc) plus a thread-preview update. Voice
-     *  notes are broadcast-only (see sendVoiceNote's doc), so this is
-     *  always the Group thread's preview. */
-    private fun onVoiceNoteReceived(note: OfflineMediaTransport.VoiceNote) {
-        val who = nameForGroupParticipant(note.srcId)
-        val durationLabel = formatVoiceNoteDuration(note.durationMs)
-        val carried = if (note.carrierId != null) " (carried, ${note.hopCount ?: 0}h)" else ""
-        appendChatMessage(
-            text = "[Group] $who sent a voice note",
-            fromMe = false,
-            voiceNoteAudio = note.audioBytes,
-            voiceNoteDurationMs = note.durationMs,
-            voiceNoteSenderLabel = "[Group] $who$carried"
-        )
-        recordThreadPreview(MeshFrame.BROADCAST_ID, "🎤 Voice note ($durationLabel)", fromMe = false)
+    /** Step 3 (diagnostic follow-up): UI-side mutable view of one
+     *  attachment. [msgId] identifies it on the wire/disk; a plain class
+     *  (not data class) deliberately — [fetchedBytes]/[requesting] mutate
+     *  IN PLACE on the SAME instance (shared between [attachmentRefsByMsgId]
+     *  and whichever ChatEntry holds it), so the SAME chat bubble
+     *  transitions from placeholder to available without ever needing to
+     *  find-and-replace the ChatEntry itself. [isAvailable]: an inline kind
+     *  (LOCATION/CONTACT) has nothing to fetch — it arrived complete in meta. */
+    private class AttachmentRef(
+        val msgId: String,
+        val kind: OfflineMediaTransport.AttachmentKind,
+        val senderNodeId: Long,
+        val meta: OfflineMediaTransport.AttachmentMeta,
+        var fetchedBytes: ByteArray? = null,
+        var requesting: Boolean = false
+    ) {
+        val isAvailable: Boolean get() = kind.isInline || fetchedBytes != null
+    }
+
+    // Step 3: msgId -> the live AttachmentRef instance, so a later
+    // onAttachmentDataReceived(msgId, bytes) can find and mutate the exact
+    // object already referenced by an existing ChatEntry/bubble.
+    private val attachmentRefsByMsgId = mutableMapOf<String, AttachmentRef>()
+
+    /** Step 3 (diagnostic follow-up): wired to
+     *  OfflineMediaTransport.onAttachmentMetaReceived — appends a
+     *  placeholder (or, for an inline kind, the complete message) into
+     *  chatMessages, same list/render path text messages use. Mirrors
+     *  onTransportChatMessage's existing pattern: appended unconditionally
+     *  (chatMessages has no per-thread filtering — see that function's own
+     *  doc) plus a thread-preview update. Every kind sendAttachment
+     *  supports today is broadcast-only, so this is always the Group
+     *  thread's preview. */
+    private fun onAttachmentMetaReceived(state: OfflineMediaTransport.AttachmentState) {
+        val meta = state.meta
+        val ref = AttachmentRef(meta.msgId, meta.kind, state.senderNodeId, meta)
+        attachmentRefsByMsgId[meta.msgId] = ref
+        val who = nameForGroupParticipant(state.senderNodeId)
+        val (bodyText, previewText) = when (meta.kind) {
+            OfflineMediaTransport.AttachmentKind.VOICE ->
+                "sent a voice note" to "🎤 Voice note (${formatVoiceNoteDuration(meta.durationMs ?: 0)})"
+            OfflineMediaTransport.AttachmentKind.IMAGE ->
+                "sent a photo" to "📷 Photo"
+            OfflineMediaTransport.AttachmentKind.DOCUMENT ->
+                "sent a document" to "📄 ${meta.filename ?: "Document"}"
+            OfflineMediaTransport.AttachmentKind.LOCATION ->
+                "shared a location" to "📍 Location"
+            OfflineMediaTransport.AttachmentKind.CONTACT ->
+                "shared a contact" to "👤 ${meta.contactName ?: "Contact"}"
+        }
+        appendChatMessage(text = "[Group] $who $bodyText", fromMe = false, attachment = ref)
+        recordThreadPreview(MeshFrame.BROADCAST_ID, previewText, fromMe = false)
+    }
+
+    /** Step 3: wired to OfflineMediaTransport.onAttachmentDataReceived —
+     *  mutates the EXISTING AttachmentRef in place (see that class's own
+     *  doc) rather than appending a new entry; a no-op if nothing is
+     *  tracking this msgId (e.g. a stray/duplicate DATA frame). */
+    private fun onAttachmentDataReceived(msgId: String, bytes: ByteArray) {
+        val ref = attachmentRefsByMsgId[msgId] ?: return
+        ref.fetchedBytes = bytes
+        ref.requesting = false
+        refreshChatAdapters()
+    }
+
+    /** Step 3: sends a just-recorded voice note via the generic attachment
+     *  protocol and appends it to this device's own scrollback immediately
+     *  — unlike a received attachment, the sender already HAS the body
+     *  (sendAttachment wrote it to disk before this call even returns), so
+     *  there's no Download gate for your own sent message, same as how a
+     *  sent text message appears immediately via appendChatMessage(fromMe=true). */
+    private fun sendVoiceNoteAttachment(audioBytes: ByteArray, durationMs: Int) {
+        val transport = mediaTransport ?: return
+        val msgId = transport.sendAttachment(OfflineMediaTransport.AttachmentKind.VOICE, audioBytes, durationMs = durationMs) ?: return
+        val meta = OfflineMediaTransport.AttachmentMeta(msgId, OfflineMediaTransport.AttachmentKind.VOICE, audioBytes.size, durationMs = durationMs)
+        val ref = AttachmentRef(msgId, OfflineMediaTransport.AttachmentKind.VOICE, transport.localNodeId, meta, fetchedBytes = audioBytes)
+        attachmentRefsByMsgId[msgId] = ref
+        appendChatMessage(text = "Voice note", fromMe = true, attachment = ref)
+    }
+
+    /** User tapped Download on a fetch-gated attachment's placeholder row —
+     *  no-op if already fetched or already in flight (button is disabled
+     *  for both, this is belt-and-suspenders against a stray double-tap). */
+    private fun requestAttachmentDownload(ref: AttachmentRef) {
+        if (ref.fetchedBytes != null || ref.requesting) return
+        ref.requesting = true
+        refreshChatAdapters()
+        mediaTransport?.requestAttachment(ref.msgId, ref.senderNodeId)
     }
 
     private fun formatVoiceNoteDuration(durationMs: Int): String {
@@ -3400,16 +3465,84 @@ class OfflineCallActivity : AppCompatActivity() {
         return "0:%02d".format(totalSec)
     }
 
-    /** Only one voice note plays at a time, identified by ChatEntry.id (not
+    private fun formatAttachmentBytes(bytes: Int): String =
+        if (bytes >= 1024) "%.0fKB".format(bytes / 1024.0) else "${bytes}B"
+
+    /** Step 3 (diagnostic follow-up): per-kind content row inside an
+     *  attachment chat bubble. VOICE is fully built out here (Play/Stop
+     *  once fetched); IMAGE/DOCUMENT get a generic Download-gated row for
+     *  now — Steps 4/5's own job is a richer preview (a thumbnail, a
+     *  proper filename+size row), hung off this SAME dispatch rather than
+     *  a parallel one. LOCATION/CONTACT render their complete (inline,
+     *  no-fetch) content directly — nothing THIS step ever sends either
+     *  kind yet (that's Steps 6/7), but the generic plumbing already
+     *  supports displaying one correctly the moment something does. */
+    private fun buildAttachmentRow(ref: AttachmentRef, entry: ChatEntry, fg: Int): View {
+        val density = resources.displayMetrics.density
+        return when (ref.kind) {
+            OfflineMediaTransport.AttachmentKind.VOICE -> LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                if (ref.fetchedBytes != null) {
+                    addView(Button(this@OfflineCallActivity).apply {
+                        text = if (playingChatEntryId == entry.id) "Stop" else "Play"
+                        setOnClickListener { toggleAttachmentPlayback(ref, entry) }
+                    })
+                } else {
+                    addView(Button(this@OfflineCallActivity).apply {
+                        text = if (ref.requesting) "Requesting…" else "Download"
+                        isEnabled = !ref.requesting
+                        setOnClickListener { requestAttachmentDownload(ref) }
+                    })
+                }
+                addView(TextView(this@OfflineCallActivity).apply {
+                    text = "🎤 ${formatVoiceNoteDuration(ref.meta.durationMs ?: 0)}"
+                    setTextColor(fg)
+                    setPadding((8 * density).toInt(), 0, 0, 0)
+                })
+            }
+            OfflineMediaTransport.AttachmentKind.IMAGE, OfflineMediaTransport.AttachmentKind.DOCUMENT -> LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                val icon = if (ref.kind == OfflineMediaTransport.AttachmentKind.IMAGE) "📷" else "📄"
+                val label = "${ref.meta.filename ?: if (ref.kind == OfflineMediaTransport.AttachmentKind.IMAGE) "Photo" else "Document"} (${formatAttachmentBytes(ref.meta.bodySize)})"
+                addView(TextView(this@OfflineCallActivity).apply {
+                    text = "$icon $label"
+                    setTextColor(fg)
+                })
+                if (ref.fetchedBytes == null) {
+                    addView(Button(this@OfflineCallActivity).apply {
+                        text = if (ref.requesting) "Requesting…" else "Download"
+                        isEnabled = !ref.requesting
+                        setPadding((8 * density).toInt(), 0, 0, 0)
+                        setOnClickListener { requestAttachmentDownload(ref) }
+                    })
+                }
+            }
+            OfflineMediaTransport.AttachmentKind.LOCATION -> TextView(this).apply {
+                val lat = (ref.meta.latE7 ?: 0) / 1e7
+                val lon = (ref.meta.lonE7 ?: 0) / 1e7
+                text = "📍 %.5f, %.5f".format(lat, lon)
+                setTextColor(fg)
+            }
+            OfflineMediaTransport.AttachmentKind.CONTACT -> TextView(this).apply {
+                text = "👤 ${ref.meta.contactName ?: "Contact"}${ref.meta.contactPhone?.let { " · $it" } ?: ""}"
+                setTextColor(fg)
+            }
+        }
+    }
+
+    /** Only one attachment plays at a time, identified by ChatEntry.id (not
      *  a View reference — ListView recycles/rebuilds row Views on every
      *  notifyDataSetChanged, so a row-based reference from the old
      *  SOS-overlay list design doesn't survive here). Tapping the
-     *  currently-playing entry's button again stops it. */
-    private fun toggleVoiceNoteEntryPlayback(entry: ChatEntry) {
+     *  currently-playing entry's button again stops it. VOICE only today —
+     *  nothing else this app sends is audio. */
+    private fun toggleAttachmentPlayback(ref: AttachmentRef, entry: ChatEntry) {
         val wasThisEntry = playingChatEntryId == entry.id
         stopVoiceNotePlayback()
         if (wasThisEntry) return
-        val audio = entry.voiceNoteAudio ?: return
+        val audio = ref.fetchedBytes ?: return
         val player = android.media.MediaPlayer()
         try {
             player.setDataSource(VoiceNoteDataSource(audio))
@@ -3421,7 +3554,7 @@ class OfflineCallActivity : AppCompatActivity() {
             playingChatEntryId = entry.id
             refreshChatAdapters()
         } catch (e: Exception) {
-            Log.w("OFFTRACE", "VOICENOTE: playback failed: ${e.javaClass.simpleName}:${e.message}")
+            Log.w("OFFTRACE", "ATTACH: playback failed: ${e.javaClass.simpleName}:${e.message}")
             try { player.release() } catch (_: Exception) {}
             Toast.makeText(this, "Couldn't play voice note", Toast.LENGTH_SHORT).show()
         }
@@ -3448,10 +3581,11 @@ class OfflineCallActivity : AppCompatActivity() {
         if (::messagesChatAdapter.isInitialized) messagesChatAdapter.notifyDataSetChanged()
     }
 
-    /** Plays straight from the in-memory recording — no temp file, no
-     *  cleanup-on-disk to forget. [close] is a no-op: the backing
-     *  ByteArray is owned by the OfflineMediaTransport.VoiceNote this
-     *  came from, not this class. */
+    /** Plays straight from an in-memory attachment body — no temp file, no
+     *  cleanup-on-disk to forget (the body is ALSO on disk via
+     *  AttachmentStore, independently — this just avoids a redundant read
+     *  for playback). [close] is a no-op: the backing ByteArray is owned by
+     *  the AttachmentRef this came from, not this class. */
     private class VoiceNoteDataSource(private val data: ByteArray) : android.media.MediaDataSource() {
         override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
             if (position >= data.size) return -1
@@ -3839,12 +3973,12 @@ class OfflineCallActivity : AppCompatActivity() {
                 if (sendChatText(messagesComposerInput.text?.toString()?.trim().orEmpty())) messagesComposerInput.setText("")
             }
         }
-        // Step 2 (diagnostic follow-up): hold-to-talk, next to Send — see
-        // this function's own doc for why it lives here now, not a separate
+        // Step 3 (diagnostic follow-up): hold-to-talk, next to Send — see
+        // this function's own doc for why it lives here, not a separate
         // section. Visibility toggled by openMessageThread (GONE by default
-        // here, before any thread is open): sendVoiceNote is broadcast-only
-        // (see its own doc — no 1:1 targeting), so this only makes sense on
-        // the Group thread, not a 1:1 one.
+        // here, before any thread is open): sendAttachment is broadcast-only
+        // for every kind today (no 1:1 targeting), so this only makes sense
+        // on the Group thread, not a 1:1 one.
         voiceNoteHoldButton = Button(this).apply {
             text = "🎤"
             visibility = View.GONE
@@ -3854,13 +3988,7 @@ class OfflineCallActivity : AppCompatActivity() {
                         val started = voiceNoteRecorder.start { result ->
                             runOnUiThread {
                                 voiceNoteHoldButton.text = "🎤"
-                                mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
-                                appendChatMessage(
-                                    text = "Voice note",
-                                    fromMe = true,
-                                    voiceNoteAudio = result.audioBytes,
-                                    voiceNoteDurationMs = result.durationMs
-                                )
+                                sendVoiceNoteAttachment(result.audioBytes, result.durationMs)
                             }
                         }
                         voiceNoteHoldButton.text = if (started) "●" else "🎤"
@@ -3871,15 +3999,7 @@ class OfflineCallActivity : AppCompatActivity() {
                     }
                     android.view.MotionEvent.ACTION_UP -> {
                         voiceNoteHoldButton.text = "🎤"
-                        voiceNoteRecorder.stop()?.let { result ->
-                            mediaTransport?.sendVoiceNote(result.audioBytes, result.durationMs)
-                            appendChatMessage(
-                                text = "Voice note",
-                                fromMe = true,
-                                voiceNoteAudio = result.audioBytes,
-                                voiceNoteDurationMs = result.durationMs
-                            )
-                        }
+                        voiceNoteRecorder.stop()?.let { result -> sendVoiceNoteAttachment(result.audioBytes, result.durationMs) }
                         true
                     }
                     android.view.MotionEvent.ACTION_CANCEL -> {
@@ -5547,33 +5667,22 @@ class OfflineCallActivity : AppCompatActivity() {
                 // respectively so contrast holds in every mode.
                 setPadding((10 * density).toInt(), (6 * density).toInt(), (10 * density).toInt(), (6 * density).toInt())
                 setBackgroundColor(if (entry.fromMe) TopoPalette.accent(mode) else TopoPalette.bgRaised(mode))
-                // Step 2 (diagnostic follow-up): a voice-note entry renders
-                // Play/Stop + duration (+ sender label if received) instead
-                // of entry.text — same bubble, same ListView/adapter, just a
-                // different content row. entry.text still carries a sensible
-                // fallback label (unused by this branch, but kept for any
-                // other reader of chatMessages, e.g. a future export).
-                if (entry.voiceNoteAudio != null) {
-                    if (entry.voiceNoteSenderLabel != null) {
+                // Step 3 (diagnostic follow-up): an attachment entry renders
+                // a kind-specific row instead of entry.text — same bubble,
+                // same ListView/adapter, just different content. entry.text
+                // still carries a sensible fallback label (unused by this
+                // branch, but kept for any other reader of chatMessages,
+                // e.g. a future export).
+                val ref = entry.attachment
+                if (ref != null) {
+                    if (!entry.fromMe) {
                         addView(TextView(this@OfflineCallActivity).apply {
-                            text = entry.voiceNoteSenderLabel
+                            text = "[Group] ${nameForGroupParticipant(ref.senderNodeId)}"
                             textSize = 12f
                             setTextColor(bubbleFg)
                         })
                     }
-                    addView(LinearLayout(this@OfflineCallActivity).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                        addView(Button(this@OfflineCallActivity).apply {
-                            text = if (playingChatEntryId == entry.id) "Stop" else "Play"
-                            setOnClickListener { toggleVoiceNoteEntryPlayback(entry) }
-                        })
-                        addView(TextView(this@OfflineCallActivity).apply {
-                            text = "🎤 ${formatVoiceNoteDuration(entry.voiceNoteDurationMs ?: 0)}"
-                            setTextColor(bubbleFg)
-                            setPadding((8 * density).toInt(), 0, 0, 0)
-                        })
-                    })
+                    addView(buildAttachmentRow(ref, entry, bubbleFg))
                 } else {
                     addView(TextView(this@OfflineCallActivity).apply { text = entry.text; setTextColor(bubbleFg) })
                 }
@@ -5603,11 +5712,9 @@ class OfflineCallActivity : AppCompatActivity() {
     private fun appendChatMessage(
         text: String,
         fromMe: Boolean,
-        voiceNoteAudio: ByteArray? = null,
-        voiceNoteDurationMs: Int? = null,
-        voiceNoteSenderLabel: String? = null
+        attachment: AttachmentRef? = null
     ) {
-        chatMessages.add(ChatEntry(text, fromMe, voiceNoteAudio = voiceNoteAudio, voiceNoteDurationMs = voiceNoteDurationMs, voiceNoteSenderLabel = voiceNoteSenderLabel))
+        chatMessages.add(ChatEntry(text, fromMe, attachment = attachment))
         chatAdapter.notifyDataSetChanged()
         chatListView.post { if (chatAdapter.count > 0) chatListView.setSelection(chatAdapter.count - 1) }
         // TOPO PART B1: Messages tab's OWN ListView/adapter instance (never
@@ -6333,7 +6440,8 @@ class OfflineCallActivity : AppCompatActivity() {
         transport.onPhraseReceived = { fromNodeId, code, seq, carrierId, hopCount ->
             runOnUiThread { onPhraseReceived(fromNodeId, code, seq, carrierId, hopCount) }
         }
-        transport.onVoiceNoteReceived = { note -> runOnUiThread { onVoiceNoteReceived(note) } }
+        transport.onAttachmentMetaReceived = { state -> runOnUiThread { onAttachmentMetaReceived(state) } }
+        transport.onAttachmentDataReceived = { msgId, bytes -> runOnUiThread { onAttachmentDataReceived(msgId, bytes) } }
         // PHASE 3: fires for BOTH the initiator (right after placeCall) and the callee
         // (auto-answered) — see onCallStarted for how each is handled.
         transport.onModeResolved = { peerId, peerName, mode -> runOnUiThread { onCallStarted(peerId, peerName, mode) } }
