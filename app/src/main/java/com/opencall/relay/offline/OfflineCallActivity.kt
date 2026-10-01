@@ -6545,7 +6545,12 @@ class OfflineCallActivity : AppCompatActivity() {
      *  tail into its own inviteListView, whose rows own their own taps). */
     private fun onRosterItemClicked(position: Int) {
         when (position) {
-            0 -> { openGroupChat(); return }
+            // fix: voice notes reachable from a real nav path — routes to
+            // the real Messages thread view (same underlying chatMessages
+            // data, same sendGroupChat path — see sendChatText/
+            // appendChatMessage's own docs) instead of the old openGroupChat()
+            // overlay, which had no voice-note affordance and no path to it.
+            0 -> { openMessageThread(MeshFrame.BROADCAST_ID, "Group chat", member = null); return }
             1 -> { showStartGroupCallDialog(); return }
         }
         val idx = position - 2
@@ -7818,19 +7823,13 @@ class OfflineCallActivity : AppCompatActivity() {
         mediaTransport?.placeCall(member.nodeId, member.name, mode)
     }
 
-    /** "Group chat" row — not a media call (no placeCall), just switches to the same
-     *  chat overlay used by a 1:1 CHAT-mode call, in broadcast send mode. */
-    private fun openGroupChat() {
-        isGroupChatScreen = true
-        connectedPeerName = "Group chat"
-        connectedPeerId = MeshFrame.BROADCAST_ID
-        openThreadKey = MeshFrame.BROADCAST_ID
-        groupScreen.visibility = View.GONE
-        callScreen.visibility = View.VISIBLE
-        errorText.visibility = View.GONE
-        updateForegroundState()
-        applyUiForMode(OfflineMediaTransport.CallMode.CHAT)
-    }
+    // fix: voice notes reachable from a real nav path — openGroupChat()
+    // RETIRED (was the only caller-less function after routing the roster's
+    // "Group chat" row to openMessageThread instead). messagesThreadView
+    // already covers everything this did: same chatMessages data, same
+    // sendGroupChat path (isGroupChatScreen/connectedPeerId=BROADCAST_ID is
+    // openMessageThread's own member==null branch), plus a real nav path
+    // and voice notes neither this nor the call-screen chat overlay ever had.
 
     /** Fires for both the initiator (redundantly, right after startDirectCall already
      *  switched screens — a no-op re-apply) and the callee (the ONLY trigger that
