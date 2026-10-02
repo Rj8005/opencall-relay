@@ -875,6 +875,7 @@ class OfflineCallActivity : AppCompatActivity() {
     // other per-kind buttons Steps 5-7 add) with one consolidated "+" menu.
     private lateinit var imageAttachmentButton: Button
     private lateinit var documentAttachmentButton: Button
+    private lateinit var locationAttachmentButton: Button
 
     // PHASE 6 TRACK E: self-healing GO re-election state — see handleGoLost/
     // handleElectionResult/becomeNewGoAfterElection/waitForInviteAfterElection.
@@ -4089,12 +4090,19 @@ class OfflineCallActivity : AppCompatActivity() {
             visibility = View.GONE
             setOnClickListener { startPickDocumentAttachment() }
         }
+        // Step 6: same pattern, one-shot send (no picker — see shareCurrentLocation).
+        locationAttachmentButton = Button(this).apply {
+            text = "📍"
+            visibility = View.GONE
+            setOnClickListener { shareCurrentLocation() }
+        }
         val composerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding((8 * density).toInt(), (4 * density).toInt(), (8 * density).toInt(), (4 * density).toInt())
             addView(messagesComposerInput, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(imageAttachmentButton)
             addView(documentAttachmentButton)
+            addView(locationAttachmentButton)
             addView(voiceNoteHoldButton)
             addView(sendBtn)
         }
@@ -4823,6 +4831,28 @@ class OfflineCallActivity : AppCompatActivity() {
         attachmentRefsByMsgId[msgId] = ref
         val label = if (kind == OfflineMediaTransport.AttachmentKind.IMAGE) "Photo" else "Document"
         appendChatMessage(text = label, fromMe = true, attachment = ref)
+    }
+
+    /** Step 6: one-shot "share my current location" — LOCATION is an inline
+     *  AttachmentKind (see its own doc), so this is a single META frame,
+     *  never a fetch round trip. Reuses the mesh session's own
+     *  already-running OfflineLocationProvider via
+     *  [OfflineMediaTransport.currentLocationFix] rather than starting a
+     *  second GPS session. */
+    private fun shareCurrentLocation() {
+        val transport = mediaTransport ?: return
+        val fix = transport.currentLocationFix()
+        if (fix == null) {
+            Toast.makeText(this, "No location fix yet", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val latE7 = (fix.latitude * 1e7).toInt()
+        val lonE7 = (fix.longitude * 1e7).toInt()
+        val msgId = transport.sendAttachment(OfflineMediaTransport.AttachmentKind.LOCATION, ByteArray(0), latE7 = latE7, lonE7 = lonE7) ?: return
+        val meta = OfflineMediaTransport.AttachmentMeta(msgId, OfflineMediaTransport.AttachmentKind.LOCATION, 0, latE7 = latE7, lonE7 = lonE7)
+        val ref = AttachmentRef(msgId, OfflineMediaTransport.AttachmentKind.LOCATION, transport.localNodeId, meta)
+        attachmentRefsByMsgId[msgId] = ref
+        appendChatMessage(text = "Location", fromMe = true, attachment = ref)
     }
 
     private fun queryDisplayName(uri: android.net.Uri): String? = try {
@@ -6002,6 +6032,10 @@ class OfflineCallActivity : AppCompatActivity() {
         // Step 5: same gate.
         if (::documentAttachmentButton.isInitialized) {
             documentAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
+        }
+        // Step 6: same gate.
+        if (::locationAttachmentButton.isInitialized) {
+            locationAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
         }
         messagesListBody.visibility = View.GONE
         messagesThreadView.visibility = View.VISIBLE

@@ -2645,6 +2645,14 @@ class OfflineMediaTransport(
         return msgId
     }
 
+    /** Step 6: one-shot read of the mesh session's own warm-started
+     *  location provider (already running continuously since
+     *  [start] — see that class's own "WARM START" doc) — null exactly
+     *  when [OfflineLocationProvider.getBestFix] would be, i.e. no fix of
+     *  any tier yet. The SAME instance TYPE_POSITION frames already read
+     *  from, not a second GPS session. */
+    fun currentLocationFix(): OfflineLocationProvider.Fix? = locationProvider.getBestFix()
+
     /** Step 4: the on-disk body File for [msgId] if this device actually
      *  has it (sent-by-self, or already-downloaded) — null otherwise, so a
      *  UI tap-to-view can hand a real File to FileProvider without
