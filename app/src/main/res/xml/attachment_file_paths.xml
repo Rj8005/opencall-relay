@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Step 4: scopes the FileProvider to exactly AttachmentStore's own
+     directory (filesDir/attachments/) — nothing else in filesDir is
+     exposed outside this app. -->
+<paths>
+    <files-path name="attachments" path="attachments/" />
+</paths>

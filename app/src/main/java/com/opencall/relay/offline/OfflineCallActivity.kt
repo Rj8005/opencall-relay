@@ -871,6 +871,9 @@ class OfflineCallActivity : AppCompatActivity() {
     // ChatEntry.id, not a row View — see toggleVoiceNoteEntryPlayback's doc.
     private var playingChatEntryId: Long? = null
     private lateinit var voiceNoteHoldButton: Button
+    // Step 4: scattered-for-now entry point — Step 8 replaces this (and the
+    // other per-kind buttons Steps 5-7 add) with one consolidated "+" menu.
+    private lateinit var imageAttachmentButton: Button
 
     // PHASE 6 TRACK E: self-healing GO re-election state — see handleGoLost/
     // handleElectionResult/becomeNewGoAfterElection/waitForInviteAfterElection.
@@ -3460,6 +3463,33 @@ class OfflineCallActivity : AppCompatActivity() {
         mediaTransport?.requestAttachment(ref.msgId, ref.senderNodeId)
     }
 
+    /** Step 4: tapping an IMAGE thumbnail opens it in an external viewer —
+     *  needs a content:// Uri (FileProvider), not the raw file:// path,
+     *  since targetSdk 36 throws FileUriExposedException on the latter.
+     *  [OfflineMediaTransport.attachmentBodyFile] only returns non-null once
+     *  the body is actually on disk (sent-by-self or already-downloaded),
+     *  which the IMAGE row's own thumbnail-vs-placeholder branch already
+     *  guarantees before this is ever called. */
+    private fun viewAttachmentFile(ref: AttachmentRef) {
+        val transport = mediaTransport ?: return
+        val file = transport.attachmentBodyFile(ref.msgId) ?: return
+        val uri = try {
+            androidx.core.content.FileProvider.getUriForFile(this, "$packageName.attachments", file)
+        } catch (e: Exception) {
+            Log.w("OFFTRACE", "ATTACH: FileProvider uri failed: ${e.javaClass.simpleName}:${e.message}")
+            return
+        }
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, ref.meta.mimeType ?: "image/*")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "No app can open this file", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     private fun formatVoiceNoteDuration(durationMs: Int): String {
         val totalSec = (durationMs / 1000).coerceIn(0, 99)
         return "0:%02d".format(totalSec)
@@ -3501,13 +3531,48 @@ class OfflineCallActivity : AppCompatActivity() {
                     setPadding((8 * density).toInt(), 0, 0, 0)
                 })
             }
-            OfflineMediaTransport.AttachmentKind.IMAGE, OfflineMediaTransport.AttachmentKind.DOCUMENT -> LinearLayout(this).apply {
+            // Step 4: IMAGE gets its own branch (thumbnail once downloaded)
+            // — split out of what used to be a single IMAGE/DOCUMENT branch;
+            // DOCUMENT below is untouched, deliberately staying the generic
+            // filename+size+Download row (Step 5's own explicit scope: "no
+            // preview").
+            OfflineMediaTransport.AttachmentKind.IMAGE -> LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                val bytes = ref.fetchedBytes
+                val bitmap = bytes?.let { b -> try { android.graphics.BitmapFactory.decodeByteArray(b, 0, b.size) } catch (e: Exception) { null } }
+                if (bitmap != null) {
+                    addView(android.widget.ImageView(this@OfflineCallActivity).apply {
+                        setImageBitmap(bitmap)
+                        scaleType = android.widget.ImageView.ScaleType.CENTER_CROP
+                        layoutParams = LinearLayout.LayoutParams((160 * density).toInt(), (160 * density).toInt())
+                        setOnClickListener { viewAttachmentFile(ref) }
+                    })
+                } else {
+                    addView(LinearLayout(this@OfflineCallActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        val label = "${ref.meta.filename ?: "Photo"}" + if (bytes == null) " (${formatAttachmentBytes(ref.meta.bodySize)})" else " (couldn't preview)"
+                        addView(TextView(this@OfflineCallActivity).apply {
+                            text = "📷 $label"
+                            setTextColor(fg)
+                        })
+                        if (bytes == null) {
+                            addView(Button(this@OfflineCallActivity).apply {
+                                text = if (ref.requesting) "Requesting…" else "Download"
+                                isEnabled = !ref.requesting
+                                setPadding((8 * density).toInt(), 0, 0, 0)
+                                setOnClickListener { requestAttachmentDownload(ref) }
+                            })
+                        }
+                    })
+                }
+            }
+            OfflineMediaTransport.AttachmentKind.DOCUMENT -> LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                val icon = if (ref.kind == OfflineMediaTransport.AttachmentKind.IMAGE) "📷" else "📄"
-                val label = "${ref.meta.filename ?: if (ref.kind == OfflineMediaTransport.AttachmentKind.IMAGE) "Photo" else "Document"} (${formatAttachmentBytes(ref.meta.bodySize)})"
+                val label = "${ref.meta.filename ?: "Document"} (${formatAttachmentBytes(ref.meta.bodySize)})"
                 addView(TextView(this@OfflineCallActivity).apply {
-                    text = "$icon $label"
+                    text = "📄 $label"
                     setTextColor(fg)
                 })
                 if (ref.fetchedBytes == null) {
@@ -4011,10 +4076,17 @@ class OfflineCallActivity : AppCompatActivity() {
                 }
             }
         }
+        // Step 4: scattered-for-now — see imageAttachmentButton's own doc.
+        imageAttachmentButton = Button(this).apply {
+            text = "📷"
+            visibility = View.GONE
+            setOnClickListener { startPickImageAttachment() }
+        }
         val composerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding((8 * density).toInt(), (4 * density).toInt(), (8 * density).toInt(), (4 * density).toInt())
             addView(messagesComposerInput, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(imageAttachmentButton)
             addView(voiceNoteHoldButton)
             addView(sendBtn)
         }
@@ -4524,6 +4596,12 @@ class OfflineCallActivity : AppCompatActivity() {
             if (resultCode == RESULT_OK) data?.data?.let { handlePickedOpticalFile(it) }
             return
         }
+        // Step 4: own request code, same "checked before the legacy
+        // IntentIntegrator parse below" reasoning as REQUEST_PICK_OPTICAL_FILE.
+        if (requestCode == REQUEST_PICK_IMAGE_ATTACHMENT) {
+            if (resultCode == RESULT_OK) data?.data?.let { handlePickedImageAttachment(it) }
+            return
+        }
         // PART "WHY THE QR JOIN FAILS": PairingScanActivity's own request
         // code, checked before the legacy IntentIntegrator parse below
         // (which is expected to return null for a code it doesn't own, but
@@ -4551,6 +4629,7 @@ class OfflineCallActivity : AppCompatActivity() {
     // transfer itself, only builds the bytes.
 
     private val REQUEST_PICK_OPTICAL_FILE = 9201
+    private val REQUEST_PICK_IMAGE_ATTACHMENT = 9202
 
     private fun launchOpticalShow(container: OpticalFileContainer.PackedFile, title: String) {
         startActivity(Intent(this, OpticalShowActivity::class.java).apply {
@@ -4648,6 +4727,55 @@ class OfflineCallActivity : AppCompatActivity() {
             return
         }
         launchOpticalShow(packed, "File: $name")
+    }
+
+    /** Step 4: same ACTION_OPEN_DOCUMENT picker pattern as
+     *  [startPickOpticalFile], filtered to image mimetypes via [Intent.setType]
+     *  plus EXTRA_MIME_TYPES (the belt-and-suspenders pair some pickers need
+     *  to actually narrow their listing rather than just their icon). */
+    private fun startPickImageAttachment() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+        }
+        startActivityForResult(intent, REQUEST_PICK_IMAGE_ATTACHMENT)
+    }
+
+    /** Step 4: mirrors [handlePickedOpticalFile]'s read-bytes-from-uri shape,
+     *  but feeds the generic attachment protocol (sendAttachment) instead of
+     *  the optical pipeline — rejects outright over MAX_ATTACHMENT_BODY_BYTES
+     *  rather than chunking, per this step's explicit scope. */
+    private fun handlePickedImageAttachment(uri: android.net.Uri) {
+        val bytes = try {
+            contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        } catch (e: Exception) {
+            null
+        }
+        if (bytes == null) {
+            Toast.makeText(this, "Couldn't read that image", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (bytes.size > OfflineMediaTransport.MAX_ATTACHMENT_BODY_BYTES) {
+            Toast.makeText(this, "Image too large (${formatAttachmentBytes(bytes.size)}, max ${formatAttachmentBytes(OfflineMediaTransport.MAX_ATTACHMENT_BODY_BYTES)})", Toast.LENGTH_LONG).show()
+            return
+        }
+        val name = queryDisplayName(uri) ?: "image"
+        val mimeType = contentResolver.getType(uri) ?: "image/jpeg"
+        sendFileAttachment(OfflineMediaTransport.AttachmentKind.IMAGE, bytes, name, mimeType)
+    }
+
+    /** Step 4/5: shared send path for a fetch-gated file attachment
+     *  (IMAGE/DOCUMENT) picked from the device — mirrors
+     *  [sendVoiceNoteAttachment]'s "sender already has the body, no Download
+     *  gate for your own sent message" pattern exactly. */
+    private fun sendFileAttachment(kind: OfflineMediaTransport.AttachmentKind, bytes: ByteArray, filename: String, mimeType: String) {
+        val transport = mediaTransport ?: return
+        val msgId = transport.sendAttachment(kind, bytes, filename = filename, mimeType = mimeType) ?: return
+        val meta = OfflineMediaTransport.AttachmentMeta(msgId, kind, bytes.size, filename = filename, mimeType = mimeType)
+        val ref = AttachmentRef(msgId, kind, transport.localNodeId, meta, fetchedBytes = bytes)
+        attachmentRefsByMsgId[msgId] = ref
+        val label = if (kind == OfflineMediaTransport.AttachmentKind.IMAGE) "Photo" else "Document"
+        appendChatMessage(text = label, fromMe = true, attachment = ref)
     }
 
     private fun queryDisplayName(uri: android.net.Uri): String? = try {
@@ -5819,6 +5947,10 @@ class OfflineCallActivity : AppCompatActivity() {
         // (sendVoiceNote has no 1:1 targeting) — only the Group thread.
         if (::voiceNoteHoldButton.isInitialized) {
             voiceNoteHoldButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
+        }
+        // Step 4: sendAttachment is broadcast-only too — same gate.
+        if (::imageAttachmentButton.isInitialized) {
+            imageAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
         }
         messagesListBody.visibility = View.GONE
         messagesThreadView.visibility = View.VISIBLE

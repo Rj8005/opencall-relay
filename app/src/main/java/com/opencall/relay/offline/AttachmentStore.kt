@@ -75,6 +75,10 @@ class AttachmentStore private constructor(context: Context) {
 
     fun has(msgId: String): Boolean = bodyFile(msgId).exists()
 
+    /** Step 4: the on-disk body File for [msgId], for handing to FileProvider
+     *  — callers must check [has] first; this does not. */
+    fun fileFor(msgId: String): File = bodyFile(msgId)
+
     /** Discards a stored body (sent or fetched) — not wired to anything
      *  yet (no retention/eviction policy exists for this store today); a
      *  deliberate hook for whoever adds one later, not dead code removed

@@ -2645,6 +2645,13 @@ class OfflineMediaTransport(
         return msgId
     }
 
+    /** Step 4: the on-disk body File for [msgId] if this device actually
+     *  has it (sent-by-self, or already-downloaded) — null otherwise, so a
+     *  UI tap-to-view can hand a real File to FileProvider without
+     *  re-deriving AttachmentStore's own has()-then-fileFor() contract. */
+    fun attachmentBodyFile(msgId: String): java.io.File? =
+        if (attachmentStore.has(msgId)) attachmentStore.fileFor(msgId) else null
+
     /** UI calls this on an explicit Download tap — never automatically.
      *  [fromNodeId] is the original sender (AttachmentState.senderNodeId),
      *  addressed directly; the mesh's existing relay/routing handles

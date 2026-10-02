@@ -31,7 +31,10 @@ class TopoTabSeparationTest {
         // through the SAME chatMessages/ChatAdapter data both this file's
         // registries already treat as shared-data/separate-views (see
         // messagesChatAdapter vs chatAdapter below), not a new overlap.
-        "voiceNoteHoldButton"
+        "voiceNoteHoldButton",
+        // Step 4: scattered-for-now image-attachment entry point, same
+        // composerRow, same reasoning — Step 8 consolidates this away.
+        "imageAttachmentButton"
     )
     private val CALL_SCREEN_VIEW_FIELDS = setOf(
         "callScreen", "videoFrame", "hangupButton", "callTimerText", "peerNameText",

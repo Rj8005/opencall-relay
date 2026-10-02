@@ -307,5 +307,20 @@
             </intent-filter>
         </receiver>
 
+        <!-- Step 4: scoped to AttachmentStore's own directory only (see
+             attachment_file_paths.xml) — needed so tapping a downloaded
+             image/document can hand an external viewer app a content://
+             Uri; a bare file:// Uri throws FileUriExposedException on a
+             targetSdk this high. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.attachments"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/attachment_file_paths" />
+        </provider>
+
     </application>
 </manifest>
