@@ -874,12 +874,11 @@ class OfflineCallActivity : AppCompatActivity() {
     // ChatEntry.id, not a row View — see toggleVoiceNoteEntryPlayback's doc.
     private var playingChatEntryId: Long? = null
     private lateinit var voiceNoteHoldButton: Button
-    // Step 4: scattered-for-now entry point — Step 8 replaces this (and the
-    // other per-kind buttons Steps 5-7 add) with one consolidated "+" menu.
-    private lateinit var imageAttachmentButton: Button
-    private lateinit var documentAttachmentButton: Button
-    private lateinit var locationAttachmentButton: Button
-    private lateinit var contactAttachmentButton: Button
+    // Step 8: single consolidated entry point, replacing Steps 4-7's own
+    // scattered per-kind buttons (imageAttachmentButton/
+    // documentAttachmentButton/locationAttachmentButton/
+    // contactAttachmentButton, all removed here).
+    private lateinit var attachmentMenuButton: Button
 
     // PHASE 6 TRACK E: self-healing GO re-election state — see handleGoLost/
     // handleElectionResult/becomeNewGoAfterElection/waitForInviteAfterElection.
@@ -4044,12 +4043,13 @@ class OfflineCallActivity : AppCompatActivity() {
                 if (sendChatText(messagesComposerInput.text?.toString()?.trim().orEmpty())) messagesComposerInput.setText("")
             }
         }
-        // Step 3 (diagnostic follow-up): hold-to-talk, next to Send — see
-        // this function's own doc for why it lives here, not a separate
-        // section. Visibility toggled by openMessageThread (GONE by default
-        // here, before any thread is open): sendAttachment is broadcast-only
-        // for every kind today (no 1:1 targeting), so this only makes sense
-        // on the Group thread, not a 1:1 one.
+        // Step 3 (diagnostic follow-up): hold-to-talk — kept exactly as
+        // built/tested; Step 8 only changes WHO shows/hides this button
+        // (showVoiceHoldControl/hideVoiceHoldControl, swapped with
+        // attachmentMenuButton) and WHEN (previously openMessageThread
+        // directly; this button's own gesture handlers do the hiding now,
+        // see each branch below). GONE by default — before any thread is
+        // open AND before attachmentMenuButton's "Voice" item is picked.
         voiceNoteHoldButton = Button(this).apply {
             text = "🎤"
             visibility = View.GONE
@@ -4071,49 +4071,32 @@ class OfflineCallActivity : AppCompatActivity() {
                     android.view.MotionEvent.ACTION_UP -> {
                         voiceNoteHoldButton.text = "🎤"
                         voiceNoteRecorder.stop()?.let { result -> sendVoiceNoteAttachment(result.audioBytes, result.durationMs) }
+                        hideVoiceHoldControl()
                         true
                     }
                     android.view.MotionEvent.ACTION_CANCEL -> {
                         voiceNoteHoldButton.text = "🎤"
                         voiceNoteRecorder.cancel()
+                        hideVoiceHoldControl()
                         true
                     }
                     else -> false
                 }
             }
         }
-        // Step 4: scattered-for-now — see imageAttachmentButton's own doc.
-        imageAttachmentButton = Button(this).apply {
-            text = "📷"
+        // Step 8: single consolidated entry point — see attachmentMenuButton's
+        // own field doc and showAttachmentMenu for why Voice swaps in
+        // voiceNoteHoldButton rather than being a plain dialog-tap send.
+        attachmentMenuButton = Button(this).apply {
+            text = "+"
             visibility = View.GONE
-            setOnClickListener { startPickImageAttachment() }
-        }
-        // Step 5: same pattern as imageAttachmentButton.
-        documentAttachmentButton = Button(this).apply {
-            text = "📄"
-            visibility = View.GONE
-            setOnClickListener { startPickDocumentAttachment() }
-        }
-        // Step 6: same pattern, one-shot send (no picker — see shareCurrentLocation).
-        locationAttachmentButton = Button(this).apply {
-            text = "📍"
-            visibility = View.GONE
-            setOnClickListener { shareCurrentLocation() }
-        }
-        // Step 7: same pattern, opens the contact picker dialog.
-        contactAttachmentButton = Button(this).apply {
-            text = "👤"
-            visibility = View.GONE
-            setOnClickListener { shareContact() }
+            setOnClickListener { showAttachmentMenu() }
         }
         val composerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding((8 * density).toInt(), (4 * density).toInt(), (8 * density).toInt(), (4 * density).toInt())
             addView(messagesComposerInput, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(imageAttachmentButton)
-            addView(documentAttachmentButton)
-            addView(locationAttachmentButton)
-            addView(contactAttachmentButton)
+            addView(attachmentMenuButton)
             addView(voiceNoteHoldButton)
             addView(sendBtn)
         }
@@ -4842,6 +4825,43 @@ class OfflineCallActivity : AppCompatActivity() {
         attachmentRefsByMsgId[msgId] = ref
         val label = if (kind == OfflineMediaTransport.AttachmentKind.IMAGE) "Photo" else "Document"
         appendChatMessage(text = label, fromMe = true, attachment = ref)
+    }
+
+    /** Step 8: single consolidated entry point — replaces Steps 4-7's own
+     *  scattered per-kind buttons with one "+" opening this list. Voice
+     *  can't be a plain dialog-tap send: it's a press-and-hold gesture, so
+     *  picking it instead swaps the real hold-to-talk control into view
+     *  (see [showVoiceHoldControl]) rather than recording here. */
+    private fun showAttachmentMenu() {
+        val options = arrayOf("Voice", "Photo", "Document", "Location", "Contact")
+        AlertDialog.Builder(this)
+            .setTitle("Attach")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> showVoiceHoldControl()
+                    1 -> startPickImageAttachment()
+                    2 -> startPickDocumentAttachment()
+                    3 -> shareCurrentLocation()
+                    4 -> shareContact()
+                }
+            }
+            .show()
+    }
+
+    /** Step 8: swaps attachmentMenuButton out for voiceNoteHoldButton in the
+     *  same composerRow slot, so the user can press-and-hold it exactly as
+     *  before Step 8 — reverted by [hideVoiceHoldControl] from the hold
+     *  button's own ACTION_UP/ACTION_CANCEL handlers once the gesture ends. */
+    private fun showVoiceHoldControl() {
+        attachmentMenuButton.visibility = View.GONE
+        voiceNoteHoldButton.visibility = View.VISIBLE
+    }
+
+    private fun hideVoiceHoldControl() {
+        voiceNoteHoldButton.visibility = View.GONE
+        if (::attachmentMenuButton.isInitialized) {
+            attachmentMenuButton.visibility = View.VISIBLE
+        }
     }
 
     /** Step 6: one-shot "share my current location" — LOCATION is an inline
@@ -6080,26 +6100,20 @@ class OfflineCallActivity : AppCompatActivity() {
         }
         messagesThreadNameText.text = name
         threadPreviews[threadKey]?.unread = 0
-        // Step 2 (diagnostic follow-up): voice notes are broadcast-only
-        // (sendVoiceNote has no 1:1 targeting) — only the Group thread.
+        // Step 8: sendAttachment (every kind, including voice) is
+        // broadcast-only — only the Group thread. Every thread switch resets
+        // to this known state: attachmentMenuButton shown/hidden per the
+        // gate, voiceNoteHoldButton always forced back to GONE here (even if
+        // a prior showVoiceHoldControl swap was never reverted by its own
+        // ACTION_UP/ACTION_CANCEL — e.g. the user switched threads mid-swap
+        // without ever touching the hold button) so the two controls can
+        // never both end up visible, or the hold button left stuck showing
+        // on a 1:1 thread.
+        if (::attachmentMenuButton.isInitialized) {
+            attachmentMenuButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
+        }
         if (::voiceNoteHoldButton.isInitialized) {
-            voiceNoteHoldButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
-        }
-        // Step 4: sendAttachment is broadcast-only too — same gate.
-        if (::imageAttachmentButton.isInitialized) {
-            imageAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
-        }
-        // Step 5: same gate.
-        if (::documentAttachmentButton.isInitialized) {
-            documentAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
-        }
-        // Step 6: same gate.
-        if (::locationAttachmentButton.isInitialized) {
-            locationAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
-        }
-        // Step 7: same gate.
-        if (::contactAttachmentButton.isInitialized) {
-            contactAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
+            voiceNoteHoldButton.visibility = View.GONE
         }
         messagesListBody.visibility = View.GONE
         messagesThreadView.visibility = View.VISIBLE

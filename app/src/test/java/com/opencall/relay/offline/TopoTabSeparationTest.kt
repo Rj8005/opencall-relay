@@ -32,15 +32,12 @@ class TopoTabSeparationTest {
         // registries already treat as shared-data/separate-views (see
         // messagesChatAdapter vs chatAdapter below), not a new overlap.
         "voiceNoteHoldButton",
-        // Step 4: scattered-for-now image-attachment entry point, same
-        // composerRow, same reasoning — Step 8 consolidates this away.
-        "imageAttachmentButton",
-        // Step 5: same reasoning, document-attachment entry point.
-        "documentAttachmentButton",
-        // Step 6: same reasoning, location-attachment entry point.
-        "locationAttachmentButton",
-        // Step 7: same reasoning, contact-attachment entry point.
-        "contactAttachmentButton"
+        // Step 8: single consolidated attachment entry point, same
+        // composerRow — replaces Steps 4-7's own scattered per-kind buttons
+        // (imageAttachmentButton/documentAttachmentButton/
+        // locationAttachmentButton/contactAttachmentButton), none of which
+        // exist as fields anymore.
+        "attachmentMenuButton"
     )
     private val CALL_SCREEN_VIEW_FIELDS = setOf(
         "callScreen", "videoFrame", "hangupButton", "callTimerText", "peerNameText",
