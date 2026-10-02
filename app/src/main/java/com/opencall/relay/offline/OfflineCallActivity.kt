@@ -874,6 +874,7 @@ class OfflineCallActivity : AppCompatActivity() {
     // Step 4: scattered-for-now entry point — Step 8 replaces this (and the
     // other per-kind buttons Steps 5-7 add) with one consolidated "+" menu.
     private lateinit var imageAttachmentButton: Button
+    private lateinit var documentAttachmentButton: Button
 
     // PHASE 6 TRACK E: self-healing GO re-election state — see handleGoLost/
     // handleElectionResult/becomeNewGoAfterElection/waitForInviteAfterElection.
@@ -4082,11 +4083,18 @@ class OfflineCallActivity : AppCompatActivity() {
             visibility = View.GONE
             setOnClickListener { startPickImageAttachment() }
         }
+        // Step 5: same pattern as imageAttachmentButton.
+        documentAttachmentButton = Button(this).apply {
+            text = "📄"
+            visibility = View.GONE
+            setOnClickListener { startPickDocumentAttachment() }
+        }
         val composerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding((8 * density).toInt(), (4 * density).toInt(), (8 * density).toInt(), (4 * density).toInt())
             addView(messagesComposerInput, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(imageAttachmentButton)
+            addView(documentAttachmentButton)
             addView(voiceNoteHoldButton)
             addView(sendBtn)
         }
@@ -4602,6 +4610,11 @@ class OfflineCallActivity : AppCompatActivity() {
             if (resultCode == RESULT_OK) data?.data?.let { handlePickedImageAttachment(it) }
             return
         }
+        // Step 5: own request code, same pattern.
+        if (requestCode == REQUEST_PICK_DOCUMENT_ATTACHMENT) {
+            if (resultCode == RESULT_OK) data?.data?.let { handlePickedDocumentAttachment(it) }
+            return
+        }
         // PART "WHY THE QR JOIN FAILS": PairingScanActivity's own request
         // code, checked before the legacy IntentIntegrator parse below
         // (which is expected to return null for a code it doesn't own, but
@@ -4630,6 +4643,7 @@ class OfflineCallActivity : AppCompatActivity() {
 
     private val REQUEST_PICK_OPTICAL_FILE = 9201
     private val REQUEST_PICK_IMAGE_ATTACHMENT = 9202
+    private val REQUEST_PICK_DOCUMENT_ATTACHMENT = 9203
 
     private fun launchOpticalShow(container: OpticalFileContainer.PackedFile, title: String) {
         startActivity(Intent(this, OpticalShowActivity::class.java).apply {
@@ -4762,6 +4776,39 @@ class OfflineCallActivity : AppCompatActivity() {
         val name = queryDisplayName(uri) ?: "image"
         val mimeType = contentResolver.getType(uri) ?: "image/jpeg"
         sendFileAttachment(OfflineMediaTransport.AttachmentKind.IMAGE, bytes, name, mimeType)
+    }
+
+    /** Step 5: same ACTION_OPEN_DOCUMENT picker as [startPickImageAttachment],
+     *  but any mimetype — this is document sharing, not a narrowed photo
+     *  picker. */
+    private fun startPickDocumentAttachment() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        startActivityForResult(intent, REQUEST_PICK_DOCUMENT_ATTACHMENT)
+    }
+
+    /** Step 5: mirrors [handlePickedImageAttachment] exactly — same read,
+     *  same MAX_ATTACHMENT_BODY_BYTES reject-over-cap, same sendFileAttachment
+     *  call, just DOCUMENT instead of IMAGE and no mimetype narrowing. */
+    private fun handlePickedDocumentAttachment(uri: android.net.Uri) {
+        val bytes = try {
+            contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        } catch (e: Exception) {
+            null
+        }
+        if (bytes == null) {
+            Toast.makeText(this, "Couldn't read that file", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (bytes.size > OfflineMediaTransport.MAX_ATTACHMENT_BODY_BYTES) {
+            Toast.makeText(this, "File too large (${formatAttachmentBytes(bytes.size)}, max ${formatAttachmentBytes(OfflineMediaTransport.MAX_ATTACHMENT_BODY_BYTES)})", Toast.LENGTH_LONG).show()
+            return
+        }
+        val name = queryDisplayName(uri) ?: "file"
+        val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+        sendFileAttachment(OfflineMediaTransport.AttachmentKind.DOCUMENT, bytes, name, mimeType)
     }
 
     /** Step 4/5: shared send path for a fetch-gated file attachment
@@ -5951,6 +5998,10 @@ class OfflineCallActivity : AppCompatActivity() {
         // Step 4: sendAttachment is broadcast-only too — same gate.
         if (::imageAttachmentButton.isInitialized) {
             imageAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
+        }
+        // Step 5: same gate.
+        if (::documentAttachmentButton.isInitialized) {
+            documentAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
         }
         messagesListBody.visibility = View.GONE
         messagesThreadView.visibility = View.VISIBLE

@@ -34,7 +34,9 @@ class TopoTabSeparationTest {
         "voiceNoteHoldButton",
         // Step 4: scattered-for-now image-attachment entry point, same
         // composerRow, same reasoning — Step 8 consolidates this away.
-        "imageAttachmentButton"
+        "imageAttachmentButton",
+        // Step 5: same reasoning, document-attachment entry point.
+        "documentAttachmentButton"
     )
     private val CALL_SCREEN_VIEW_FIELDS = setOf(
         "callScreen", "videoFrame", "hangupButton", "callTimerText", "peerNameText",
