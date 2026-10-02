@@ -115,6 +115,9 @@ class OfflineCallActivity : AppCompatActivity() {
         // here instead of this Settings tab's content moving out.
         const val EXTRA_OPEN_SETTINGS_TAB = "open_settings_tab"
         private const val PERM_REQUEST = 5001
+        // Step 7: separate request code — a denial/grant here must not be
+        // confused with (or trigger) PERM_REQUEST's own proceedToDiscovery.
+        private const val REQUEST_CONTACTS_PERMISSION = 5002
         private const val GROUP_FORMATION_TIMEOUT_MS = 30_000L
         // BUG (GROUP FORMS, NOBODY JOINS) FIX: the tapper's "waiting for the
         // invited peer to associate" deadline — covers both "group never
@@ -876,6 +879,7 @@ class OfflineCallActivity : AppCompatActivity() {
     private lateinit var imageAttachmentButton: Button
     private lateinit var documentAttachmentButton: Button
     private lateinit var locationAttachmentButton: Button
+    private lateinit var contactAttachmentButton: Button
 
     // PHASE 6 TRACK E: self-healing GO re-election state — see handleGoLost/
     // handleElectionResult/becomeNewGoAfterElection/waitForInviteAfterElection.
@@ -4096,6 +4100,12 @@ class OfflineCallActivity : AppCompatActivity() {
             visibility = View.GONE
             setOnClickListener { shareCurrentLocation() }
         }
+        // Step 7: same pattern, opens the contact picker dialog.
+        contactAttachmentButton = Button(this).apply {
+            text = "👤"
+            visibility = View.GONE
+            setOnClickListener { shareContact() }
+        }
         val composerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding((8 * density).toInt(), (4 * density).toInt(), (8 * density).toInt(), (4 * density).toInt())
@@ -4103,6 +4113,7 @@ class OfflineCallActivity : AppCompatActivity() {
             addView(imageAttachmentButton)
             addView(documentAttachmentButton)
             addView(locationAttachmentButton)
+            addView(contactAttachmentButton)
             addView(voiceNoteHoldButton)
             addView(sendBtn)
         }
@@ -4853,6 +4864,55 @@ class OfflineCallActivity : AppCompatActivity() {
         val ref = AttachmentRef(msgId, OfflineMediaTransport.AttachmentKind.LOCATION, transport.localNodeId, meta)
         attachmentRefsByMsgId[msgId] = ref
         appendChatMessage(text = "Location", fromMe = true, attachment = ref)
+    }
+
+    /** Step 7: entry point — requests READ_CONTACTS if not already granted
+     *  (same ContextCompat/ActivityCompat pattern as [onSearchClicked],
+     *  separate request code so its result can't be confused with
+     *  PERM_REQUEST's own flow), then opens the picker. */
+    private fun shareContact() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_CONTACTS), REQUEST_CONTACTS_PERMISSION)
+            return
+        }
+        showContactPickerDialog()
+    }
+
+    /** Step 7: reuses [com.opencall.relay.dialer.data.ContactsRepository]'s
+     *  existing ContactsContract query (Pillar 2's own contacts list/T9
+     *  search source) rather than a second, parallel contacts query here. */
+    private fun showContactPickerDialog() {
+        val contacts = com.opencall.relay.dialer.data.ContactsRepository.queryContacts(this)
+        if (contacts.isEmpty()) {
+            Toast.makeText(this, "No contacts found", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val labels = contacts.map { "${it.displayName} (${it.phoneNumbers.firstOrNull() ?: "no number"})" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Share a contact")
+            .setItems(labels) { _, which ->
+                val c = contacts[which]
+                val number = c.phoneNumbers.firstOrNull()
+                if (number == null) {
+                    Toast.makeText(this, "That contact has no phone number", Toast.LENGTH_SHORT).show()
+                } else {
+                    sendContactAttachment(c.displayName, number)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Step 7: CONTACT is an inline AttachmentKind (see Step 3) — name+phone
+     *  travel complete in a single META frame, same no-fetch-gate shape as
+     *  [shareCurrentLocation]'s LOCATION. */
+    private fun sendContactAttachment(name: String, phone: String) {
+        val transport = mediaTransport ?: return
+        val msgId = transport.sendAttachment(OfflineMediaTransport.AttachmentKind.CONTACT, ByteArray(0), contactName = name, contactPhone = phone) ?: return
+        val meta = OfflineMediaTransport.AttachmentMeta(msgId, OfflineMediaTransport.AttachmentKind.CONTACT, 0, contactName = name, contactPhone = phone)
+        val ref = AttachmentRef(msgId, OfflineMediaTransport.AttachmentKind.CONTACT, transport.localNodeId, meta)
+        attachmentRefsByMsgId[msgId] = ref
+        appendChatMessage(text = "Contact: $name", fromMe = true, attachment = ref)
     }
 
     private fun queryDisplayName(uri: android.net.Uri): String? = try {
@@ -6037,6 +6097,10 @@ class OfflineCallActivity : AppCompatActivity() {
         if (::locationAttachmentButton.isInitialized) {
             locationAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
         }
+        // Step 7: same gate.
+        if (::contactAttachmentButton.isInitialized) {
+            contactAttachmentButton.visibility = if (isGroupChatScreen) View.VISIBLE else View.GONE
+        }
         messagesListBody.visibility = View.GONE
         messagesThreadView.visibility = View.VISIBLE
         updateForegroundState() // PART 1 (batch A): messagesThreadView is now a full-bleed root sibling
@@ -6122,6 +6186,16 @@ class OfflineCallActivity : AppCompatActivity() {
                     "Location, Nearby Devices, Microphone, and Camera permissions are required for offline calls",
                     Toast.LENGTH_LONG
                 ).show()
+            }
+            return
+        }
+        // Step 7: a grant here resumes straight into the picker dialog —
+        // the tap that triggered the request is otherwise lost.
+        if (requestCode == REQUEST_CONTACTS_PERMISSION) {
+            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                showContactPickerDialog()
+            } else {
+                Toast.makeText(this, "Contacts permission is required to share a contact", Toast.LENGTH_SHORT).show()
             }
         }
     }

@@ -38,7 +38,9 @@ class TopoTabSeparationTest {
         // Step 5: same reasoning, document-attachment entry point.
         "documentAttachmentButton",
         // Step 6: same reasoning, location-attachment entry point.
-        "locationAttachmentButton"
+        "locationAttachmentButton",
+        // Step 7: same reasoning, contact-attachment entry point.
+        "contactAttachmentButton"
     )
     private val CALL_SCREEN_VIEW_FIELDS = setOf(
         "callScreen", "videoFrame", "hangupButton", "callTimerText", "peerNameText",
